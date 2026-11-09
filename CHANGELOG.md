@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.8
+
+- Added HTTP/1.1 Upgrade transport (`httpupgrade`) interoperable with sing-box for inbound and outbound proxies, supporting early data via query parameter, header, or base64 path.
+- Added gRPC Gun transport (`grpc`) interoperable with sing-box for inbound and outbound proxies, supporting framing over HTTP/2 gRPC with bidirectional streaming for TCP streams and UDP packet routing.
+- Added Trojan UDP-over-TLS client and server support.
+- Added Snell v4, v5, and v6 protocol support with automatic inbound version detection.
+- Fixed ephemeral port collision race during multi-peer WireGuard test initialization.
+- Added automated sing-box integration test suite to CI, gated cross-compilation on test success, and added multi-layer GitHub Actions caching.
+
 ## v0.3.7
 
 - Added managed Linux desktop capture with `auto_route`, optional TCP `auto_redirect`, independent DNS interception, and best-effort systemd-resolved integration. Capture supports single-stack or temporarily offline underlays and retains network ownership across reloads; proxy transports and DIRECT traffic still require native connectivity. This is host TCP/UDP capture, not gateway forwarding. Requires network-administration privileges and `nft`; network-topology changes require a restart. See [managed TUN requirements and limitations](https://shoes-rs.github.io/config/tun/#managed-linux-desktop-capture).
