@@ -8,8 +8,8 @@ use crate::address::NetLocation;
 use crate::anytls::{AnyTlsClientHandler, PaddingFactory};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
 use crate::config::{
-    ResolvedClientProxyConfig, ResolvedRuleActionConfig, ResolvedRuleConfig,
-    ResolvedTlsClientConfig, ResolvedWebsocketClientConfig, ShadowsocksConfig,
+    ResolvedClientProxyConfig, ResolvedHttpUpgradeClientConfig, ResolvedRuleActionConfig,
+    ResolvedRuleConfig, ResolvedTlsClientConfig, ResolvedWebsocketClientConfig, ShadowsocksConfig,
 };
 use crate::h2mux::H2MuxClientHandler;
 use crate::http_handler::HttpTcpClientHandler;
@@ -441,6 +441,37 @@ pub(crate) fn create_with_hop_context(
                 )
                 .with_early_data(max_early_data, early_data_header_name.as_deref()),
             )
+        }
+        ResolvedClientProxyConfig::HttpUpgrade(httpupgrade_config) => {
+            crate::httpupgrade::validate_client_config(
+                httpupgrade_config.matching_path.as_deref(),
+                httpupgrade_config.matching_headers.as_ref(),
+            )?;
+            let authority = crate::http2::client::format_authority(hop_location);
+            let ResolvedHttpUpgradeClientConfig {
+                matching_path,
+                matching_headers,
+                host,
+                protocol,
+            } = httpupgrade_config;
+
+            let mut matching_headers =
+                matching_headers.map(|h| h.into_iter().collect::<rustc_hash::FxHashMap<_, _>>());
+            if let Some(host) = host {
+                matching_headers
+                    .get_or_insert_with(Default::default)
+                    .entry("Host".to_string())
+                    .or_insert(host);
+            }
+
+            let handler = create_with_hop_context(*protocol, hop_location, None, resolver.clone())?;
+
+            Box::new(crate::httpupgrade::HttpUpgradeTcpClientHandler::new(
+                authority,
+                matching_path,
+                matching_headers,
+                handler,
+            ))
         }
         ResolvedClientProxyConfig::PortForward => Box::new(PortForwardClientHandler),
         ResolvedClientProxyConfig::Anytls {
