@@ -14,6 +14,8 @@ mod h2mux_singbox;
 mod hostname_sniffing;
 #[path = "cases/integration/http2_proxy.rs"]
 mod http2_proxy;
+#[path = "cases/integration/httpupgrade_singbox.rs"]
+mod httpupgrade_singbox;
 #[path = "cases/integration/http_host_sniffing.rs"]
 mod http_host_sniffing;
 #[path = "cases/integration/hysteria2_integration.rs"]

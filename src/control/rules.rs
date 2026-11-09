@@ -152,6 +152,18 @@ impl Builder {
                     );
                 }
             }
+            ResolvedServerProxyConfig::HttpUpgrade { targets } => {
+                for (index, target) in targets.iter_mut().enumerate() {
+                    let scope = format!("{scope}/httpupgrade/{index}");
+                    self.project_target(
+                        &mut target.override_rules,
+                        &mut target.protocol,
+                        inherited,
+                        inbound,
+                        &scope,
+                    );
+                }
+            }
             ResolvedServerProxyConfig::SudokuMask(config) => self.project_protocol(
                 &mut config.protocol,
                 inbound,
@@ -183,6 +195,7 @@ pub fn inbound_type(protocol: &ResolvedServerProxyConfig) -> &'static str {
         ResolvedServerProxyConfig::Wireguard(_) => "WireGuard",
         ResolvedServerProxyConfig::Tls { .. } => "TLS",
         ResolvedServerProxyConfig::Websocket { .. } => "WebSocket",
+        ResolvedServerProxyConfig::HttpUpgrade { .. } => "HTTPUpgrade",
         ResolvedServerProxyConfig::SudokuMask(config) => inbound_type(&config.protocol),
         ResolvedServerProxyConfig::Xhttp(_) => "XHTTP",
         _ => "Shoes",

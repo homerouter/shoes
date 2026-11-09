@@ -54,6 +54,12 @@ fn protocol(
                 self::protocol(&mut target.protocol, visitor, group)?;
             }
         }
+        ServerProxyConfig::HttpUpgrade { targets } => {
+            for target in targets.iter_mut() {
+                rules(&mut target.override_rules, visitor, group)?;
+                self::protocol(&mut target.protocol, visitor, group)?;
+            }
+        }
         ServerProxyConfig::SudokuMask(config) => {
             self::protocol(&mut config.protocol, visitor, group)?
         }
