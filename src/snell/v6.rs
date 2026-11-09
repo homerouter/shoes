@@ -20,9 +20,8 @@
 //! block and the `⇄` byte interleaving of padding and sealed payload. The
 //! other two modes carry no padding and the reader rejects any.
 //!
-//! A record without payload is a zero chunk (half-close). It surfaces as
-//! v4's zero-chunk error so [`super::protocol::is_zero_chunk`] recognises it;
-//! in `default` mode its padding is skipped.
+//! A record without payload is a zero chunk (half-close). It reads as a clean
+//! EOF, like v4; in `default` mode its padding is skipped.
 //!
 //! Requests are *deferred* ([`V6Conn::defer_request`]) and sent at the head
 //! of the next record, so a session's first payload bytes share a record with
@@ -39,7 +38,7 @@ use rand::Rng;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
 
 use super::aead::{snell_kdf, Aead};
-use super::v4::{increment_nonce, zero_chunk_err};
+use super::v4::increment_nonce;
 use super::v6_shape::{ShapeProfile, ShapeState, RECORD_LEN_MAX, SALT_LEN};
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
@@ -507,7 +506,7 @@ impl RecvHalf {
                 let seq = self.seq;
                 self.seq = seq.wrapping_add(1);
                 self.state = match (padding_len, payload_len) {
-                    (0, 0) => return Poll::Ready(Err(zero_chunk_err())),
+                    (0, 0) => return Poll::Ready(Ok(false)),
                     (padding_len, 0) => RecvState::SkipPadding(padding_len),
                     (padding_len, payload_len) => RecvState::Body {
                         padding_len,
@@ -521,7 +520,7 @@ impl RecvHalf {
                     return Poll::Ready(Err(truncated()));
                 }
                 self.state = RecvState::Header;
-                return Poll::Ready(Err(zero_chunk_err()));
+                return Poll::Ready(Ok(false));
             }
             RecvState::Body {
                 padding_len,
@@ -662,8 +661,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for V6Conn<S> {
                 .recv
                 .poll_step(&mut this.io, cx, &this.framing, &this.psk))?
             {
-                // Clean EOF between records: the peer closed without a
-                // zero chunk.
+                // Clean EOF between records: a zero chunk or the peer closed.
                 return Poll::Ready(Ok(()));
             }
         }
@@ -783,7 +781,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncMessageStream for V6Conn<S> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snell::v4::is_zero_chunk;
     use aws_lc_rs::digest::{Context as DigestContext, SHA256};
     use std::fmt::Write as _;
     use std::future::Future;
@@ -862,9 +859,8 @@ mod tests {
         let mut buf = vec![0u8; 8192];
         loop {
             match conn.read(&mut buf).await {
-                Ok(0) => panic!("EOF before zero chunk"),
+                Ok(0) => return got,
                 Ok(n) => got.extend_from_slice(&buf[..n]),
-                Err(e) if is_zero_chunk(&e) => return got,
                 Err(e) => panic!("read failed: {e}"),
             }
         }

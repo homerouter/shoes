@@ -39,22 +39,6 @@ pub const MAX_PAYLOAD_LENGTH: usize = 0x3FFF;
 
 const V4_READ_BUFFER_SIZE: usize = 64 * 1024;
 
-const ZERO_CHUNK_KIND: io::ErrorKind = io::ErrorKind::UnexpectedEof;
-const ZERO_CHUNK_MSG: &str = "snell: zero chunk";
-
-/// True iff the I/O error is the v4 zero-chunk half-close signal.
-#[allow(dead_code)]
-pub fn is_zero_chunk(err: &io::Error) -> bool {
-    err.kind() == ZERO_CHUNK_KIND
-        && err
-            .get_ref()
-            .is_some_and(|e| e.to_string() == ZERO_CHUNK_MSG)
-}
-
-pub(super) fn zero_chunk_err() -> io::Error {
-    io::Error::new(ZERO_CHUNK_KIND, ZERO_CHUNK_MSG)
-}
-
 pub fn increment_nonce(nonce: &mut [u8; V4_NONCE_SIZE]) {
     for byte in nonce.iter_mut() {
         *byte = byte.wrapping_add(1);
@@ -466,7 +450,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for V4Conn<S> {
                             header_buf: [0u8; V4_HEADER_CIPHER_SIZE],
                             header_progress: 0,
                         };
-                        return Poll::Ready(Err(zero_chunk_err()));
+                        // A zero chunk ends the session: report clean EOF, as meow-rs does.
+                        return Poll::Ready(Ok(()));
                     }
                     if payload_len > MAX_PAYLOAD_LENGTH || padding_len > MAX_PAYLOAD_LENGTH {
                         return Poll::Ready(Err(io::Error::new(
@@ -756,7 +741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_zero_chunk_surfaces_as_tagged_error() {
+    async fn v4_zero_chunk_reads_as_eof() {
         let (a, b) = tokio::io::duplex(8192);
         let psk: Arc<[u8]> = Arc::from(b"k".as_slice());
         let mut alice = V4Conn::new(a, Arc::clone(&psk));
@@ -774,7 +759,6 @@ mod tests {
         assert_eq!(&buf, b"abc");
 
         let mut more = [0u8; 1];
-        let err = bob.read_exact(&mut more).await.unwrap_err();
-        assert!(is_zero_chunk(&err), "expected zero-chunk tag, got {err:?}");
+        assert_eq!(bob.read(&mut more).await.unwrap(), 0);
     }
 }
