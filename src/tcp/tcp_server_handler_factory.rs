@@ -9,7 +9,7 @@ use crate::anytls::{AnyTlsServerHandler, PaddingFactory};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::{ResolvedClientConfig, ResolvedClientHop};
 use crate::config::{
-    ResolvedHttpUpgradeServerConfig, ResolvedRealityServerConfig, ResolvedRuleConfig,
+    ResolvedGrpcServerConfig, ResolvedHttpUpgradeServerConfig, ResolvedRealityServerConfig, ResolvedRuleConfig,
     ResolvedServerProxyConfig, ResolvedShadowTlsServerConfig,
     ResolvedShadowTlsServerHandshakeConfig, ResolvedTlsServerConfig,
     ResolvedWebsocketServerConfig, ShadowsocksConfig,
@@ -400,6 +400,23 @@ fn create_handler(
                 })
                 .collect::<std::io::Result<Vec<_>>>()?;
             Box::new(crate::httpupgrade::HttpUpgradeTcpServerHandler::new(server_targets))
+        }
+        ResolvedServerProxyConfig::Grpc { targets } => {
+            let server_targets: Vec<crate::grpc::GrpcServerTarget> = targets
+                .into_vec()
+                .into_iter()
+                .enumerate()
+                .map(|(index, config)| {
+                    create_grpc_server_target(
+                        config,
+                        client_proxy_selector,
+                        resolver,
+                        bind_ip,
+                        &mut scope.child(format!("grpc:{index}")),
+                    )
+                })
+                .collect::<std::io::Result<Vec<_>>>()?;
+            Box::new(crate::grpc::GrpcTcpServerHandler::new(server_targets, resolver.clone()))
         }
         ResolvedServerProxyConfig::PortForward { targets } => {
             let targets = targets.into_vec();
@@ -854,6 +871,37 @@ fn create_httpupgrade_server_target(
         matching_headers,
         handler,
     ))
+}
+
+fn create_grpc_server_target(
+    grpc_server_config: ResolvedGrpcServerConfig,
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    bind_ip: Option<IpAddr>,
+    scope: &mut ServiceScope<'_>,
+) -> std::io::Result<crate::grpc::GrpcServerTarget> {
+    let ResolvedGrpcServerConfig {
+        service_name,
+        matching_headers,
+        host,
+        protocol,
+        override_rules,
+    } = grpc_server_config;
+
+    let effective_selector = if !override_rules.is_empty() {
+        create_override_selector(override_rules, client_proxy_selector, resolver)?
+    } else {
+        client_proxy_selector.clone()
+    };
+
+    let handler = create_handler(protocol, &effective_selector, resolver, bind_ip, scope)?;
+
+    Ok(crate::grpc::GrpcServerTarget {
+        service_name,
+        matching_headers,
+        host,
+        handler: handler.into(),
+    })
 }
 
 #[cfg(test)]
