@@ -802,6 +802,8 @@ pub enum ServerProxyConfig {
         password: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shadowsocks: Option<ShadowsocksConfig>,
+        #[serde(default = "default_true")]
+        udp_enabled: bool,
     },
     Tls {
         // sni_targets is the previous field name
@@ -1004,6 +1006,7 @@ pub enum ResolvedServerProxyConfig {
         password: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         shadowsocks: Option<ShadowsocksConfig>,
+        udp_enabled: bool,
     },
     Tls {
         tls_targets: HashMap<String, crate::config::resolved::ResolvedTlsServerConfig>,
