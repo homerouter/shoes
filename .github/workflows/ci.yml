@@ -96,6 +96,10 @@ jobs:
           cargo test --lib --locked
           cargo test --test process_contract --locked
 
+      - name: Run Snell tests
+        run: |
+          .github/require-tests.sh cargo test --lib --locked snell
+
       - name: Run sing-box integration tests
         run: |
           cargo test --test integration --features="integration-tests" httpupgrade_singbox

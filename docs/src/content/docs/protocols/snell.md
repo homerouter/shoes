@@ -19,7 +19,7 @@ protocol:
   mode: string                 # Optional, v6 only: default, unshaped, unsafe-raw
 ```
 
-v4, v5, and v6 always use `aes-128-gcm`; auto-detection only considers them when `cipher` is `aes-128-gcm`. Each connection serves one request; reused connections are not supported.
+v4, v5, and v6 always use `aes-128-gcm`; auto-detection only considers them when `cipher` is `aes-128-gcm`. Connect v2 (reuse) is supported: one connection can carry many requests, as with sing-snell.
 
 With `udp_enabled`, the server also opens a QUIC proxy listener on the same UDP port for Surge clients with `block-quic=off`. It always uses `aes-128-gcm`. Set `udp_enabled: false` to turn it off.
 

@@ -20,7 +20,7 @@ protocol:
   mode: string                 # 可选，仅 v6：default、unshaped、unsafe-raw
 ```
 
-v4、v5 和 v6 始终使用 `aes-128-gcm`；只有当 `cipher` 为 `aes-128-gcm` 时自动检测才会考虑它们。每个连接只处理一个请求，不支持连接复用。
+v4、v5 和 v6 始终使用 `aes-128-gcm`；只有当 `cipher` 为 `aes-128-gcm` 时自动检测才会考虑它们。支持 Connect v2（连接复用）：一个连接可承载多个请求，与 sing-snell 一致。
 
 启用 `udp_enabled` 时，服务端还会在同一 UDP 端口上为设置了 `block-quic=off` 的 Surge 客户端开启 QUIC 代理监听。它始终使用 `aes-128-gcm`。设置 `udp_enabled: false` 可将其关闭。
 
