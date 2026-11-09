@@ -31,8 +31,8 @@ See the [first-configuration guide](https://shoes-rs.github.io/start/first-confi
 - **VMess AEAD**
 - **VLESS** (native encryption, resumption, and fallback for unencrypted VLESS)
 - **Shadowsocks**
-- **Trojan**
-- **Snell v3**
+- **Trojan** (with UDP-over-TLS client and server support)
+- **Snell** (v3, v4, v5, and v6 with automatic version detection; Snell v5 QUIC proxy mode over UDP)
 - **Hysteria2**
 - **TUIC v5**
 - **AnyTLS**
@@ -45,6 +45,8 @@ All server protocols plus:
 - **ShadowTLS v3**
 - **TLS**
 - **WebSocket** (Shadowsocks SIP003)
+- **HTTPUpgrade** (HTTP/1.1 Upgrade transport compatible with sing-box)
+- **gRPC** (Gun transport compatible with sing-box)
 - **XHTTP / SplitHTTP** (packet-up, stream-up, stream-one over HTTP/1.1, HTTP/2, HTTP/3)
 - **XTLS Reality**
   - Hybrid-first X25519MLKEM768 key exchange and optional ML-DSA-65 server authentication
@@ -59,15 +61,12 @@ All server protocols plus:
 ### Supported Ciphers
 - **VMess**: `aes-128-gcm`, `chacha20-poly1305`, `none`
 - **Shadowsocks**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`, `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`, `2022-blake3-chacha20-ietf-poly1305`
-- **Snell v3**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`
+- **Snell**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305` (v3, v4, v5, and v6)
 
-For Clash.Meta/Mihomo legacy Snell clients, use `chacha20-ietf-poly1305` with v1
-or `aes-128-gcm` with v3. Run shoes v0.3.3 or newer for the corrected 16-byte
-Snell salts. These clients do not offer an AES-256 option. Do not use v2:
-shoes does not implement Snell v2 connection reuse or its half-close markers.
-Older Clash.Meta clients fail requests on reused v2 connections.
-shoes-to-shoes connections can also use `aes-256-gcm`; both ends must use the
-same cipher and run v0.3.3 or newer for AES-256 or ChaCha20.
+For Snell client compatibility:
+- **Snell v4, v5, and v6**: Full connection reuse and UDP-over-TCP support with automatic version detection. Compatible with Surge and Clash.Meta/Mihomo Snell clients.
+- **Snell QUIC Proxy Mode**: Companion UDP listener for Surge clients with `block-quic=off`. Decrypts the initial authenticated Init frame over UDP and seamlessly proxies established QUIC streams with zero secondary crypto overhead.
+- **Legacy v1/v3 clients**: Use `chacha20-ietf-poly1305` with v1 or `aes-128-gcm` with v3. Run shoes v0.3.3 or newer for the corrected 16-byte Snell salts. shoes-to-shoes connections can also use `aes-256-gcm`.
 
 ## Features
 
