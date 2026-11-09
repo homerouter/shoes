@@ -147,7 +147,7 @@ pub(crate) fn create_with_hop_context(
         ResolvedClientProxyConfig::Snell {
             config: ShadowsocksConfig::Legacy { cipher, password },
             udp_enabled,
-        } => Box::new(SnellClientHandler::new(cipher, &password, udp_enabled)),
+        } => Box::new(SnellClientHandler::new(cipher, &password, udp_enabled, None, None)),
         ResolvedClientProxyConfig::Snell {
             config: ShadowsocksConfig::Aead2022 { .. },
             ..

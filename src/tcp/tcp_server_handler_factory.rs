@@ -222,12 +222,16 @@ fn create_handler(
             cipher,
             password,
             udp_enabled,
+            version,
+            mode,
         } => Box::new(SnellServerHandler::new(
             cipher.as_str().try_into().unwrap(),
             &password,
             udp_enabled,
             client_proxy_selector.clone(),
             resolver.clone(),
+            version.as_deref(),
+            mode.as_deref(),
         )),
         ResolvedServerProxyConfig::Vless {
             user_id,
