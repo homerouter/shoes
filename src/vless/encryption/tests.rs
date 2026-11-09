@@ -66,10 +66,8 @@ fn go_encapsulation_decapsulates_with_imported_seed() {
 }
 
 #[test]
-#[ignore = "exports randomized test-only ciphertexts for independent Go verification"]
 fn export_rust_encapsulations() {
-    let output =
-        std::env::var_os("VLESS_RUST_VECTORS").expect("set VLESS_RUST_VECTORS to the output path");
+    let output = std::env::var_os("VLESS_RUST_VECTORS");
     let hex = |data: &[u8]| data.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let vectors: Vec<_> = fixtures()["seeds"]
         .as_array()
@@ -80,6 +78,8 @@ fn export_rust_encapsulations() {
             let key = ServerKey::new(&seed).unwrap();
             let client = super::keys::ClientKey::new(&key.public).unwrap();
             let (ciphertext, secret) = client.exchange().unwrap();
+            let recovered = key.exchange(&ciphertext).unwrap();
+            assert_eq!(recovered.as_ref(), secret.as_ref());
             serde_json::json!({
                 "seed": hex(&seed),
                 "public": hex(&key.public),
@@ -88,7 +88,9 @@ fn export_rust_encapsulations() {
             })
         })
         .collect();
-    std::fs::write(output, serde_json::to_vec_pretty(&vectors).unwrap()).unwrap();
+    if let Some(output) = output {
+        std::fs::write(output, serde_json::to_vec_pretty(&vectors).unwrap()).unwrap();
+    }
 }
 
 #[test]
