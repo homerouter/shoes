@@ -677,7 +677,9 @@ async fn start_tcp_servers(
                     listeners.push((listener, tcp_handler));
                 }
             }
-            for (listener, tcp_handler) in listeners {
+            for (listener, tcp_handler) in &listeners {
+                let listener = listener.clone();
+                let tcp_handler = tcp_handler.clone();
                 let tcp_config = tcp_config.clone();
                 let resolver = resolver.clone();
                 let admission = sockets.admission.clone();
@@ -692,6 +694,49 @@ async fn start_tcp_servers(
                         error!("TCP listener stopped: {error}");
                     }
                 }));
+            }
+
+            if let crate::config::ResolvedServerProxyConfig::Snell {
+                password,
+                udp_enabled: true,
+                ..
+            } = &protocol
+            {
+                for (listener, _) in &listeners {
+                    if let Ok(udp_addr) = listener.local_addr() {
+                        let psk: Arc<str> = Arc::from(password.as_str());
+                        let selector = client_proxy_selector.clone();
+                        let resolver = resolver.clone();
+                        let admission = sockets.admission.clone();
+                        match crate::socket_util::new_udp_listener(udp_addr) {
+                            Ok(udp_socket) => {
+                                let udp_socket = Arc::new(udp_socket);
+                                log::info!("Starting Snell QUIC Proxy UDP listener at {udp_addr}");
+                                handles.push(tokio::spawn(async move {
+                                    if let Some(admission) = admission {
+                                        admission.cancelled().await;
+                                    }
+                                    if let Err(e) =
+                                        crate::snell::quic_proxy::run_snell_quic_proxy_listener(
+                                            udp_socket,
+                                            psk,
+                                            selector,
+                                            resolver,
+                                        )
+                                        .await
+                                    {
+                                        error!("Snell QUIC proxy UDP listener stopped: {e}");
+                                    }
+                                }));
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Failed to bind Snell QUIC proxy UDP listener at {udp_addr}: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         BindLocation::Path(path_buf) => {

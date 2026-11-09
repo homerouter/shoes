@@ -11,6 +11,11 @@ use std::path::Path;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+pub fn new_udp_listener(bind_address: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), false)?;
+    into_tokio_udp_socket(socket)
+}
+
 pub fn new_udp_socket(
     is_ipv6: bool,
     bind_interface: Option<String>,
