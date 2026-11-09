@@ -561,6 +561,8 @@ pub enum ClientProxyConfig {
     Websocket(WebsocketClientConfig),
     #[serde(alias = "http-upgrade", alias = "http_upgrade")]
     HttpUpgrade(HttpUpgradeClientConfig),
+    #[serde(alias = "gun")]
+    Grpc(GrpcClientConfig),
     #[serde(alias = "splithttp")]
     Xhttp(super::xhttp::XhttpClientConfig),
     #[serde(alias = "noop")]
@@ -637,6 +639,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::Vmess { .. } => "VMess",
             ClientProxyConfig::Websocket(..) => "WebSocket",
             ClientProxyConfig::HttpUpgrade(..) => "HTTPUpgrade",
+            ClientProxyConfig::Grpc(..) => "gRPC",
             ClientProxyConfig::Xhttp(..) => "XHTTP",
             ClientProxyConfig::PortForward => "PortForward",
             ClientProxyConfig::Anytls { .. } => "AnyTLS",
@@ -715,6 +718,19 @@ pub struct HttpUpgradeClientRecord<P> {
 }
 
 pub type HttpUpgradeClientConfig = HttpUpgradeClientRecord<ClientProxyConfig>;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GrpcClientRecord<P> {
+    #[serde(alias = "service", alias = "serviceName", default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    #[serde(alias = "headers", default, skip_serializing_if = "Option::is_none")]
+    pub matching_headers: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub protocol: Box<P>,
+}
+
+pub type GrpcClientConfig = GrpcClientRecord<ClientProxyConfig>;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -808,6 +824,8 @@ pub enum ResolvedClientProxyConfig {
     Websocket(crate::config::resolved::ResolvedWebsocketClientConfig),
     #[serde(alias = "http-upgrade", alias = "http_upgrade")]
     HttpUpgrade(crate::config::resolved::ResolvedHttpUpgradeClientConfig),
+    #[serde(alias = "gun")]
+    Grpc(crate::config::resolved::ResolvedGrpcClientConfig),
     Xhttp(crate::config::resolved::ResolvedXhttpClientConfig),
     PortForward,
     Anytls {
@@ -863,6 +881,7 @@ impl ResolvedClientProxyConfig {
             ResolvedClientProxyConfig::Vmess { .. } => "VMess",
             ResolvedClientProxyConfig::Websocket(..) => "WebSocket",
             ResolvedClientProxyConfig::HttpUpgrade(..) => "HTTPUpgrade",
+            ResolvedClientProxyConfig::Grpc(..) => "gRPC",
             ResolvedClientProxyConfig::Xhttp(..) => "XHTTP",
             ResolvedClientProxyConfig::PortForward => "PortForward",
             ResolvedClientProxyConfig::Anytls { .. } => "AnyTLS",

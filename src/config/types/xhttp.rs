@@ -558,6 +558,9 @@ pub(crate) fn contains_resolved_server(
         crate::config::ResolvedServerProxyConfig::HttpUpgrade { targets } => targets
             .iter()
             .any(|t| contains_resolved_server(&t.protocol)),
+        crate::config::ResolvedServerProxyConfig::Grpc { targets } => targets
+            .iter()
+            .any(|t| contains_resolved_server(&t.protocol)),
         _ => false,
     }
 }
@@ -588,6 +591,9 @@ pub(crate) fn contains_server(protocol: &ServerProxyConfig) -> bool {
             targets.iter().any(|t| contains_server(&t.protocol))
         }
         ServerProxyConfig::HttpUpgrade { targets } => {
+            targets.iter().any(|t| contains_server(&t.protocol))
+        }
+        ServerProxyConfig::Grpc { targets } => {
             targets.iter().any(|t| contains_server(&t.protocol))
         }
         _ => false,
