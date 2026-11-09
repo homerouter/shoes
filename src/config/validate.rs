@@ -2420,10 +2420,14 @@ fn resolve_server_proxy_config(
             cipher,
             password,
             udp_enabled,
+            version,
+            mode,
         } => ResolvedServerProxyConfig::Snell {
             cipher,
             password,
             udp_enabled,
+            version,
+            mode,
         },
         ServerProxyConfig::Vless {
             user_id,
