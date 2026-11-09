@@ -6,6 +6,15 @@
 - Raised the TUN `resource_limits.tcp_buffer_size` default from 32 KiB to 128 KiB, giving each TCP flow 512 KiB of buffer capacity across four buffers. WireGuard retains its 32 KiB default and existing admission budget.
 - Upgrade note: TUN configurations that set `tcp_memory_bytes` without `tcp_buffer_size` now have a lower memory-derived connection limit (for example, 32 MiB permits 64 flows instead of 256). Previously valid budgets below 524,288 bytes fail validation with the new default. Explicitly set `tcp_buffer_size: 32768` to preserve the previous buffer size and admission calculation.
 
+## v0.3.8
+
+- Added HTTP/1.1 Upgrade transport (`httpupgrade`) interoperable with sing-box for inbound and outbound proxies, supporting early data via query parameter, header, or base64 path.
+- Added gRPC Gun transport (`grpc`) interoperable with sing-box for inbound and outbound proxies, supporting framing over HTTP/2 gRPC with bidirectional streaming for TCP streams and UDP packet routing.
+- Added Trojan UDP-over-TLS client and server support.
+- Added Snell v4, v5, and v6 protocol support with automatic inbound version detection.
+- Fixed ephemeral port collision race during multi-peer WireGuard test initialization.
+- Added automated sing-box integration test suite to CI, gated cross-compilation on test success, and added multi-layer GitHub Actions caching.
+
 ## v0.3.7
 
 - Added managed Linux desktop capture with `auto_route`, optional TCP `auto_redirect`, independent DNS interception, and best-effort systemd-resolved integration. Capture supports single-stack or temporarily offline underlays and retains network ownership across reloads; proxy transports and DIRECT traffic still require native connectivity. This is host TCP/UDP capture, not gateway forwarding. Requires network-administration privileges and `nft`; network-topology changes require a restart. See [managed TUN requirements and limitations](https://shoes-rs.github.io/config/tun/#managed-linux-desktop-capture).
