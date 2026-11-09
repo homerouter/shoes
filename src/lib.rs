@@ -99,6 +99,7 @@ mod thread_util;
 mod tls_client_handler;
 mod tls_server_handler;
 mod trojan_handler;
+mod trojan_udp_stream;
 mod tuic_server;
 mod udp_fragments;
 mod uot;

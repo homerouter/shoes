@@ -7,7 +7,7 @@ use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 
 use crate::address::{Address, ResolvedLocation};
-use crate::async_stream::AsyncStream;
+use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::ShadowsocksConfig;
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
@@ -20,6 +20,7 @@ use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
+use crate::trojan_udp_stream::{TrojanClientMessageStream, TrojanUdpStream};
 use crate::util::write_all;
 
 #[cfg(test)]
@@ -75,7 +76,7 @@ mod client_handshake_tests {
     #[tokio::test]
     async fn client_submits_complete_handshake_in_one_write() {
         for address in ["example.com:443", "127.0.0.1:80", "[::1]:8080"] {
-            let handler = TrojanTcpHandler::new_client("password", &None);
+            let handler = TrojanTcpHandler::new_client("password", &None, true);
             let location = crate::address::NetLocation::from_str(address, None).unwrap();
             let stream = RecordingStream::default();
             let writes = stream.0.clone();
@@ -106,6 +107,7 @@ struct ShadowsocksData {
 pub struct TrojanTcpHandler {
     password_hash: Box<[u8]>,
     shadowsocks_data: Option<ShadowsocksData>,
+    udp_enabled: bool,
     /// Proxy selector for server handler use. None when used as client handler.
     proxy_selector: Option<Arc<ClientProxySelector>>,
     /// DNS resolver for h2mux sessions. None when used as client handler.
@@ -117,25 +119,32 @@ impl TrojanTcpHandler {
     pub fn new_server(
         password: &str,
         shadowsocks_config: &Option<ShadowsocksConfig>,
+        udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
         Self::new_inner(
             password,
             shadowsocks_config,
+            udp_enabled,
             Some(proxy_selector),
             Some(resolver),
         )
     }
 
     /// Create a new handler for client use (no proxy_selector needed)
-    pub fn new_client(password: &str, shadowsocks_config: &Option<ShadowsocksConfig>) -> Self {
-        Self::new_inner(password, shadowsocks_config, None, None)
+    pub fn new_client(
+        password: &str,
+        shadowsocks_config: &Option<ShadowsocksConfig>,
+        udp_enabled: bool,
+    ) -> Self {
+        Self::new_inner(password, shadowsocks_config, udp_enabled, None, None)
     }
 
     fn new_inner(
         password: &str,
         shadowsocks_config: &Option<ShadowsocksConfig>,
+        udp_enabled: bool,
         proxy_selector: Option<Arc<ClientProxySelector>>,
         resolver: Option<Arc<dyn Resolver>>,
     ) -> Self {
@@ -162,6 +171,7 @@ impl TrojanTcpHandler {
         Self {
             password_hash,
             shadowsocks_data,
+            udp_enabled,
             proxy_selector,
             resolver,
         }
@@ -211,10 +221,38 @@ impl TcpServerHandler for TrojanTcpHandler {
         let command_type = stream_reader.read_u8(&mut server_stream).await?;
 
         if command_type == CMD_UDP_ASSOCIATE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "UDP associate command is not supported",
-            ));
+            if !self.udp_enabled {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "UDP associate command is disabled",
+                ));
+            }
+
+            let _remote_location = read_location(&mut server_stream, &mut stream_reader).await?;
+
+            let request_suffix = stream_reader.read_u16_be(&mut server_stream).await?;
+            if request_suffix != 0x0d0a {
+                return Err(std::io::Error::other(format!(
+                    "Invalid request suffix bytes {request_suffix}"
+                )));
+            }
+
+            let proxy_selector = self
+                .proxy_selector
+                .clone()
+                .expect("proxy_selector required for server handler");
+
+            let mut trojan_udp_stream = TrojanUdpStream::new(server_stream);
+            let unparsed = stream_reader.unparsed_data();
+            if !unparsed.is_empty() {
+                trojan_udp_stream.feed_initial_data(unparsed);
+            }
+
+            return Ok(TcpServerSetupResult::MultiDirectionalUdp {
+                stream: Box::new(trojan_udp_stream),
+                need_initial_flush: false,
+                proxy_selector,
+            });
         }
 
         if command_type != CMD_CONNECT {
@@ -317,14 +355,49 @@ impl TcpClientHandler for TrojanTcpHandler {
     }
 
     fn supports_udp_over_tcp(&self) -> bool {
-        // TODO: Return true once setup_client_udp_bidirectional is implemented
-        false
+        self.udp_enabled
     }
 
-    // TODO: Implement Trojan UDP-over-TCP
-    // Trojan UDP uses a message-framed protocol where each packet has:
-    // ATYPE + Address + Port + Length(2 bytes) + CRLF + Payload
-    // async fn setup_client_udp_bidirectional(...)
+    async fn setup_client_udp_bidirectional(
+        &self,
+        mut client_stream: Box<dyn AsyncStream>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        if !self.udp_enabled {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "UDP-over-TCP is disabled for this Trojan client",
+            ));
+        }
+
+        if let Some(ShadowsocksData {
+            ref cipher,
+            ref key,
+        }) = self.shadowsocks_data
+        {
+            client_stream = Box::new(ShadowsocksStream::new(
+                client_stream,
+                ShadowsocksStreamType::Aead,
+                cipher.algorithm(),
+                cipher.salt_len(),
+                key.clone(),
+                None,
+            ));
+        }
+
+        let location_bytes = write_location_to_vec(target.location())?;
+        let mut header = Vec::with_capacity(self.password_hash.len() + location_bytes.len() + 5);
+        header.extend_from_slice(&self.password_hash);
+        header.extend_from_slice(&CRLF_BYTES);
+        header.push(CMD_UDP_ASSOCIATE);
+        header.extend_from_slice(&location_bytes);
+        header.extend_from_slice(&CRLF_BYTES);
+        write_all(&mut client_stream, &header).await?;
+        client_stream.flush().await?;
+
+        let stream = TrojanClientMessageStream::new(client_stream, target.into_location());
+        Ok(Box::new(stream))
+    }
 }
 
 fn create_password_hash(password: &str) -> Box<[u8]> {
@@ -348,6 +421,10 @@ fn create_password_hash(password: &str) -> Box<[u8]> {
 mod tests {
     use super::*;
     use crate::address::NetLocation;
+    use crate::async_stream::{
+        AsyncFlushMessage, AsyncReadMessage, AsyncReadTargetedMessage, AsyncWriteMessage,
+        AsyncWriteSourcedMessage,
+    };
     use crate::resolver::NativeResolver;
     use std::io::ErrorKind;
     use tokio::io::AsyncReadExt;
@@ -356,6 +433,17 @@ mod tests {
         TrojanTcpHandler::new_server(
             "password",
             &None,
+            true,
+            Arc::new(ClientProxySelector::new(vec![])),
+            Arc::new(NativeResolver::new()),
+        )
+    }
+
+    fn handler_no_udp() -> TrojanTcpHandler {
+        TrojanTcpHandler::new_server(
+            "password",
+            &None,
+            false,
             Arc::new(ClientProxySelector::new(vec![])),
             Arc::new(NativeResolver::new()),
         )
@@ -402,7 +490,7 @@ mod tests {
     async fn client_emits_hash_connect_address_and_suffix() {
         let location = NetLocation::from_str("example.com:443", None).unwrap();
         let (client, mut server) = tokio::io::duplex(1024);
-        let result = TrojanTcpHandler::new_client("password", &None)
+        let result = TrojanTcpHandler::new_client("password", &None, true)
             .setup_client_tcp_stream(Box::new(client), location.clone().into())
             .await
             .unwrap();
@@ -421,7 +509,7 @@ mod tests {
         let mut wrong_hash = valid.clone();
         wrong_hash[0] = b'0';
         cases.push((wrong_hash, ErrorKind::Other));
-        for command in [CMD_UDP_ASSOCIATE, 0xff] {
+        for command in [0x00, 0x02, 0xff] {
             let mut request = valid.clone();
             request[58] = command;
             cases.push((request, ErrorKind::InvalidInput));
@@ -447,6 +535,97 @@ mod tests {
                 kind
             );
         }
+    }
+
+    #[tokio::test]
+    async fn udp_associate_when_disabled_returns_permission_denied() {
+        let location = NetLocation::from_str("example.com:443", None).unwrap();
+        let mut udp_request = request(&location);
+        udp_request[58] = CMD_UDP_ASSOCIATE;
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(&udp_request).await.unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            handler_no_udp()
+                .setup_server_stream(Box::new(server))
+                .await
+                .err()
+                .unwrap()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn client_and_server_udp_associate_e2e() {
+        use std::pin::Pin;
+        use tokio::io::ReadBuf;
+
+        let target = NetLocation::from_str("8.8.8.8:53", None).unwrap();
+        let (client_io, server_io) = tokio::io::duplex(65536);
+
+        let client_handler = TrojanTcpHandler::new_client("password", &None, true);
+        let server_handler = handler();
+
+        assert!(client_handler.supports_udp_over_tcp());
+
+        // Connect client and server
+        let client_fut = client_handler.setup_client_udp_bidirectional(
+            Box::new(client_io),
+            target.clone().into(),
+        );
+        let server_fut = server_handler.setup_server_stream(Box::new(server_io));
+
+        let (mut client_msg_stream, server_res) = tokio::try_join!(client_fut, server_fut).unwrap();
+
+        let TcpServerSetupResult::MultiDirectionalUdp { mut stream, .. } = server_res else {
+            panic!("expected MultiDirectionalUdp");
+        };
+
+        // 1. Client sends UDP packet
+        let client_payload = b"test trojan udp payload";
+        futures::future::poll_fn(|cx| {
+            Pin::new(&mut client_msg_stream).poll_write_message(cx, client_payload)
+        })
+        .await
+        .unwrap();
+        futures::future::poll_fn(|cx| Pin::new(&mut client_msg_stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+
+        // 2. Server receives targeted packet
+        let mut server_buf = vec![0u8; 1024];
+        let mut read_buf = ReadBuf::new(&mut server_buf);
+        let received_target = futures::future::poll_fn(|cx| {
+            Pin::new(&mut stream).poll_read_targeted_message(cx, &mut read_buf)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(received_target, target);
+        assert_eq!(read_buf.filled(), client_payload);
+
+        // 3. Server replies with sourced packet
+        let reply_payload = b"trojan udp reply data";
+        futures::future::poll_fn(|cx| {
+            Pin::new(&mut stream).poll_write_sourced_message(cx, reply_payload, &received_target)
+        })
+        .await
+        .unwrap();
+        futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+
+        // 4. Client receives reply
+        let mut client_buf = vec![0u8; 1024];
+        let mut client_read_buf = ReadBuf::new(&mut client_buf);
+        futures::future::poll_fn(|cx| {
+            Pin::new(&mut client_msg_stream).poll_read_message(cx, &mut client_read_buf)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(client_read_buf.filled(), reply_payload);
     }
 
     #[tokio::test]

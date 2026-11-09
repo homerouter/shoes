@@ -81,11 +81,15 @@ fn wireguard_check_validates_outer_udp_without_dns_or_listeners() {
     for mode in ["check", "--dry-run"] {
         for (protocol, valid) in [
             (json!({"type": "socks"}), false),
-            (json!({"type": "trojan", "password": "test"}), false),
+            (
+                json!({"type": "trojan", "password": "test", "udp_enabled": false}),
+                false,
+            ),
             (
                 json!({"type": "vless", "user_id": shoes_test_support::test_fixture::TEST_UUID, "udp_enabled": false}),
                 false,
             ),
+            (json!({"type": "trojan", "password": "test"}), true),
             (wireguard_support::vless_protocol(), true),
         ] {
             endpoint["client_chains"][0]["protocol"]["peer_client_chain"] = json!([{

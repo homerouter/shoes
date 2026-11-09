@@ -150,6 +150,7 @@ fn create_test_server_config_trojan() -> ServerConfig {
                 cipher: "chacha20-poly1305".try_into().unwrap(),
                 password: "ss_password".to_string(),
             }),
+            udp_enabled: true,
         },
         transport: Transport::Tcp,
         tcp_settings: None,
