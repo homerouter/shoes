@@ -1446,21 +1446,30 @@ async fn wireguard_rejects_wrong_psk_spoofed_sources_and_unsolicited_flows() {
 #[tokio::test]
 async fn wireguard_multiple_peers_share_a_bind_without_cross_delivering_replies() {
     tokio::time::timeout(Duration::from_secs(10), async {
-        let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-        let port = reservation.local_addr().unwrap().port();
-        let mut configs = validate(&pair_config(port)).unwrap();
-        let mut peer = configs.wireguard_endpoints[SERVER].peers[0].clone();
-        peer.public_key = serde_yaml::from_str(&public(44)).unwrap();
-        peer.allowed_ips = vec!["10.77.0.3/32".into(), "fd77::3/128".into()];
-        configs.wireguard_endpoints[SERVER].peers.push(peer);
-        let mut client = configs.wireguard_endpoints[CLIENT].clone();
-        client.id = "second-client".into();
-        client.private_key = crate::config::wireguard::WireguardKey([44; 32]);
-        client.addresses = vec!["10.77.0.3/32".into(), "fd77::3/128".into()];
-        configs.wireguard_endpoints.push(client);
-        let prepared = Prepared::new(&mut configs).await.unwrap();
-        drop(reservation);
-        let mut running = start_prepared(&prepared).await;
+        let mut attempts = 0;
+        let (prepared, mut running) = loop {
+            attempts += 1;
+            let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            let mut configs = validate(&pair_config(port)).unwrap();
+            let mut peer = configs.wireguard_endpoints[SERVER].peers[0].clone();
+            peer.public_key = serde_yaml::from_str(&public(44)).unwrap();
+            peer.allowed_ips = vec!["10.77.0.3/32".into(), "fd77::3/128".into()];
+            configs.wireguard_endpoints[SERVER].peers.push(peer);
+            let mut client = configs.wireguard_endpoints[CLIENT].clone();
+            client.id = "second-client".into();
+            client.private_key = crate::config::wireguard::WireguardKey([44; 32]);
+            client.addresses = vec!["10.77.0.3/32".into(), "fd77::3/128".into()];
+            configs.wireguard_endpoints.push(client);
+            let prepared = Prepared::new(&mut configs).await.unwrap();
+            drop(reservation);
+            let mut running = Running::default();
+            match prepared.start(&mut DnsRegistry::new(), &mut running).await {
+                Ok(()) => break (prepared, running),
+                Err(err) if attempts < 5 && err.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(err) => panic!("failed to start prepared: {err}"),
+            }
+        };
         for v6 in [false, true] {
             let (tcp, udp, _echoes) = echo_servers(v6).await;
             tokio::join!(
