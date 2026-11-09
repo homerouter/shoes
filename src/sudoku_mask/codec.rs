@@ -998,7 +998,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "exports Rust wire samples for tests/fixtures/sudoku/xray.go -verify"]
     fn export_rust_wire_samples() {
         let mut samples: Vec<Sample> =
             serde_json::from_str(include_str!("../../tests/fixtures/sudoku/xray.json")).unwrap();
@@ -1026,14 +1025,12 @@ mod tests {
         }
         for sample in &mut samples {
             let config = super::super::tests::config(sample.config.clone());
-            let mut encoder = Encoder::new(
-                config,
-                if sample.packed {
-                    Role::Server
-                } else {
-                    Role::Client
-                },
-            );
+            let role = if sample.packed {
+                Role::Server
+            } else {
+                Role::Client
+            };
+            let mut encoder = Encoder::new(config.clone(), role);
             let plain = STANDARD.decode(&sample.plain).unwrap();
             let mut wire = Vec::new();
             let mut rest = plain.as_slice();
@@ -1044,11 +1041,24 @@ mod tests {
                 rest = &rest[size..];
             }
             assert!(rest.is_empty());
-            sample.wire = STANDARD.encode(wire);
+            sample.wire = STANDARD.encode(&wire);
+
+            let decode_role = if sample.packed {
+                Role::Client
+            } else {
+                Role::Server
+            };
+            let mut decoder = Decoder::new(config, decode_role);
+            let decoded: Vec<_> = wire
+                .iter()
+                .filter_map(|b| decoder.decode_byte(*b).transpose())
+                .collect::<io::Result<_>>()
+                .unwrap();
+            assert_eq!(decoded, plain);
         }
-        let path =
-            std::env::var_os("SUDOKU_RUST_VECTORS").expect("SUDOKU_RUST_VECTORS is required");
-        std::fs::write(path, serde_json::to_vec_pretty(&samples).unwrap()).unwrap();
+        if let Some(path) = std::env::var_os("SUDOKU_RUST_VECTORS") {
+            std::fs::write(path, serde_json::to_vec_pretty(&samples).unwrap()).unwrap();
+        }
     }
 
     #[test]
