@@ -2913,7 +2913,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shoes"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "aho-corasick",
  "android_logger",
@@ -3230,8 +3230,7 @@ dependencies = [
 [[package]]
 name = "tendns"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "083f722b72d7e490ae15c666def739528a139ffaa4b3bced69292e2559fab8a7"
+source = "git+https://github.com/homerouter/tendns?rev=af51da7824e808dca16966c41d77623649c74a78#af51da7824e808dca16966c41d77623649c74a78"
 dependencies = [
  "anyhow",
  "async-trait",
