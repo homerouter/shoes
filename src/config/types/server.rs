@@ -768,6 +768,10 @@ pub enum ServerProxyConfig {
         password: String,
         #[serde(default = "default_true")]
         udp_enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
     },
     Vless {
         user_id: String,
@@ -977,6 +981,10 @@ pub enum ResolvedServerProxyConfig {
         cipher: String,
         password: String,
         udp_enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
     },
     Vless {
         user_id: String,

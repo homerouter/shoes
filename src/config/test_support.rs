@@ -192,10 +192,14 @@ impl Inline for ResolvedServerProxyConfig {
                 cipher,
                 password,
                 udp_enabled,
+                version,
+                mode,
             } => Self::Snell {
                 cipher,
                 password,
                 udp_enabled,
+                version,
+                mode,
             },
             ServerProxyConfig::Vless {
                 user_id,
