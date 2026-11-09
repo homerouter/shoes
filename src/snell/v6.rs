@@ -758,8 +758,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWriteMessage for V6Conn<S> {
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
         ready!(this.poll_send_out(cx))?;
+        // A retry after Pending: this packet is already staged (and maybe sent by a flush).
+        if this.send.owed.take().is_some() {
+            return Poll::Ready(Ok(()));
+        }
         this.stage_packet_frame(buf)?;
+        this.send.owed = Some(0);
         ready!(this.poll_send_out(cx))?;
+        this.send.owed = None;
         Poll::Ready(Ok(()))
     }
 }
@@ -1115,6 +1121,52 @@ mod tests {
             let (_raw, (stream, packet)) = within(async { tokio::join!(feed, read) }).await;
             assert!(stream == pattern(3000, 7, 3), "{mode:?}");
             assert!(packet == pattern(700, 11, 5), "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_message_retry_after_flush_sends_packet_once() {
+        for mode in [SnellV6Mode::Default, SnellV6Mode::Unshaped, SnellV6Mode::UnsafeRaw] {
+            let psk: Arc<[u8]> = Arc::from(b"v6-unit-psk".as_slice());
+            let (a, b) = tokio::io::duplex(64);
+            let mut writer = V6Conn::new(a, Arc::clone(&psk), V6Codec::new(mode, &psk));
+            let mut reader = V6Conn::new(b, Arc::clone(&psk), V6Codec::new(mode, &psk));
+            let packet = pattern(1000, 13, 1);
+
+            let waker = std::task::Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            assert!(Pin::new(&mut writer)
+                .poll_write_message(&mut cx, &packet)
+                .is_pending());
+
+            let reader_task = tokio::spawn(async move {
+                let mut packets = Vec::new();
+                loop {
+                    let mut data = vec![0u8; 0x10000];
+                    let mut read_buf = ReadBuf::new(&mut data);
+                    std::future::poll_fn(|cx| {
+                        Pin::new(&mut reader).poll_read_message(cx, &mut read_buf)
+                    })
+                    .await
+                    .unwrap();
+                    if read_buf.filled().is_empty() {
+                        return packets;
+                    }
+                    packets.push(read_buf.filled().to_vec());
+                }
+            });
+
+            writer.flush().await.unwrap();
+            assert!(matches!(
+                Pin::new(&mut writer).poll_write_message(&mut cx, &packet),
+                Poll::Ready(Ok(()))
+            ));
+            // The next stream write must not report a stale count.
+            writer.write_all(b"tail").await.unwrap();
+            writer.shutdown().await.unwrap();
+
+            let packets = reader_task.await.unwrap();
+            assert!(packets == vec![packet, b"tail".to_vec()], "{mode:?}");
         }
     }
 }
