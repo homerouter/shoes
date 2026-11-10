@@ -569,6 +569,7 @@ pub fn find_singbox_binary_with(capability: SingBoxCapability) -> io::Result<Pat
         PathBuf::from("sing-box"),
     ]);
     if let Some(home) = home {
+        candidates.push(home.join("work/sing-box-project/sing-box/sing-box"));
         candidates.push(home.join("go/bin/sing-box"));
         candidates.push(home.join(".asdf/shims/sing-box"));
     }
