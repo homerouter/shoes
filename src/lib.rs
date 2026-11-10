@@ -57,6 +57,7 @@ mod file_watcher;
 mod h2mux;
 mod http2;
 mod http_handler;
+mod httpupgrade;
 mod hysteria2_server;
 mod listener_tasks;
 mod mixed_handler;

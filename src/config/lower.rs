@@ -168,6 +168,21 @@ fn client_protocol(
                 protocol: Box::new(client_protocol(*config.protocol, None)),
             })
         }
+        ClientProxyConfig::HttpUpgrade(config) => {
+            let mut matching_headers = config.matching_headers;
+            if let Some(host) = config.host {
+                matching_headers
+                    .get_or_insert_with(std::collections::HashMap::new)
+                    .entry("Host".to_string())
+                    .or_insert(host);
+            }
+            ResolvedClientProxyConfig::HttpUpgrade(ResolvedHttpUpgradeClientConfig {
+                matching_path: config.matching_path,
+                matching_headers,
+                host: None,
+                protocol: Box::new(client_protocol(*config.protocol, None)),
+            })
+        }
         ClientProxyConfig::Xhttp(config) => {
             ResolvedClientProxyConfig::Xhttp(ResolvedXhttpClientConfig {
                 path: config.path,

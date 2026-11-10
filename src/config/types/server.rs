@@ -706,6 +706,23 @@ pub struct WebsocketServerRecord<P, R> {
 pub type WebsocketServerConfig =
     WebsocketServerRecord<ServerProxyConfig, ConfigSelection<RuleConfig>>;
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(bound(deserialize = "P: Deserialize<'de>, R: Deserialize<'de>"))]
+pub struct HttpUpgradeServerRecord<P, R> {
+    #[serde(alias = "path", default)]
+    pub matching_path: Option<String>,
+    #[serde(alias = "headers", default)]
+    pub matching_headers: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub protocol: P,
+    #[serde(alias = "override_rule", default)]
+    pub override_rules: NoneOrSome<R>,
+}
+
+pub type HttpUpgradeServerConfig =
+    HttpUpgradeServerRecord<ServerProxyConfig, ConfigSelection<RuleConfig>>;
+
 #[derive(Default, Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum WebsocketPingType {
@@ -850,6 +867,11 @@ pub enum ServerProxyConfig {
         #[serde(alias = "target")]
         targets: Box<OneOrSome<WebsocketServerConfig>>,
     },
+    #[serde(alias = "http-upgrade", alias = "http_upgrade")]
+    HttpUpgrade {
+        #[serde(alias = "target")]
+        targets: Box<OneOrSome<HttpUpgradeServerConfig>>,
+    },
     #[serde(alias = "forward")]
     PortForward {
         #[serde(alias = "target")]
@@ -943,6 +965,7 @@ impl std::fmt::Display for ServerProxyConfig {
             }
             Self::Vmess { .. } => write!(f, "Vmess"),
             Self::Websocket { .. } => write!(f, "Websocket"),
+            Self::HttpUpgrade { .. } => write!(f, "HttpUpgrade"),
             Self::Xhttp(..) => write!(f, "XHTTP"),
             Self::PortForward { .. } => write!(f, "Portforward"),
             Self::Hysteria2 { .. } => write!(f, "Hysteria2"),
@@ -1033,6 +1056,10 @@ pub enum ResolvedServerProxyConfig {
     Websocket {
         targets: Box<OneOrSome<crate::config::resolved::ResolvedWebsocketServerConfig>>,
     },
+    #[serde(alias = "http-upgrade", alias = "http_upgrade")]
+    HttpUpgrade {
+        targets: Box<OneOrSome<crate::config::resolved::ResolvedHttpUpgradeServerConfig>>,
+    },
     PortForward {
         targets: OneOrSome<NetLocation>,
     },
@@ -1102,6 +1129,7 @@ impl std::fmt::Display for ResolvedServerProxyConfig {
             }
             Self::Vmess { .. } => write!(f, "Vmess"),
             Self::Websocket { .. } => write!(f, "Websocket"),
+            Self::HttpUpgrade { .. } => write!(f, "HttpUpgrade"),
             Self::Xhttp(..) => write!(f, "XHTTP"),
             Self::PortForward { .. } => write!(f, "Portforward"),
             Self::Hysteria2 { .. } => write!(f, "Hysteria2"),

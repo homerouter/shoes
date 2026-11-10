@@ -9,8 +9,9 @@ use crate::anytls::{AnyTlsServerHandler, PaddingFactory};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::{ResolvedClientConfig, ResolvedClientHop};
 use crate::config::{
-    ResolvedRealityServerConfig, ResolvedRuleConfig, ResolvedServerProxyConfig,
-    ResolvedShadowTlsServerConfig, ResolvedShadowTlsServerHandshakeConfig, ResolvedTlsServerConfig,
+    ResolvedHttpUpgradeServerConfig, ResolvedRealityServerConfig, ResolvedRuleConfig,
+    ResolvedServerProxyConfig, ResolvedShadowTlsServerConfig,
+    ResolvedShadowTlsServerHandshakeConfig, ResolvedTlsServerConfig,
     ResolvedWebsocketServerConfig, ShadowsocksConfig,
 };
 use crate::http_handler::HttpTcpServerHandler;
@@ -382,6 +383,23 @@ fn create_handler(
                 })
                 .collect::<std::io::Result<Vec<_>>>()?;
             Box::new(WebsocketTcpServerHandler::new(server_targets))
+        }
+        ResolvedServerProxyConfig::HttpUpgrade { targets } => {
+            let server_targets: Vec<crate::httpupgrade::HttpUpgradeServerTarget> = targets
+                .into_vec()
+                .into_iter()
+                .enumerate()
+                .map(|(index, config)| {
+                    create_httpupgrade_server_target(
+                        config,
+                        client_proxy_selector,
+                        resolver,
+                        bind_ip,
+                        &mut scope.child(format!("httpupgrade:{index}")),
+                    )
+                })
+                .collect::<std::io::Result<Vec<_>>>()?;
+            Box::new(crate::httpupgrade::HttpUpgradeTcpServerHandler::new(server_targets))
         }
         ResolvedServerProxyConfig::PortForward { targets } => {
             let targets = targets.into_vec();
@@ -787,6 +805,55 @@ fn create_websocket_server_target(
         ping_type,
         handler,
     })
+}
+
+fn create_httpupgrade_server_target(
+    httpupgrade_server_config: ResolvedHttpUpgradeServerConfig,
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    bind_ip: Option<IpAddr>,
+    scope: &mut ServiceScope<'_>,
+) -> std::io::Result<crate::httpupgrade::HttpUpgradeServerTarget> {
+    crate::httpupgrade::validate_server_config(
+        httpupgrade_server_config.matching_path.as_deref(),
+        httpupgrade_server_config.matching_headers.as_ref(),
+    )?;
+    let ResolvedHttpUpgradeServerConfig {
+        matching_path,
+        matching_headers,
+        host,
+        protocol,
+        override_rules,
+    } = httpupgrade_server_config;
+
+    let mut matching_headers = matching_headers.map(|h| {
+        h.into_iter()
+            .map(|(mut key, val)| {
+                key.make_ascii_lowercase();
+                (key, val)
+            })
+            .collect::<FxHashMap<_, _>>()
+    });
+    if let Some(host) = host {
+        matching_headers
+            .get_or_insert_with(Default::default)
+            .entry("host".to_string())
+            .or_insert(host);
+    }
+
+    let effective_selector = if !override_rules.is_empty() {
+        create_override_selector(override_rules, client_proxy_selector, resolver)?
+    } else {
+        client_proxy_selector.clone()
+    };
+
+    let handler = create_handler(protocol, &effective_selector, resolver, bind_ip, scope)?;
+
+    Ok(crate::httpupgrade::HttpUpgradeServerTarget::new(
+        matching_path,
+        matching_headers,
+        handler,
+    ))
 }
 
 #[cfg(test)]

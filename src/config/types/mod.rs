@@ -36,8 +36,8 @@ pub mod xhttp;
 pub use clash_api::{CacheFileConfig, ClashApiConfig, ControlConfig};
 #[allow(unused_imports)]
 pub use client::{
-    ClientConfig, ClientProxyConfig, H2MuxConfig, HttpVersion, TlsClientConfig,
-    WebsocketClientConfig,
+    ClientConfig, ClientProxyConfig, H2MuxConfig, HttpUpgradeClientConfig, HttpVersion,
+    TlsClientConfig, WebsocketClientConfig,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
@@ -50,9 +50,9 @@ pub use ntp::NtpConfig;
 pub use rules::{ClientChain, ClientChainHop, RuleActionConfig, RuleConfig};
 pub use selection::ConfigSelection;
 pub use server::{
-    RealityServerConfig, ServerConfig, ServerProxyConfig, ShadowTlsServerConfig,
-    ShadowTlsServerHandshakeConfig, TlsServerConfig, WebsocketPingType, WebsocketServerConfig,
-    direct_allow_rule,
+    HttpUpgradeServerConfig, RealityServerConfig, ServerConfig, ServerProxyConfig,
+    ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, TlsServerConfig, WebsocketPingType,
+    WebsocketServerConfig, direct_allow_rule,
 };
 pub use shadowsocks::ShadowsocksConfig;
 pub use tls::TlsKeyExchangeGroups;
