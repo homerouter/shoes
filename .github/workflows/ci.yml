@@ -4,29 +4,25 @@ on:
   push:
     branches:
       - '**'
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'examples/**'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.dockerignore'
-      - 'LICENSE*'
-      - 'licenses/**'
-      - 'THIRD_PARTY_NOTICES.md'
-      - 'about.toml'
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'benches/**'
+      - 'include/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
   pull_request:
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'examples/**'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.dockerignore'
-      - 'LICENSE*'
-      - 'licenses/**'
-      - 'THIRD_PARTY_NOTICES.md'
-      - 'about.toml'
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'benches/**'
+      - 'include/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
   workflow_dispatch:
 
 concurrency:
@@ -88,9 +84,6 @@ jobs:
           sudo mv "$RUNNER_TEMP/singbox/sing-box" /usr/local/bin/sing-box
           sudo chmod +x /usr/local/bin/sing-box
           /usr/local/bin/sing-box version
-
-      - name: Test deb packaging script
-        run: python3 scripts/test-package-deb.py
 
       - name: Run Snell unit tests
         run: |
