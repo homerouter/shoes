@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.0
+
 - Added Snell obfuscation (`simple-obfs`) matching Surge 6.4.4 and sing-snell:
   - Server-side HTTP simple-obfs on Snell v5 server (`obfs_mode: "http"`, default `"none"`).
     TLS obfs is rejected during configuration validation with a suggestion to use ShadowTLS.
