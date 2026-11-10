@@ -2631,3 +2631,397 @@ async fn test_server_dns_unknown_group_ref() {
         err
     );
 }
+
+#[test]
+fn snell_server_users_validation() {
+    let base = "type: snell\ncipher: aes-128-gcm\n";
+    let userkey = "multi_user_authentication: userkey\n";
+    let psk = "multi_user_authentication: psk\n";
+    let cases: &[(String, Option<&str>)] = &[
+        ("password: shared\n".into(), None),
+        ("password: ''\n".into(), Some("Snell server password must not be empty")),
+        ("version: v6\npassword: short\n".into(), Some("Snell v6 password must be 12 to 255 bytes")),
+        ("version: v6\npassword: long-enough-psk\n".into(), None),
+        (
+            "password: shared\nmulti_user_authentication: userkey\n".into(),
+            Some("Snell multi_user_authentication requires users"),
+        ),
+        (
+            "password: shared\nusers:\n  - userkey: k\n".into(),
+            Some("Snell users require version v4, v5 or v6"),
+        ),
+        (
+            "version: v3\npassword: shared\nusers:\n  - userkey: k\n".into(),
+            Some("Snell users require version v4, v5 or v6"),
+        ),
+        (
+            "version: v5\npassword: shared\nmulti_user_authentication: other\nusers:\n  - userkey: k\n"
+                .into(),
+            Some("Snell multi_user_authentication must be userkey or psk"),
+        ),
+        (
+            format!("version: v5\npassword: shared\n{userkey}users:\n  - name: a\n    userkey: k\n"),
+            None,
+        ),
+        (
+            "version: v5\npassword: shared\nusers:\n  - name: a\n    userkey: k\n".into(),
+            None,
+        ),
+        (
+            format!("version: v5\n{userkey}users:\n  - userkey: k\n"),
+            Some("Snell server password must not be empty"),
+        ),
+        (
+            format!("version: v5\npassword: shared\n{userkey}users:\n  - name: a\n"),
+            Some("Snell users[].userkey must be 1 to 255 bytes"),
+        ),
+        (
+            format!("version: v5\npassword: shared\n{userkey}users:\n  - userkey: {}\n", "k".repeat(256)),
+            Some("Snell users[].userkey must be 1 to 255 bytes"),
+        ),
+        (
+            format!("version: v5\npassword: shared\n{userkey}users:\n  - userkey: k\n    password: p\n"),
+            Some("Snell users[].password is not allowed with userkey authentication"),
+        ),
+        (
+            format!("version: v5\npassword: shared\n{userkey}users:\n  - userkey: k\n  - userkey: k\n"),
+            Some("Snell users[].userkey must be unique"),
+        ),
+        (
+            format!("version: v5\n{psk}users:\n  - name: a\n    password: user-a-psk\n"),
+            None,
+        ),
+        (
+            format!("version: v5\npassword: shared\n{psk}users:\n  - password: user-a-psk\n"),
+            Some("Snell password is not allowed with psk authentication"),
+        ),
+        (
+            format!("version: v5\n{psk}users:\n  - name: a\n"),
+            Some("Snell users[].password must not be empty"),
+        ),
+        (
+            format!("version: v5\n{psk}users:\n  - password: p\n    userkey: k\n"),
+            Some("Snell users[].userkey is not allowed with psk authentication"),
+        ),
+        (
+            format!("version: v5\n{psk}users:\n  - password: same\n  - password: same\n"),
+            Some("Snell users[].password must be unique"),
+        ),
+        (
+            format!("version: v6\n{psk}users:\n  - password: short\n"),
+            Some("Snell v6 users[].password must be 12 to 255 bytes"),
+        ),
+        (
+            format!("version: v6\nmode: unsafe-raw\n{psk}users:\n  - password: user-a-psk-long\n"),
+            Some("Snell psk authentication is unavailable in v6 unsafe-raw mode"),
+        ),
+        (
+            format!("version: v6\nmode: unshaped\n{psk}users:\n  - password: user-a-psk-long\n"),
+            None,
+        ),
+    ];
+    for (extra, expected) in cases {
+        let config: ServerProxyConfig = serde_yaml::from_str(&format!("{base}{extra}"))
+            .unwrap_or_else(|error| panic!("{extra}: {error}"));
+        let result = validate_server_auth(&config);
+        match expected {
+            None => result.unwrap_or_else(|error| panic!("{extra}: {error}")),
+            Some(message) => {
+                let error = result.expect_err(extra).to_string();
+                assert!(error.contains(message), "{extra}: {error}");
+            }
+        }
+    }
+}
+
+#[test]
+fn snell_users_need_aes_128_gcm() {
+    let config: ServerProxyConfig = serde_yaml::from_str(
+        "type: snell\ncipher: chacha20-ietf-poly1305\nversion: v5\npassword: shared\n\
+         users:\n  - userkey: k\n",
+    )
+    .unwrap();
+    let error = validate_server_auth(&config).unwrap_err().to_string();
+    assert!(error.contains("Snell users require cipher aes-128-gcm"), "{error}");
+}
+
+#[test]
+fn snell_client_configuration_validation() {
+    use serde_json::json;
+
+    let cases: &[(serde_json::Value, Option<&str>)] = &[
+        (
+            json!({"type": "snell", "cipher": "aes-128-gcm", "password": "pass"}),
+            None,
+        ),
+        (
+            json!({"type": "snell", "version": 4, "password": "pass", "reuse": true}),
+            None,
+        ),
+        (
+            json!({
+                "type": "snell", "version": 6, "password": "password-12345",
+                "mode": "default", "reuse": true, "quic_proxy_mode": true
+            }),
+            None,
+        ),
+        (
+            json!({"type": "snell", "version": "v1", "password": "pass", "udp_enabled": false}),
+            None,
+        ),
+        (
+            json!({"type": "snell", "version": 2, "password": "pass", "udp_enabled": false}),
+            None,
+        ),
+        (
+            json!({"type": "snell", "version": 3, "password": "pass", "udp_enabled": true}),
+            None,
+        ),
+        (
+            json!({"type": "snell", "version": 5, "password": "pass", "userkey": "key1"}),
+            None,
+        ),
+        (
+            json!({"type": "snell", "version": 6, "password": "short"}),
+            Some("psk length must be between 12 and 255 bytes"),
+        ),
+        (
+            json!({
+                "type": "snell", "version": 1, "password": "pass",
+                "reuse": true, "udp_enabled": false
+            }),
+            Some("reuse requires version 4 or above"),
+        ),
+        (
+            json!({"type": "snell", "version": 2, "password": "pass", "udp_enabled": true}),
+            Some("UDP requires version 3 or above"),
+        ),
+        (
+            json!({"type": "snell", "version": 3, "password": "pass", "userkey": "k"}),
+            Some("userkey requires version 4 or above"),
+        ),
+        (
+            json!({
+                "type": "snell", "version": 4, "password": "pass", "quic_proxy_mode": true
+            }),
+            Some("quic_proxy_mode requires version 5 or above"),
+        ),
+        (
+            json!({"type": "snell", "cipher": "2022-blake3-aes-128-gcm", "password": "pass"}),
+            Some("Snell does not support shadowsocks 2022 ciphers"),
+        ),
+    ];
+
+    for (value, expected) in cases {
+        let result: Result<ClientProxyConfig, _> = serde_json::from_value(value.clone());
+        match result {
+            Ok(mut client) => {
+                let val_result = validate_client_proxy_config(&mut client, &HashMap::new(), None);
+                match expected {
+                    None => {
+                        assert!(
+                            val_result.is_ok(),
+                            "{}: expected ok, got {:?}",
+                            value,
+                            val_result
+                        );
+                    }
+                    Some(msg) => {
+                        let err = val_result.expect_err(&format!("{}: expected error", value));
+                        assert!(
+                            err.to_string().contains(msg),
+                            "{}: expected '{}', got '{}'",
+                            value,
+                            msg,
+                            err
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                match expected {
+                    Some(msg) => {
+                        assert!(
+                            err.to_string().contains(msg),
+                            "{}: expected '{}', got '{}'",
+                            value,
+                            msg,
+                            err
+                        );
+                    }
+                    None => panic!("{}: expected ok deserialization, got {}", value, err),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn snell_obfs_configuration_validation() {
+    use serde_json::json;
+
+    let client_cases: &[(serde_json::Value, Option<&str>)] = &[
+        (
+            json!({
+                "type": "snell", "version": 1, "password": "pass", "udp_enabled": false,
+                "obfs_mode": "http", "obfs_host": "example.com", "obfs_uri": "/ws"
+            }),
+            None,
+        ),
+        (
+            json!({
+                "type": "snell", "version": 2, "password": "pass", "udp_enabled": false,
+                "obfs_mode": "tls", "obfs_host": "example.com"
+            }),
+            None,
+        ),
+        (
+            json!({
+                "type": "snell", "version": 3, "password": "pass",
+                "obfs_mode": "tls"
+            }),
+            None,
+        ),
+        (
+            json!({
+                "type": "snell", "version": 4, "password": "pass",
+                "obfs_mode": "http"
+            }),
+            None,
+        ),
+        (
+            json!({
+                "type": "snell", "version": 5, "password": "pass",
+                "obfs_mode": "http"
+            }),
+            None,
+        ),
+        (
+            json!({
+                "type": "snell", "version": 4, "password": "pass",
+                "obfs_mode": "tls"
+            }),
+            Some("TLS obfs is unsupported for version 4; use ShadowTLS instead"),
+        ),
+        (
+            json!({
+                "type": "snell", "version": 5, "password": "pass",
+                "obfs_mode": "tls"
+            }),
+            Some("TLS obfs is unsupported for version 5; use ShadowTLS instead"),
+        ),
+        (
+            json!({
+                "type": "snell", "version": 6, "password": "password-12345",
+                "obfs_mode": "http"
+            }),
+            Some("obfs is not supported for version 6"),
+        ),
+        (
+            json!({
+                "type": "snell", "version": 5, "password": "pass",
+                "obfs_mode": "invalid"
+            }),
+            Some("unknown obfs mode: invalid"),
+        ),
+    ];
+
+    for (value, expected) in client_cases {
+        let result: Result<ClientProxyConfig, _> = serde_json::from_value(value.clone());
+        match result {
+            Ok(mut client) => {
+                let val_result = validate_client_proxy_config(&mut client, &HashMap::new(), None);
+                match expected {
+                    None => {
+                        assert!(
+                            val_result.is_ok(),
+                            "{}: expected ok, got {:?}",
+                            value,
+                            val_result
+                        );
+                    }
+                    Some(msg) => {
+                        let err = val_result.expect_err(&format!("{}: expected error", value));
+                        assert!(
+                            err.to_string().contains(msg),
+                            "{}: expected '{}', got '{}'",
+                            value,
+                            msg,
+                            err
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                match expected {
+                    Some(msg) => {
+                        assert!(
+                            err.to_string().contains(msg),
+                            "{}: expected '{}', got '{}'",
+                            value,
+                            msg,
+                            err
+                        );
+                    }
+                    None => panic!("{}: expected ok deserialization, got {}", value, err),
+                }
+            }
+        }
+    }
+
+    let server_cases: &[(&str, Option<&str>)] = &[
+        (
+            "type: snell\ncipher: aes-128-gcm\nversion: v5\npassword: pass\nobfs_mode: http\n",
+            None,
+        ),
+        (
+            "type: snell\ncipher: aes-128-gcm\nversion: v5\npassword: pass\nobfs_mode: none\n",
+            None,
+        ),
+        (
+            "type: snell\ncipher: aes-128-gcm\nversion: v5\npassword: pass\nobfs_mode: tls\n",
+            Some("TLS obfs is unsupported for version 5; use ShadowTLS instead"),
+        ),
+        (
+            "type: snell\ncipher: aes-128-gcm\nversion: v6\npassword: password-12345\n\
+             obfs_mode: http\n",
+            Some("obfs is only supported for version 5"),
+        ),
+        (
+            "type: snell\ncipher: aes-128-gcm\nversion: v5\npassword: pass\nobfs_mode: ws\n",
+            Some("version 5 only supports http obfs"),
+        ),
+    ];
+
+    for (yaml, expected) in server_cases {
+        let config_res: Result<ServerProxyConfig, _> = serde_yaml::from_str(yaml);
+        match config_res {
+            Ok(config) => {
+                let val_res = validate_server_auth(&config);
+                match expected {
+                    None => {
+                        assert!(val_res.is_ok(), "{yaml}: expected ok, got {val_res:?}");
+                    }
+                    Some(msg) => {
+                        let err = val_res.expect_err(&format!("{yaml}: expected error"));
+                        assert!(
+                            err.to_string().contains(msg),
+                            "{yaml}: expected '{msg}', got '{err}'"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                match expected {
+                    Some(msg) => {
+                        assert!(
+                            err.to_string().contains(msg),
+                            "{yaml}: expected '{msg}', got '{err}'"
+                        );
+                    }
+                    None => panic!("{yaml}: expected ok deserialization, got {err}"),
+                }
+            }
+        }
+    }
+}

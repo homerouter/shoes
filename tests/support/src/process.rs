@@ -516,6 +516,8 @@ fn wait_for_process_group_exit(process_group_id: i32, use_sudo: bool, timeout: D
 pub enum SingBoxCapability {
     Standard,
     NaiveOutbound,
+    /// The reF1nd fork with Snell; official builds have none, so only the override is used.
+    Snell,
 }
 
 pub fn find_singbox_binary() -> io::Result<PathBuf> {
@@ -530,6 +532,7 @@ pub fn find_singbox_binary_with(capability: SingBoxCapability) -> io::Result<Pat
     let override_name = match capability {
         SingBoxCapability::Standard => "SHOES_TEST_SING_BOX_BIN",
         SingBoxCapability::NaiveOutbound => "SHOES_TEST_SING_BOX_NAIVE_BIN",
+        SingBoxCapability::Snell => "SHOES_TEST_SING_BOX_SNELL_BIN",
     };
 
     if let Some(path) = std::env::var_os(override_name) {
@@ -557,6 +560,13 @@ pub fn find_singbox_binary_with(capability: SingBoxCapability) -> io::Result<Pat
             )
         })?;
         return Ok(path);
+    }
+
+    if capability == SingBoxCapability::Snell {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "set SHOES_TEST_SING_BOX_SNELL_BIN to a sing-box built from reF1nd/sing-box",
+        ));
     }
 
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -597,6 +607,7 @@ pub fn find_singbox_binary_with(capability: SingBoxCapability) -> io::Result<Pat
     let requirement = match capability {
         SingBoxCapability::Standard => "a working sing-box executable",
         SingBoxCapability::NaiveOutbound => "sing-box built with with_naive_outbound",
+        SingBoxCapability::Snell => unreachable!("handled before the candidate search"),
     };
     let details = if failures.is_empty() {
         String::new()
