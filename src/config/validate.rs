@@ -2007,6 +2007,7 @@ fn validate_server_auth(protocol: &ServerProxyConfig) -> std::io::Result<()> {
         ServerProxyConfig::Trojan {
             password,
             shadowsocks,
+            ..
         } => {
             validate_nonempty_secret(password, "Trojan")?;
             if let Some(ShadowsocksConfig::Legacy { password, .. }) = shadowsocks {
@@ -2449,9 +2450,11 @@ fn resolve_server_proxy_config(
         ServerProxyConfig::Trojan {
             password,
             shadowsocks,
+            udp_enabled,
         } => ResolvedServerProxyConfig::Trojan {
             password,
             shadowsocks,
+            udp_enabled,
         },
         ServerProxyConfig::Vmess {
             cipher,

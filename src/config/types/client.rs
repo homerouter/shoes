@@ -498,6 +498,8 @@ pub enum ClientProxyConfig {
         password: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shadowsocks: Option<ShadowsocksConfig>,
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        udp_enabled: bool,
         /// H2MUX multiplexing configuration
         #[serde(default, skip_serializing_if = "Option::is_none")]
         h2mux: Option<H2MuxConfig>,
@@ -749,6 +751,8 @@ pub enum ResolvedClientProxyConfig {
         password: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         shadowsocks: Option<ShadowsocksConfig>,
+        #[serde(skip_serializing_if = "is_true")]
+        udp_enabled: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         h2mux: Option<H2MuxConfig>,
     },

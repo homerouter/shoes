@@ -283,7 +283,8 @@ mod tests {
         for (protocol, expected) in [
             ("{type: direct}", true),
             ("{type: socks}", false),
-            ("{type: trojan, password: test}", false),
+            ("{type: trojan, password: test}", true),
+            ("{type: trojan, password: test, udp_enabled: false}", false),
             ("{type: trojan, password: test, h2mux: {}}", true),
             (
                 "{type: vless, user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0, udp_enabled: false}",
