@@ -438,3 +438,230 @@ impl TcpServerHandler for HttpUpgradeTcpServerHandler {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Debug)]
+    struct EchoHandler;
+
+    #[async_trait]
+    impl TcpServerHandler for EchoHandler {
+        async fn setup_server_stream(
+            &self,
+            mut server_stream: Box<dyn AsyncStream>,
+        ) -> io::Result<TcpServerSetupResult> {
+            Ok(TcpServerSetupResult::Session(Box::pin(async move {
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = server_stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if server_stream.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            })))
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockClientHandler;
+
+    #[async_trait]
+    impl TcpClientHandler for MockClientHandler {
+        async fn setup_client_tcp_stream(
+            &self,
+            client_stream: Box<dyn AsyncStream>,
+            _remote_location: ResolvedLocation,
+        ) -> io::Result<TcpClientSetupResult> {
+            Ok(TcpClientSetupResult {
+                client_stream,
+                early_data: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_httpupgrade_e2e_duplex() {
+        let server_handler = HttpUpgradeTcpServerHandler::new(vec![HttpUpgradeServerTarget {
+            matching_path: Some("/tunnel".into()),
+            matching_headers: None,
+            handler: Box::new(EchoHandler),
+        }]);
+
+        let client_handler = HttpUpgradeTcpClientHandler::new(
+            "example.com:443".into(),
+            Some("/tunnel".into()),
+            None,
+            Box::new(MockClientHandler),
+        );
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let res = server_handler.setup_server_stream(Box::new(server_io)).await.unwrap();
+            let TcpServerSetupResult::Session(session) = res else {
+                panic!("expected session");
+            };
+            session.await;
+        });
+
+        let client_task = tokio::spawn(async move {
+            let res = client_handler
+                .setup_client_tcp_stream(
+                    Box::new(client_io),
+                    crate::address::NetLocation::UNSPECIFIED.into(),
+                )
+                .await
+                .unwrap();
+            let mut stream = res.client_stream;
+            stream.write_all(b"hello httpupgrade").await.unwrap();
+            let mut buf = [0u8; 17];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"hello httpupgrade");
+        });
+
+        tokio::try_join!(server_task, client_task).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_httpupgrade_custom_host_and_headers() {
+        let mut match_headers = FxHashMap::default();
+        match_headers.insert("x-custom-token".into(), "secret123".into());
+
+        let server_handler = HttpUpgradeTcpServerHandler::new(vec![HttpUpgradeServerTarget {
+            matching_path: Some("/api/v1".into()),
+            matching_headers: Some(match_headers.clone()),
+            handler: Box::new(EchoHandler),
+        }]);
+
+        let client_handler = HttpUpgradeTcpClientHandler::new(
+            "cdn.example.org".into(),
+            Some("/api/v1".into()),
+            Some(match_headers),
+            Box::new(MockClientHandler),
+        );
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let res = server_handler.setup_server_stream(Box::new(server_io)).await.unwrap();
+            let TcpServerSetupResult::Session(session) = res else {
+                panic!("expected session");
+            };
+            session.await;
+        });
+
+        let client_task = tokio::spawn(async move {
+            let res = client_handler
+                .setup_client_tcp_stream(
+                    Box::new(client_io),
+                    crate::address::NetLocation::UNSPECIFIED.into(),
+                )
+                .await
+                .unwrap();
+            let mut stream = res.client_stream;
+            stream.write_all(b"custom headers work").await.unwrap();
+            let mut buf = [0u8; 19];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"custom headers work");
+        });
+
+        tokio::try_join!(server_task, client_task).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_httpupgrade_server_reject_invalid_upgrade() {
+        let server_handler = HttpUpgradeTcpServerHandler::new(vec![HttpUpgradeServerTarget {
+            matching_path: Some("/tunnel".into()),
+            matching_headers: None,
+            handler: Box::new(EchoHandler),
+        }]);
+
+        let (mut client_io, server_io) = tokio::io::duplex(1024);
+
+        // Missing Upgrade header
+        client_io
+            .write_all(b"GET /tunnel HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\n\r\n")
+            .await
+            .unwrap();
+
+        let Err(err) = server_handler
+            .setup_server_stream(Box::new(server_io))
+            .await else {
+            panic!("expected error");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("400 Bad Request"));
+
+        let mut resp = String::new();
+        client_io.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    #[tokio::test]
+    async fn test_httpupgrade_server_reject_404_path_mismatch() {
+        let server_handler = HttpUpgradeTcpServerHandler::new(vec![HttpUpgradeServerTarget {
+            matching_path: Some("/correct_path".into()),
+            matching_headers: None,
+            handler: Box::new(EchoHandler),
+        }]);
+
+        let (mut client_io, server_io) = tokio::io::duplex(1024);
+
+        client_io
+            .write_all(b"GET /wrong_path HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+            .await
+            .unwrap();
+
+        let Err(err) = server_handler
+            .setup_server_stream(Box::new(server_io))
+            .await else {
+            panic!("expected error");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("404 Not Found"));
+
+        let mut resp = String::new();
+        client_io.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 404 Not Found"));
+    }
+
+    #[tokio::test]
+    async fn test_httpupgrade_client_reject_non_101() {
+        let client_handler = HttpUpgradeTcpClientHandler::new(
+            "example.com".into(),
+            Some("/tunnel".into()),
+            None,
+            Box::new(MockClientHandler),
+        );
+
+        let (client_io, mut server_io) = tokio::io::duplex(1024);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let _ = server_io.read(&mut buf).await.unwrap();
+            server_io
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let client_task = tokio::spawn(async move {
+            let res = client_handler
+                .setup_client_tcp_stream(
+                    Box::new(client_io),
+                    crate::address::NetLocation::UNSPECIFIED.into(),
+                )
+                .await;
+            let Err(err) = res else {
+                panic!("expected error");
+            };
+            assert!(err.to_string().contains("bad HTTP upgrade status"));
+        });
+
+        tokio::try_join!(server_task, client_task).unwrap();
+    }
+}

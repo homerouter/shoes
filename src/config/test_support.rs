@@ -171,6 +171,9 @@ impl Inline for ResolvedServerProxyConfig {
             ServerProxyConfig::Websocket { targets } => Self::Websocket {
                 targets: Box::new(one(*targets, ResolvedWebsocketServerConfig::inline)),
             },
+            ServerProxyConfig::HttpUpgrade { targets } => Self::HttpUpgrade {
+                targets: Box::new(one(*targets, ResolvedHttpUpgradeServerConfig::inline)),
+            },
             ServerProxyConfig::Http { username, password } => Self::Http { username, password },
             ServerProxyConfig::Socks {
                 username,
@@ -367,6 +370,19 @@ impl Inline for ResolvedWebsocketServerConfig {
             early_data_header_name: source.early_data_header_name,
             protocol: ResolvedServerProxyConfig::inline(source.protocol),
             ping_type: source.ping_type,
+            override_rules: rules(source.override_rules),
+        }
+    }
+}
+
+impl Inline for ResolvedHttpUpgradeServerConfig {
+    type Source = super::HttpUpgradeServerConfig;
+    fn inline(source: Self::Source) -> Self {
+        Self {
+            matching_path: source.matching_path,
+            matching_headers: source.matching_headers,
+            host: source.host,
+            protocol: ResolvedServerProxyConfig::inline(source.protocol),
             override_rules: rules(source.override_rules),
         }
     }
