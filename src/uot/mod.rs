@@ -38,7 +38,7 @@
 //! - 0x01: IPv6 (16 bytes)
 //! - 0x02: Domain (1 byte length + domain)
 
-mod socks_addr;
+pub(crate) mod socks_addr;
 pub mod uot_common;
 mod uot_v1_server_stream;
 

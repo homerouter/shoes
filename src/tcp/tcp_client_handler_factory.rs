@@ -195,10 +195,11 @@ pub(crate) fn create_with_hop_context(
         ResolvedClientProxyConfig::Trojan {
             password,
             shadowsocks,
+            udp_enabled,
             h2mux,
         } => {
             let handler: Box<dyn TcpClientHandler> =
-                Box::new(TrojanTcpHandler::new_client(&password, &shadowsocks));
+                Box::new(TrojanTcpHandler::new_client(&password, &shadowsocks, udp_enabled));
             if let Some(h2mux_config) = h2mux {
                 Box::new(H2MuxClientHandler::new(
                     Arc::from(handler),
