@@ -31,8 +31,8 @@ See the [first-configuration guide](https://shoes-rs.github.io/start/first-confi
 - **VMess AEAD**
 - **VLESS** (native encryption, resumption, and fallback for unencrypted VLESS)
 - **Shadowsocks**
-- **Trojan**
-- **Snell v3**
+- **Trojan** (with UDP-over-TLS client and server support)
+- **Snell** (server: v3, v4, v5, and v6 with automatic version detection, plus QUIC proxy mode over UDP; client: v3 and v4)
 - **Hysteria2**
 - **TUIC v5**
 - **AnyTLS**
@@ -45,6 +45,8 @@ All server protocols plus:
 - **ShadowTLS v3**
 - **TLS**
 - **WebSocket** (Shadowsocks SIP003)
+- **HTTPUpgrade** (HTTP/1.1 Upgrade transport compatible with sing-box)
+- **gRPC** (Gun transport compatible with sing-box)
 - **XHTTP / SplitHTTP** (packet-up, stream-up, stream-one over HTTP/1.1, HTTP/2, HTTP/3)
 - **XTLS Reality**
   - Hybrid-first X25519MLKEM768 key exchange and optional ML-DSA-65 server authentication
@@ -59,15 +61,14 @@ All server protocols plus:
 ### Supported Ciphers
 - **VMess**: `aes-128-gcm`, `chacha20-poly1305`, `none`
 - **Shadowsocks**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`, `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`, `2022-blake3-chacha20-ietf-poly1305`
-- **Snell v3**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`
+- **Snell**: v3 supports `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`; v4, v5, and v6 are `aes-128-gcm` only
 
-For Clash.Meta/Mihomo legacy Snell clients, use `chacha20-ietf-poly1305` with v1
-or `aes-128-gcm` with v3. Run shoes v0.3.3 or newer for the corrected 16-byte
-Snell salts. These clients do not offer an AES-256 option. Do not use v2:
-shoes does not implement Snell v2 connection reuse or its half-close markers.
-Older Clash.Meta clients fail requests on reused v2 connections.
-shoes-to-shoes connections can also use `aes-256-gcm`; both ends must use the
-same cipher and run v0.3.3 or newer for AES-256 or ChaCha20.
+For Snell client compatibility:
+- **Snell v4, v5, and v6 (server)**: Connection reuse (Connect v2), UDP-over-TCP, multi-user authentication (userkey or per-user PSK), replay protection, with tunnel and error replies matching sing-snell / snell-server. Auto-detection only considers v4+ when the cipher is `aes-128-gcm`; other ciphers are served as v3.
+- **Snell QUIC proxy mode**: Enabled automatically on every Snell server with `udp_enabled` (the default), as a UDP listener on the same port for Surge clients with `block-quic=off`. It always uses `aes-128-gcm`. Set `udp_enabled: false` to turn it off.
+- **shoes Snell client**: Speaks v4 with `aes-128-gcm` and v3 with other ciphers; the version cannot be chosen and connections are not pooled. A v4 client cannot reach shoes servers older than v0.3.8 or real Snell v3 servers, so use another cipher there.
+- **Clash.Meta/Mihomo legacy clients**: Use `chacha20-ietf-poly1305` with v1 or `aes-128-gcm` with v3. Run shoes v0.3.3 or newer for the corrected 16-byte Snell salts. These clients do not offer an AES-256 option. Do not use v2: shoes does not implement Snell v2 connection reuse, and older Clash.Meta clients fail requests on reused v2 connections.
+- **shoes-to-shoes**: Can also use `aes-256-gcm` (v3); both ends must use the same cipher and run v0.3.3 or newer for AES-256 or ChaCha20.
 
 ## Features
 
