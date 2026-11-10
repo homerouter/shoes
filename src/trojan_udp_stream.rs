@@ -355,3 +355,310 @@ impl<S: AsyncStream> AsyncPing for TrojanClientMessageStream<S> {
 
 impl<S: AsyncStream> AsyncMessageStream for TrojanClientMessageStream<S> {}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::Address;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_write_and_parse_frame_ipv4() {
+        let addr = NetLocation::new(Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+        let payload = b"hello udp over trojan";
+        let mut buf = vec![0u8; 1024];
+
+        let written = write_trojan_packet_frame(&mut buf, &addr, payload).unwrap();
+        assert_eq!(written, 7 + 2 + 2 + payload.len());
+
+        let (parsed_addr, start, len) =
+            parse_trojan_packet_frame(&buf[..written]).unwrap().unwrap();
+        assert_eq!(parsed_addr, addr);
+        assert_eq!(&buf[start..start + len], payload);
+    }
+
+    #[test]
+    fn test_write_and_parse_frame_domain() {
+        let addr = NetLocation::new(Address::Hostname("dns.google".to_string()), 853);
+        let payload = b"dns query payload";
+        let mut buf = vec![0u8; 1024];
+
+        let written = write_trojan_packet_frame(&mut buf, &addr, payload).unwrap();
+        let expected_len = 1 + 1 + "dns.google".len() + 2 + 2 + 2 + payload.len();
+        assert_eq!(written, expected_len);
+
+        let (parsed_addr, start, len) =
+            parse_trojan_packet_frame(&buf[..written]).unwrap().unwrap();
+        assert_eq!(parsed_addr, addr);
+        assert_eq!(&buf[start..start + len], payload);
+    }
+
+    #[test]
+    fn test_write_and_parse_frame_ipv6() {
+        let addr = NetLocation::new(
+            Address::Ipv6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+            53,
+        );
+        let payload = b"ipv6 payload";
+        let mut buf = vec![0u8; 1024];
+
+        let written = write_trojan_packet_frame(&mut buf, &addr, payload).unwrap();
+        let expected_len = 19 + 2 + 2 + payload.len();
+        assert_eq!(written, expected_len);
+
+        let (parsed_addr, start, len) =
+            parse_trojan_packet_frame(&buf[..written]).unwrap().unwrap();
+        assert_eq!(parsed_addr, addr);
+        assert_eq!(&buf[start..start + len], payload);
+    }
+
+    #[test]
+    fn test_incomplete_frame_returns_none() {
+        let addr = NetLocation::new(Address::Ipv4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+        let payload = b"payload data";
+        let mut buf = vec![0u8; 1024];
+        let written = write_trojan_packet_frame(&mut buf, &addr, payload).unwrap();
+
+        // Truncate at various points
+        assert!(parse_trojan_packet_frame(&buf[..4]).unwrap().is_none());
+        assert!(parse_trojan_packet_frame(&buf[..7]).unwrap().is_none());
+        assert!(parse_trojan_packet_frame(&buf[..9]).unwrap().is_none());
+        assert!(parse_trojan_packet_frame(&buf[..11]).unwrap().is_none());
+        assert!(parse_trojan_packet_frame(&buf[..written - 1])
+            .unwrap()
+            .is_none());
+        assert!(parse_trojan_packet_frame(&buf[..written])
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn test_missing_crlf_errors() {
+        let addr = NetLocation::new(Address::Ipv4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+        let payload = b"payload data";
+        let mut buf = vec![0u8; 1024];
+        let written = write_trojan_packet_frame(&mut buf, &addr, payload).unwrap();
+
+        // Corrupt CRLF (bytes at addr_len + 2 and + 3)
+        buf[7 + 2] = 0x00;
+        let err = parse_trojan_packet_frame(&buf[..written]).unwrap_err();
+        assert!(err.to_string().contains("CRLF"));
+    }
+
+    #[tokio::test]
+    async fn test_client_and_server_udp_echo() {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let target = NetLocation::new(Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1)), 5353);
+
+        let client_stream = TrojanClientMessageStream::new(client_io, target.clone());
+        let server_stream = TrojanUdpStream::new(server_io);
+
+        let mut client_stream = Box::new(client_stream);
+        let mut server_stream = Box::new(server_stream);
+
+        // 1. Client sends a UDP packet to target
+        let sent_payload = b"ping dns query";
+        futures::future::poll_fn(|cx| {
+            Pin::new(&mut client_stream).poll_write_message(cx, sent_payload)
+        })
+        .await
+        .unwrap();
+
+        futures::future::poll_fn(|cx| Pin::new(&mut client_stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+
+        // 2. Server reads the targeted packet
+        let mut server_recv_buf = vec![0u8; 1024];
+        let mut read_buf = ReadBuf::new(&mut server_recv_buf);
+        let received_dest = futures::future::poll_fn(|cx| {
+            Pin::new(&mut server_stream).poll_read_targeted_message(cx, &mut read_buf)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(received_dest, target);
+        assert_eq!(read_buf.filled(), sent_payload);
+
+        // 3. Server sends a reply back to client stamped with source = target
+        let reply_payload = b"pong dns response";
+        futures::future::poll_fn(|cx| {
+            Pin::new(&mut server_stream)
+                .poll_write_sourced_message(cx, reply_payload, &received_dest)
+        })
+        .await
+        .unwrap();
+
+        futures::future::poll_fn(|cx| Pin::new(&mut server_stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+
+        // 4. Client reads the response packet
+        let mut client_recv_buf = vec![0u8; 1024];
+        let mut client_read_buf = ReadBuf::new(&mut client_recv_buf);
+        futures::future::poll_fn(|cx| {
+            Pin::new(&mut client_stream).poll_read_message(cx, &mut client_read_buf)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(client_read_buf.filled(), reply_payload);
+    }
+
+    #[tokio::test]
+    async fn test_trojan_udp_feed_initial_data_pipelined() {
+        let (_client_io, server_io) = tokio::io::duplex(1024);
+        let target = NetLocation::new(Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+        let payload = b"pipelined dns query";
+
+        let mut initial_bytes = vec![0u8; 1024];
+        let written = write_trojan_packet_frame(&mut initial_bytes, &target, payload).unwrap();
+        initial_bytes.truncate(written);
+
+        let mut server_stream = TrojanUdpStream::new(server_io);
+        server_stream.feed_initial_data(&initial_bytes);
+
+        let mut recv_buf = vec![0u8; 1024];
+        let mut read_buf = ReadBuf::new(&mut recv_buf);
+        let dest = futures::future::poll_fn(|cx| {
+            Pin::new(&mut server_stream).poll_read_targeted_message(cx, &mut read_buf)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(dest, target);
+        assert_eq!(read_buf.filled(), payload);
+    }
+
+    #[tokio::test]
+    async fn test_trojan_udp_backpressure_does_not_duplicate_packet() {
+        use tokio::io::AsyncReadExt;
+
+        // Create a duplex with a tiny 16-byte channel to trigger backpressure
+        let (client_io, mut server_raw) = tokio::io::duplex(16);
+        let target = NetLocation::new(Address::Ipv4(Ipv4Addr::new(1, 2, 3, 4)), 1234);
+        let payload = b"this is a payload that exceeds the tiny sixteen byte duplex channel";
+
+        let mut server_stream = TrojanUdpStream::new(client_io);
+
+        // 1. Stage the message
+        futures::future::poll_fn(|cx| {
+            Pin::new(&mut server_stream).poll_write_sourced_message(cx, payload, &target)
+        })
+        .await
+        .unwrap();
+
+        // 2. Poll flush once - it will partially fill the 16-byte buffer and return Pending
+        let flush_res = futures::future::poll_fn(|cx| {
+            let res = Pin::new(&mut server_stream).poll_flush_message(cx);
+            Poll::Ready(res.is_pending())
+        })
+        .await;
+        assert!(flush_res, "Flush should be pending due to backpressure");
+
+        // 3. A retried poll_write_sourced_message while backpressured must return Pending and NOT duplicate
+        let retry_pending = futures::future::poll_fn(|cx| {
+            let res =
+                Pin::new(&mut server_stream).poll_write_sourced_message(cx, payload, &target);
+            Poll::Ready(res.is_pending())
+        })
+        .await;
+        assert!(
+            retry_pending,
+            "Retried write during backpressure must yield Pending"
+        );
+
+        // 4. Drain the duplex from the receiver side while driving the flush to completion
+        let mut received = Vec::new();
+        let drain_task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                let n = server_raw.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+                if let Ok(Some((_, start, len))) = parse_trojan_packet_frame(&received) {
+                    if received.len() >= start + len {
+                        break;
+                    }
+                }
+            }
+            received
+        });
+
+        futures::future::poll_fn(|cx| Pin::new(&mut server_stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+
+        let received = drain_task.await.unwrap();
+
+        // 5. Verify received data contains exactly one frame with the original payload
+        let (dest, start, len) = parse_trojan_packet_frame(&received).unwrap().unwrap();
+        assert_eq!(dest, target);
+        assert_eq!(&received[start..start + len], payload);
+        // Entire buffer should be exactly this single frame (no second duplicate frame trailing)
+        assert_eq!(received.len(), start + len);
+    }
+
+    #[tokio::test]
+    async fn test_trojan_udp_write_zero_error() {
+        struct ZeroWriter;
+        impl tokio::io::AsyncRead for ZeroWriter {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl tokio::io::AsyncWrite for ZeroWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(0))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncPing for ZeroWriter {
+            fn supports_ping(&self) -> bool {
+                false
+            }
+            fn poll_write_ping(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<bool>> {
+                Poll::Ready(Ok(false))
+            }
+        }
+        impl AsyncStream for ZeroWriter {}
+
+        let mut stream = TrojanUdpStream::new(ZeroWriter);
+        let target = NetLocation::new(Address::Ipv4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+        // Staging the packet succeeds
+        futures::future::poll_fn(|cx| {
+            Pin::new(&mut stream).poll_write_sourced_message(cx, b"hello", &target)
+        })
+        .await
+        .unwrap();
+
+        // Flushing when underlying writer returns Ok(0) must immediately return WriteZero, never hang
+        let err = futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_flush_message(cx))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+    }
+}
