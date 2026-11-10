@@ -1,0 +1,201 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (leave empty for current git tag or package version)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CROSS_VERSION: 0.2.5
+  SHOES_BUILD_REVISION: ${{ github.sha }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.resolve-tag.outputs.tag }}
+      version: ${{ steps.resolve-tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Prevent duplicate workflow run
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ACTIVE_RUN=$(gh run list --workflow release.yml --repo "$GITHUB_REPOSITORY" --commit "$GITHUB_SHA" --json databaseId,status,event --jq '.[] | select(.databaseId != '"$GITHUB_RUN_ID"' and .status == "in_progress" and .event == "push") | .databaseId' | head -n 1)
+          if [ -n "$ACTIVE_RUN" ]; then
+            echo "::warning::Release run #$ACTIVE_RUN is already actively building commit $GITHUB_SHA. Canceling duplicate dispatch."
+            gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" || true
+            exit 0
+          fi
+
+      - name: Validate manifest, lockfile, and tag
+        id: resolve-tag
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          manifest = tomllib.loads(Path("Cargo.toml").read_text())["package"]
+          packages = tomllib.loads(Path("Cargo.lock").read_text())["package"]
+          locked = [p["version"] for p in packages if p["name"] == manifest["name"] and "source" not in p]
+          assert locked == [manifest["version"]], f"Manifest ({manifest['version']}) and lockfile ({locked}) versions differ"
+
+          input_tag = os.environ.get("INPUT_TAG", "").strip()
+          ref_type = os.environ.get("GITHUB_REF_TYPE", "")
+          ref_name = os.environ.get("GITHUB_REF_NAME", "")
+
+          if input_tag:
+              tag = input_tag
+          elif ref_type == "tag":
+              tag = ref_name
+          else:
+              tag = f"v{manifest['version']}"
+
+          expected = f"v{manifest['version']}"
+          assert tag == expected, f"Tag {tag} does not match package version {expected}"
+
+          version = manifest["version"]
+          print(f"Validated release tag: {tag}, version: {version}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"tag={tag}\n")
+              f.write(f"version={version}\n")
+          PY
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+
+  build:
+    name: Build deb for ${{ matrix.deb_arch }} (${{ matrix.target }})
+    needs: [version]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            deb_arch: amd64
+          - target: aarch64-unknown-linux-musl
+            deb_arch: arm64
+    env:
+      TARGET: ${{ matrix.target }}
+      SHOES_RELEASE_TAG: ${{ needs.version.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cross binary
+        id: cache-cross
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/cross
+          key: cross-bin-v${{ env.CROSS_VERSION }}
+
+      - name: Install cross binary
+        if: steps.cache-cross.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -sSL "https://github.com/cross-rs/cross/releases/download/v${CROSS_VERSION}/cross-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.cargo/bin" cross
+          chmod +x "$HOME/.cargo/bin/cross"
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install Debian packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debhelper dpkg-dev fakeroot binutils-aarch64-linux-gnu
+
+      - name: Build Debian package (.deb)
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          ARCH="${{ matrix.deb_arch }}"
+
+          # Sync debian/changelog top entry with release version if needed
+          python3 - <<'PY'
+          import os, datetime
+          version = "${{ needs.version.outputs.version }}"
+          p = "debian/changelog"
+          content = open(p).read()
+          if f"shoes ({version})" not in content:
+              date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+              entry = f"shoes ({version}) unstable; urgency=medium\n\n  * Release version {version}.\n\n -- debiansid <9624961+debiansid@users.noreply.github.com>  {date_str}\n\n"
+              open(p, "w").write(entry + content)
+          PY
+
+          # Build Debian package directly via dpkg-buildpackage
+          dpkg-buildpackage -us -uc -b -d --host-arch "$ARCH"
+
+          mkdir -p artifacts
+          cp "../shoes_${VERSION}_${ARCH}.deb" artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.deb_arch }}
+          path: artifacts/*.deb
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download deb release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd release-artifacts
+          sha256sum *.deb > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          cd release-artifacts
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Updating existing release $TAG..."
+            gh release upload "$TAG" * --clobber
+          else
+            echo "Creating new release $TAG..."
+            gh release create "$TAG" * --title "$TAG" --generate-notes
+          fi
