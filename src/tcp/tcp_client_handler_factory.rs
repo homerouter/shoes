@@ -19,7 +19,7 @@ use crate::reality::RealityClientHandler;
 use crate::resolver::Resolver;
 use crate::rustls_config_util::try_create_client_config;
 use crate::shadow_tls::ShadowTlsClientHandler;
-use crate::shadowsocks::ShadowsocksTcpHandler;
+use crate::shadowsocks::{ShadowsocksCipher, ShadowsocksTcpHandler};
 use crate::snell::snell_handler::SnellClientHandler;
 use crate::socks_handler::SocksTcpClientHandler;
 use crate::tcp::chain_builder::try_build_client_chain_group;
@@ -145,16 +145,37 @@ pub(crate) fn create_with_hop_context(
             )),
         },
         ResolvedClientProxyConfig::Snell {
-            config: ShadowsocksConfig::Legacy { cipher, password },
+            cipher,
+            password,
             udp_enabled,
-        } => Box::new(SnellClientHandler::new(cipher, &password, udp_enabled, None, None)),
-        ResolvedClientProxyConfig::Snell {
-            config: ShadowsocksConfig::Aead2022 { .. },
-            ..
+            version,
+            userkey,
+            reuse,
+            mode,
+            quic_proxy_mode,
+            obfs_mode,
+            obfs_host,
+            obfs_uri,
         } => {
-            panic!(
-                "Snell does not support shadowsocks 2022 ciphers (checked during config validation)"
-            )
+            let mut handler = SnellClientHandler::new(
+                ShadowsocksCipher::try_from(cipher.as_str()).expect("cipher validated"),
+                &password,
+                udp_enabled,
+                version.as_deref(),
+                mode.as_deref(),
+                userkey.as_deref(),
+                reuse,
+                quic_proxy_mode,
+            );
+            if let Some(obfs_str) = obfs_mode {
+                use crate::snell::obfs::SnellObfsMode;
+                handler = handler.with_obfs(
+                    SnellObfsMode::parse(&obfs_str),
+                    obfs_host.as_deref(),
+                    obfs_uri.as_deref(),
+                );
+            }
+            Box::new(handler)
         }
         ResolvedClientProxyConfig::Vless {
             user_id,
