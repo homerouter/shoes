@@ -221,9 +221,11 @@ impl Inline for ResolvedServerProxyConfig {
             ServerProxyConfig::Trojan {
                 password,
                 shadowsocks,
+                udp_enabled,
             } => Self::Trojan {
                 password,
                 shadowsocks,
+                udp_enabled,
             },
             ServerProxyConfig::Vmess {
                 cipher,
