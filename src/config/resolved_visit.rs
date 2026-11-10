@@ -62,6 +62,13 @@ fn protocol_rules(protocol: &ServerProxyConfig) -> Box<dyn Iterator<Item = &Rule
                     .map(|target| (&target.override_rules, &target.protocol)),
             );
         }
+        ServerProxyConfig::Grpc { targets: grpc } => {
+            targets.extend(
+                grpc
+                    .iter()
+                    .map(|target| (&target.override_rules, &target.protocol)),
+            );
+        }
         ServerProxyConfig::SudokuMask(config) => return protocol_rules(&config.protocol),
         ServerProxyConfig::Xhttp(config) => return protocol_rules(&config.protocol),
         _ => {}
@@ -164,6 +171,12 @@ fn visit_protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -
             }
         }
         ServerProxyConfig::HttpUpgrade { targets } => {
+            for target in targets.iter_mut() {
+                visit_rules(&mut target.override_rules, visitor)?;
+                visit_protocol(&mut target.protocol, visitor)?;
+            }
+        }
+        ServerProxyConfig::Grpc { targets } => {
             for target in targets.iter_mut() {
                 visit_rules(&mut target.override_rules, visitor)?;
                 visit_protocol(&mut target.protocol, visitor)?;

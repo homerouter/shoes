@@ -723,6 +723,23 @@ pub struct HttpUpgradeServerRecord<P, R> {
 pub type HttpUpgradeServerConfig =
     HttpUpgradeServerRecord<ServerProxyConfig, ConfigSelection<RuleConfig>>;
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(bound(deserialize = "P: Deserialize<'de>, R: Deserialize<'de>"))]
+pub struct GrpcServerRecord<P, R> {
+    #[serde(alias = "service", alias = "serviceName", default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    #[serde(alias = "headers", default, skip_serializing_if = "Option::is_none")]
+    pub matching_headers: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub protocol: P,
+    #[serde(alias = "override_rule", default)]
+    pub override_rules: NoneOrSome<R>,
+}
+
+pub type GrpcServerConfig =
+    GrpcServerRecord<ServerProxyConfig, ConfigSelection<RuleConfig>>;
+
 #[derive(Default, Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum WebsocketPingType {
@@ -872,6 +889,11 @@ pub enum ServerProxyConfig {
         #[serde(alias = "target")]
         targets: Box<OneOrSome<HttpUpgradeServerConfig>>,
     },
+    #[serde(alias = "gun")]
+    Grpc {
+        #[serde(alias = "target")]
+        targets: Box<OneOrSome<GrpcServerConfig>>,
+    },
     #[serde(alias = "forward")]
     PortForward {
         #[serde(alias = "target")]
@@ -966,6 +988,7 @@ impl std::fmt::Display for ServerProxyConfig {
             Self::Vmess { .. } => write!(f, "Vmess"),
             Self::Websocket { .. } => write!(f, "Websocket"),
             Self::HttpUpgrade { .. } => write!(f, "HttpUpgrade"),
+            Self::Grpc { .. } => write!(f, "gRPC"),
             Self::Xhttp(..) => write!(f, "XHTTP"),
             Self::PortForward { .. } => write!(f, "Portforward"),
             Self::Hysteria2 { .. } => write!(f, "Hysteria2"),
@@ -1060,6 +1083,10 @@ pub enum ResolvedServerProxyConfig {
     HttpUpgrade {
         targets: Box<OneOrSome<crate::config::resolved::ResolvedHttpUpgradeServerConfig>>,
     },
+    #[serde(alias = "gun")]
+    Grpc {
+        targets: Box<OneOrSome<crate::config::resolved::ResolvedGrpcServerConfig>>,
+    },
     PortForward {
         targets: OneOrSome<NetLocation>,
     },
@@ -1130,6 +1157,7 @@ impl std::fmt::Display for ResolvedServerProxyConfig {
             Self::Vmess { .. } => write!(f, "Vmess"),
             Self::Websocket { .. } => write!(f, "Websocket"),
             Self::HttpUpgrade { .. } => write!(f, "HttpUpgrade"),
+            Self::Grpc { .. } => write!(f, "gRPC"),
             Self::Xhttp(..) => write!(f, "XHTTP"),
             Self::PortForward { .. } => write!(f, "Portforward"),
             Self::Hysteria2 { .. } => write!(f, "Hysteria2"),

@@ -54,6 +54,7 @@ mod crypto;
 mod desktop;
 pub mod dns;
 mod file_watcher;
+mod grpc;
 mod h2mux;
 mod http2;
 mod http_handler;
