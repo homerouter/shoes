@@ -200,12 +200,18 @@ impl Inline for ResolvedServerProxyConfig {
                 udp_enabled,
                 version,
                 mode,
+                users,
+                multi_user_authentication,
+                obfs_mode,
             } => Self::Snell {
                 cipher,
                 password,
                 udp_enabled,
                 version,
                 mode,
+                users: users.map(OneOrSome::into_vec).unwrap_or_default(),
+                multi_user_authentication,
+                obfs_mode,
             },
             ServerProxyConfig::Vless {
                 user_id,

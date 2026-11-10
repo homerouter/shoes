@@ -8,6 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use crate::dns::ParsedDnsUrl;
 use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
+use crate::shadowsocks::ShadowsocksCipher;
 use crate::thread_util::get_num_threads;
 use crate::uuid_util::parse_uuid;
 
@@ -1474,6 +1475,141 @@ fn validate_reality_client_short_id(short_id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_snell_client(
+    cipher: &str,
+    password: &str,
+    udp_enabled: bool,
+    version: Option<&str>,
+    userkey: Option<&str>,
+    reuse: bool,
+    mode: Option<&str>,
+    quic_proxy_mode: bool,
+    obfs_mode: Option<&str>,
+) -> std::io::Result<()> {
+    if cipher.contains("2022") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Snell does not support shadowsocks 2022 ciphers",
+        ));
+    }
+    if ShadowsocksCipher::try_from(cipher).is_err() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported cipher: {cipher}"),
+        ));
+    }
+    let ver = version
+        .and_then(crate::snell::snell_handler::SnellVersion::parse)
+        .unwrap_or(if cipher == "aes-128-gcm" {
+            crate::snell::snell_handler::SnellVersion::V4
+        } else {
+            crate::snell::snell_handler::SnellVersion::V3
+        });
+
+    if ver == crate::snell::snell_handler::SnellVersion::V6
+        && !(12..=255).contains(&password.len())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "snell: psk length must be between 12 and 255 bytes",
+        ));
+    }
+
+    if reuse && ver < crate::snell::snell_handler::SnellVersion::V4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "snell: reuse requires version 4 or above",
+        ));
+    }
+
+    if udp_enabled && ver < crate::snell::snell_handler::SnellVersion::V3 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "snell: UDP requires version 3 or above",
+        ));
+    }
+
+    if userkey.is_some() && ver < crate::snell::snell_handler::SnellVersion::V4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "snell: userkey requires version 4 or above",
+        ));
+    }
+
+    if let Some(key) = userkey {
+        if key.len() > 255 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "snell: userkey too long",
+            ));
+        }
+    }
+
+    if mode.is_some() && ver != crate::snell::snell_handler::SnellVersion::V6 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "snell: mode is only supported for version 6",
+        ));
+    }
+
+    if let Some(m) = mode {
+        if crate::snell::v6::SnellV6Mode::parse(m).is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("snell: unknown mode: {m}"),
+            ));
+        }
+    }
+
+    if quic_proxy_mode && ver < crate::snell::snell_handler::SnellVersion::V5 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "snell: quic_proxy_mode requires version 5 or above",
+        ));
+    }
+
+    if let Some(obfs) = obfs_mode {
+        let obfs_norm = obfs.to_ascii_lowercase();
+        match obfs_norm.as_str() {
+            "" | "none" => {}
+            "http" => {
+                if ver == crate::snell::snell_handler::SnellVersion::V6 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "snell: obfs is not supported for version 6",
+                    ));
+                }
+            }
+            "tls" => {
+                if ver == crate::snell::snell_handler::SnellVersion::V6 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "snell: obfs is not supported for version 6",
+                    ));
+                }
+                if ver >= crate::snell::snell_handler::SnellVersion::V4 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "snell: TLS obfs is unsupported for version {}; use ShadowTLS instead",
+                            ver.number()
+                        ),
+                    ));
+                }
+            }
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("snell: unknown obfs mode: {other}"),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_reality_server_short_ids(
     short_ids: &OneOrSome<String>,
     target_name: &str,
@@ -1775,13 +1911,28 @@ fn validate_client_proxy_config(
             }
         }
         ClientProxyConfig::Snell {
-            config: super::types::ShadowsocksConfig::Aead2022 { .. },
+            cipher,
+            password,
+            udp_enabled,
+            version,
+            userkey,
+            reuse,
+            mode,
+            quic_proxy_mode,
+            obfs_mode,
             ..
         } => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Snell does not support shadowsocks 2022 ciphers",
-            ));
+            validate_snell_client(
+                cipher,
+                password,
+                *udp_enabled,
+                version.as_deref(),
+                userkey.as_deref(),
+                *reuse,
+                mode.as_deref(),
+                *quic_proxy_mode,
+                obfs_mode.as_deref(),
+            )?;
         }
         ClientProxyConfig::Reality {
             public_key,
@@ -1994,6 +2145,123 @@ fn validate_nonempty_secret(secret: &str, protocol: &str) -> std::io::Result<()>
     Ok(())
 }
 
+/// Snell server secrets and users, as sing-box `option/snell.go` and
+/// snell-server v6 (PSK length 12..255) check them.
+fn validate_snell_server(
+    cipher: &str,
+    password: &str,
+    version: Option<&str>,
+    mode: Option<&str>,
+    users: Option<&OneOrSome<super::types::SnellUserConfig>>,
+    authentication: Option<&str>,
+    obfs_mode: Option<&str>,
+) -> std::io::Result<()> {
+    use crate::snell::snell_handler::SnellVersion;
+    use crate::snell::v6::SnellV6Mode;
+
+    fn invalid(message: impl Into<String>) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            message.into(),
+        ))
+    }
+
+    let version = version.and_then(SnellVersion::parse);
+    if let Some(obfs) = obfs_mode {
+        let obfs_norm = obfs.to_ascii_lowercase();
+        match obfs_norm.as_str() {
+            "" | "none" => {}
+            "tls" => {
+                return invalid(
+                    "snell: TLS obfs is unsupported for version 5; use ShadowTLS instead",
+                );
+            }
+            "http" => {
+                if version != Some(SnellVersion::V5) {
+                    return invalid("snell: obfs is only supported for version 5");
+                }
+            }
+            _ => {
+                return invalid("snell: version 5 only supports http obfs");
+            }
+        }
+    }
+    let v6_length = |psk: &str, field: &str| {
+        if version == Some(SnellVersion::V6) && !(12..=255).contains(&psk.len()) {
+            return invalid(format!("Snell v6 {field} must be 12 to 255 bytes"));
+        }
+        Ok(())
+    };
+    let Some(users) = users else {
+        if authentication.is_some() {
+            return invalid("Snell multi_user_authentication requires users");
+        }
+        validate_nonempty_secret(password, "Snell")?;
+        return v6_length(password, "password");
+    };
+    if !matches!(
+        version,
+        Some(SnellVersion::V4 | SnellVersion::V5 | SnellVersion::V6)
+    ) {
+        return invalid("Snell users require version v4, v5 or v6");
+    }
+    if cipher != "aes-128-gcm" {
+        return invalid("Snell users require cipher aes-128-gcm");
+    }
+    let mut seen = HashSet::new();
+    match authentication.unwrap_or("userkey") {
+        "userkey" => {
+            validate_nonempty_secret(password, "Snell")?;
+            v6_length(password, "password")?;
+            for user in users.iter() {
+                if user.password.is_some() {
+                    return invalid(
+                        "Snell users[].password is not allowed with userkey authentication",
+                    );
+                }
+                let key = user.userkey.as_deref().unwrap_or_default();
+                if !(1..=255).contains(&key.len()) {
+                    return invalid("Snell users[].userkey must be 1 to 255 bytes");
+                }
+                if !seen.insert(key) {
+                    return invalid("Snell users[].userkey must be unique");
+                }
+            }
+        }
+        "psk" => {
+            if !password.is_empty() {
+                return invalid(
+                    "Snell password is not allowed with psk authentication; set users[].password",
+                );
+            }
+            if version == Some(SnellVersion::V6)
+                && mode.and_then(SnellV6Mode::parse) == Some(SnellV6Mode::UnsafeRaw)
+            {
+                return invalid("Snell psk authentication is unavailable in v6 unsafe-raw mode");
+            }
+            for user in users.iter() {
+                if user.userkey.is_some() {
+                    return invalid("Snell users[].userkey is not allowed with psk authentication");
+                }
+                let psk = user.password.as_deref().unwrap_or_default();
+                if psk.is_empty() {
+                    return invalid("Snell users[].password must not be empty");
+                }
+                v6_length(psk, "users[].password")?;
+                if !seen.insert(psk) {
+                    return invalid("Snell users[].password must be unique");
+                }
+            }
+        }
+        other => {
+            return invalid(format!(
+                "Snell multi_user_authentication must be userkey or psk, got {other}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_server_auth(protocol: &ServerProxyConfig) -> std::io::Result<()> {
     match protocol {
         ServerProxyConfig::Http { username, password } => {
@@ -2030,8 +2298,25 @@ fn validate_server_auth(protocol: &ServerProxyConfig) -> std::io::Result<()> {
                 validate_nonempty_secret(password, "Trojan Shadowsocks")?;
             }
         }
-        ServerProxyConfig::Snell { password, .. }
-        | ServerProxyConfig::Hysteria2 { password, .. }
+        ServerProxyConfig::Snell {
+            cipher,
+            password,
+            version,
+            mode,
+            users,
+            multi_user_authentication,
+            obfs_mode,
+            ..
+        } => validate_snell_server(
+            cipher,
+            password,
+            version.as_deref(),
+            mode.as_deref(),
+            users.as_ref(),
+            multi_user_authentication.as_deref(),
+            obfs_mode.as_deref(),
+        )?,
+        ServerProxyConfig::Hysteria2 { password, .. }
         | ServerProxyConfig::TuicV5 { password, .. } => {
             validate_nonempty_secret(password, &protocol.to_string())?;
         }
@@ -2498,12 +2783,18 @@ fn resolve_server_proxy_config(
             udp_enabled,
             version,
             mode,
+            users,
+            multi_user_authentication,
+            obfs_mode,
         } => ResolvedServerProxyConfig::Snell {
             cipher,
             password,
             udp_enabled,
             version,
             mode,
+            users: users.map(OneOrSome::into_vec).unwrap_or_default(),
+            multi_user_authentication,
+            obfs_mode,
         },
         ServerProxyConfig::Vless {
             user_id,

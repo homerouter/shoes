@@ -98,8 +98,38 @@ where
     state.end()
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StringOrInt {
+    Int(u64),
+    String(String),
+}
+
+impl StringOrInt {
+    fn into_string(self) -> String {
+        match self {
+            Self::Int(n) => n.to_string(),
+            Self::String(s) => s,
+        }
+    }
+}
+
+type SnellClientFields = (
+    String,
+    String,
+    bool,
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<String>,
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 /// Custom deserializer for ClientProxyConfig::Snell - flattens config fields
-fn deserialize_snell_client<'de, D>(deserializer: D) -> Result<(ShadowsocksConfig, bool), D::Error>
+fn deserialize_snell_client<'de, D>(deserializer: D) -> Result<SnellClientFields, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -108,23 +138,81 @@ where
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct SnellClientTemp {
-        cipher: String,
-        password: String,
+        #[serde(default)]
+        cipher: Option<String>,
+        #[serde(default, alias = "psk")]
+        password: Option<String>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
+        #[serde(default)]
+        version: Option<StringOrInt>,
+        #[serde(default)]
+        userkey: Option<String>,
+        #[serde(default)]
+        reuse: bool,
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
+        quic_proxy_mode: bool,
+        #[serde(default)]
+        obfs_mode: Option<String>,
+        #[serde(default)]
+        obfs_host: Option<String>,
+        #[serde(default)]
+        obfs_uri: Option<String>,
     }
 
     let temp = SnellClientTemp::deserialize(deserializer)?;
-    let config =
-        ShadowsocksConfig::from_fields(&temp.cipher, &temp.password).map_err(Error::custom)?;
+    let password = temp
+        .password
+        .ok_or_else(|| Error::custom("snell: password (or psk) is required"))?;
+    let version = temp.version.map(|v| v.into_string());
+    let parsed_version = version
+        .as_deref()
+        .and_then(crate::snell::snell_handler::SnellVersion::parse);
+    if version.is_some() && parsed_version.is_none() {
+        return Err(Error::custom(format!(
+            "snell: unsupported version: {}",
+            version.as_deref().unwrap_or("")
+        )));
+    }
+    let cipher = match temp.cipher {
+        Some(c) => c,
+        None => match parsed_version {
+            Some(crate::snell::snell_handler::SnellVersion::V1) => "chacha20-poly1305".to_string(),
+            _ => "aes-128-gcm".to_string(),
+        },
+    };
 
-    Ok((config, temp.udp_enabled))
+    Ok((
+        cipher,
+        password,
+        temp.udp_enabled,
+        version,
+        temp.userkey,
+        temp.reuse,
+        temp.mode,
+        temp.quic_proxy_mode,
+        temp.obfs_mode,
+        temp.obfs_host,
+        temp.obfs_uri,
+    ))
 }
 
 /// Custom serializer for ClientProxyConfig::Snell - flattens config fields
+#[allow(clippy::too_many_arguments)]
 fn serialize_snell_client<S>(
-    config: &ShadowsocksConfig,
+    cipher: &str,
+    password: &str,
     udp_enabled: &bool,
+    version: &Option<String>,
+    userkey: &Option<String>,
+    reuse: &bool,
+    mode: &Option<String>,
+    quic_proxy_mode: &bool,
+    obfs_mode: &Option<String>,
+    obfs_host: &Option<String>,
+    obfs_uri: &Option<String>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
@@ -132,12 +220,64 @@ where
 {
     use serde::ser::SerializeStruct;
 
-    // Only serialize udp_enabled if it's not the default (true)
-    let field_count = if *udp_enabled { 2 } else { 3 };
-    let mut state = serializer.serialize_struct("Snell", field_count)?;
-    config.serialize_fields(&mut state)?;
+    let mut count = 2;
+    if !*udp_enabled {
+        count += 1;
+    }
+    if version.is_some() {
+        count += 1;
+    }
+    if userkey.is_some() {
+        count += 1;
+    }
+    if *reuse {
+        count += 1;
+    }
+    if mode.is_some() {
+        count += 1;
+    }
+    if *quic_proxy_mode {
+        count += 1;
+    }
+    if obfs_mode.is_some() {
+        count += 1;
+    }
+    if obfs_host.is_some() {
+        count += 1;
+    }
+    if obfs_uri.is_some() {
+        count += 1;
+    }
+
+    let mut state = serializer.serialize_struct("Snell", count)?;
+    state.serialize_field("cipher", cipher)?;
+    state.serialize_field("password", password)?;
     if !*udp_enabled {
         state.serialize_field("udp_enabled", udp_enabled)?;
+    }
+    if let Some(v) = version {
+        state.serialize_field("version", v)?;
+    }
+    if let Some(k) = userkey {
+        state.serialize_field("userkey", k)?;
+    }
+    if *reuse {
+        state.serialize_field("reuse", reuse)?;
+    }
+    if let Some(m) = mode {
+        state.serialize_field("mode", m)?;
+    }
+    if *quic_proxy_mode {
+        state.serialize_field("quic_proxy_mode", quic_proxy_mode)?;
+    }
+    if let Some(om) = obfs_mode {
+        state.serialize_field("obfs_mode", om)?;
+    }
+    if let Some(oh) = obfs_host {
+        state.serialize_field("obfs_host", oh)?;
+    }
+    if let Some(ou) = obfs_uri {
+        state.serialize_field("obfs_uri", ou)?;
     }
     state.end()
 }
@@ -469,8 +609,17 @@ pub enum ClientProxyConfig {
         serialize_with = "serialize_snell_client"
     )]
     Snell {
-        config: ShadowsocksConfig,
+        cipher: String,
+        password: String,
         udp_enabled: bool,
+        version: Option<String>,
+        userkey: Option<String>,
+        reuse: bool,
+        mode: Option<String>,
+        quic_proxy_mode: bool,
+        obfs_mode: Option<String>,
+        obfs_host: Option<String>,
+        obfs_uri: Option<String>,
     },
     Vless {
         user_id: String,
@@ -763,8 +912,17 @@ pub enum ResolvedClientProxyConfig {
     },
     #[serde(serialize_with = "serialize_snell_client")]
     Snell {
-        config: ShadowsocksConfig,
+        cipher: String,
+        password: String,
         udp_enabled: bool,
+        version: Option<String>,
+        userkey: Option<String>,
+        reuse: bool,
+        mode: Option<String>,
+        quic_proxy_mode: bool,
+        obfs_mode: Option<String>,
+        obfs_host: Option<String>,
+        obfs_uri: Option<String>,
     },
     Vless {
         user_id: String,
