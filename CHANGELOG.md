@@ -2,9 +2,60 @@
 
 ## Unreleased
 
+- Added Snell obfuscation (`simple-obfs`) matching Surge 6.4.4 and sing-snell:
+  - Server-side HTTP simple-obfs on Snell v5 server (`obfs_mode: "http"`, default `"none"`).
+    TLS obfs is rejected during configuration validation with a suggestion to use ShadowTLS.
+  - Client-side simple-obfs supporting `none`, `http`, and `tls` for versions 1–3, and
+    `none` or `http` for versions 4–5, with configurable `obfs_host` and `obfs_uri`. Version 6
+    rejects `obfs_mode` in favor of native traffic shaping.
+  - Full wire protocol parity: HTTP WebSocket upgrade handshake with Firefox/Safari UA,
+    client request packing, server 101 Switching Protocols response, and zero-overhead raw
+    passthrough on subsequent stream data; TLS fake ClientHello with payload embedded in
+    session ticket extension (`0x0023`), SNI hostname, ServerHello payload extraction at
+    offset `0x6b`, and standard TLS 1.2 application data record framing (`0x17 0x03 0x03`).
+  - Integrated with `SnellServerHandler`, `SnellClientHandler`, and client connection reuse pool.
+  - Peer interop test coverage with `sing-box` for client and server HTTP obfs.
+
+- Added Snell client parity across versions v1 through v6 matching sing-snell:
+  - Client configuration and validation for v1–v6, `userkey`, `reuse`, and `quic_proxy_mode`.
+  - Legacy client framing for v1 (ChaCha20-Poly1305 with command 1) and v2
+    (AES-128-GCM with command 5).
+  - Lazy client request packing: first write packs request header and payload into a
+    single record; reading before write sends request alone without deadlock; remote EOF
+    (0x65) error replies surface as clean IO errors.
+  - Client connection reuse pool (`SnellClientPool`) for v4–v6: retains up to 10
+    connections with a 180 s max age, 20 s sweep interval, and background server draining
+    up to 512 KiB upon zero-chunk.
+  - Snell QUIC proxy client mode for v5 and v6: sniffs initial datagram to send
+    authenticated `Init` over UDP for QUIC traffic, falling back to UDP-over-TCP relay for
+    non-QUIC datagrams.
+  - sing-box peer interop test coverage for client v6 connection reuse and client userkey
+    authentication.
+- Verified Snell v6 wire framing parity against sing-snell (reF1nd/sing-snell@e056cb336137)
+  across shape profiles, salt blocks, seq/padding tables, and opening records with golden
+  value test suites.
+- The Snell QUIC proxy listener now authenticates users (userkey or per-user PSK) and runs on servers with `users`. Inits are decoded off the receive loop, so a flood of bad inits no longer stalls live sessions. Matching sing-box: sessions expire 60 seconds after the client's last packet (target replies no longer keep them open), a repeated init keeps the session's target, and an init without payload is refused.
+- Added Snell server multi-user authentication (`users`, `multi_user_authentication: userkey | psk`) and v4/v5 first-record salt replay protection, matching sing-snell / snell-server. With `version: v6`, PSKs must now be 12 to 255 bytes.
+- Fixed the Snell v4 client splitting its request across records: sing-snell and snell-server read the request from the first record and reset the connection. Added sing-box (reF1nd fork) Snell interop tests in both directions to CI.
 - Reduced UDP burst loss for TUN and WireGuard inbound forwarding by waiting for space in bounded reply queues. A destination closes after 30 seconds without response-queue capacity. TUN ingress and inbound UDP session/destination upload queues now hold 128 packets and still drop when full; WireGuard stack queues remain at 64.
 - Raised the TUN `resource_limits.tcp_buffer_size` default from 32 KiB to 128 KiB, giving each TCP flow 512 KiB of buffer capacity across four buffers. WireGuard retains its 32 KiB default and existing admission budget.
 - Upgrade note: TUN configurations that set `tcp_memory_bytes` without `tcp_buffer_size` now have a lower memory-derived connection limit (for example, 32 MiB permits 64 flows instead of 256). Previously valid budgets below 524,288 bytes fail validation with the new default. Explicitly set `tcp_buffer_size: 32768` to preserve the previous buffer size and admission calculation.
+
+## v0.3.9
+
+- Added Snell v4, v5, and v6 server connection reuse (`Connect v2`), deferred tunnel replies, zero-chunk session framing, and client data drain matching sing-snell and snell-server.
+- Added standard native Shadowsocks UDP relay for SIP004 and SIP022 inbound and outbound proxies.
+- Added dedicated Snell unit and connection reuse test step with test runner validation in CI.
+- Fixed Snell v4 and v6 zero-chunk handling as clean session EOF.
+
+## v0.3.8
+
+- Added HTTP/1.1 Upgrade transport (`httpupgrade`) interoperable with sing-box for inbound and outbound proxies, supporting early data via query parameter, header, or base64 path.
+- Added gRPC Gun transport (`grpc`) interoperable with sing-box for inbound and outbound proxies, supporting framing over HTTP/2 gRPC with bidirectional streaming for TCP streams and UDP packet routing.
+- Added Trojan UDP-over-TLS client and server support.
+- Added Snell v4, v5, and v6 protocol support with automatic inbound version detection.
+- Fixed ephemeral port collision race during multi-peer WireGuard test initialization.
+- Added automated sing-box integration test suite to CI, gated cross-compilation on test success, and added multi-layer GitHub Actions caching.
 
 ## v0.3.7
 
