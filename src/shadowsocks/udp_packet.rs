@@ -537,3 +537,203 @@ pub fn encrypt_server_udp_packet_2022(
 // Unit Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_socks5_target_roundtrip() {
+        let targets = vec![
+            NetLocation::new(Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8)), 53),
+            NetLocation::new(
+                Address::Ipv6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+                853,
+            ),
+            NetLocation::new(Address::from("dns.google").unwrap(), 443),
+        ];
+
+        for target in targets {
+            let mut buf = Vec::new();
+            write_socks5_target(&target, &mut buf);
+            let (parsed, len) = parse_socks5_target(&buf).unwrap();
+            assert_eq!(len, buf.len());
+            assert_eq!(parsed, target);
+        }
+    }
+
+    #[test]
+    fn test_legacy_aead_udp_roundtrip() {
+        let password = "test-password-123";
+        let ciphers = ["aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"];
+
+        for cipher_name in ciphers {
+            let cipher = ShadowsocksCipher::try_from(cipher_name).unwrap();
+            let key = DefaultKey::new(password, cipher.key_len());
+
+            let target = NetLocation::new(Address::Ipv4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+            let payload = b"hello legacy udp shadowsocks";
+
+            // Client encrypts request
+            let mut request_salt = vec![0u8; cipher.salt_len()];
+            rand::rng().fill_bytes(&mut request_salt);
+
+            let session_key = key.create_session_key(&request_salt);
+            let unbound = UnboundKey::new(cipher.algorithm(), &session_key).unwrap();
+            let less_safe = LessSafeKey::new(unbound);
+
+            let mut plain = Vec::new();
+            write_socks5_target(&target, &mut plain);
+            plain.extend_from_slice(payload);
+
+            let nonce = Nonce::try_assume_unique_for_key(&[0u8; NONCE_LEN]).unwrap();
+            less_safe
+                .seal_in_place_append_tag(nonce, Aad::empty(), &mut plain)
+                .unwrap();
+
+            let mut request_data = request_salt;
+            request_data.extend_from_slice(&plain);
+
+            // Server decrypts request
+            let (dec_target, dec_payload) =
+                decrypt_client_udp_packet_legacy(&request_data, &key, cipher).unwrap();
+            assert_eq!(dec_target, target);
+            assert_eq!(dec_payload, payload);
+
+            // Server encrypts response
+            let response_payload = b"reply from 1.1.1.1";
+            let response_packet =
+                encrypt_server_udp_packet_legacy(&target, response_payload, &key, cipher).unwrap();
+
+            // Client decrypts response
+            let (dec_resp_target, dec_resp_payload) =
+                decrypt_client_udp_packet_legacy(&response_packet, &key, cipher).unwrap();
+            assert_eq!(dec_resp_target, target);
+            assert_eq!(dec_resp_payload, response_payload);
+        }
+    }
+
+    #[test]
+    fn test_2022_aead_udp_roundtrip() {
+        let ciphers = [
+            ("2022-blake3-aes-128-gcm", 16),
+            ("2022-blake3-aes-256-gcm", 32),
+            ("2022-blake3-chacha20-poly1305", 32),
+        ];
+
+        for (cipher_name, key_len) in ciphers {
+            let stripped = cipher_name.strip_prefix("2022-blake3-").unwrap();
+            let cipher = ShadowsocksCipher::try_from(stripped).unwrap();
+            let key_bytes = vec![0x42u8; key_len].into_boxed_slice();
+
+            let target = NetLocation::new(Address::from("example.com").unwrap(), 443);
+            let payload = b"hello 2022 udp";
+            let client_session_id: u64 = 0x123456789abcdef0;
+            let client_packet_id: u64 = 1;
+
+            // Simulate client packet creation
+            let is_aes = matches!(stripped, "aes-128-gcm" | "aes-256-gcm");
+            let client_packet = if is_aes {
+                let mut header = [0u8; 16];
+                header[0..8].copy_from_slice(&client_session_id.to_be_bytes());
+                header[8..16].copy_from_slice(&client_packet_id.to_be_bytes());
+
+                let mut nonce_bytes = [0u8; NONCE_LEN];
+                nonce_bytes.copy_from_slice(&header[4..16]);
+
+                let session_key =
+                    derive_2022_udp_session_key(&key_bytes, &header[0..8], cipher.key_len());
+                let unbound = UnboundKey::new(cipher.algorithm(), &session_key).unwrap();
+                let less_safe = LessSafeKey::new(unbound);
+
+                let mut plain = Vec::new();
+                plain.push(TYPE_CLIENT_PAYLOAD);
+                plain.extend_from_slice(&get_now_unix().to_be_bytes());
+                plain.extend_from_slice(&0u16.to_be_bytes()); // padding size = 0
+                write_socks5_target(&target, &mut plain);
+                plain.extend_from_slice(payload);
+
+                let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
+                less_safe
+                    .seal_in_place_append_tag(nonce, Aad::empty(), &mut plain)
+                    .unwrap();
+
+                let algorithm = match key_len {
+                    16 => &AES_128,
+                    32 => &AES_256,
+                    _ => unreachable!(),
+                };
+                let unbound_cipher = UnboundCipherKey::new(algorithm, &key_bytes).unwrap();
+                let encrypting_key = EncryptingKey::ecb(unbound_cipher).unwrap();
+                encrypting_key
+                    .less_safe_encrypt(&mut header, EncryptionContext::None)
+                    .unwrap();
+
+                let mut out = header.to_vec();
+                out.extend_from_slice(&plain);
+                out
+            } else {
+                let mut nonce_bytes = [0u8; 12];
+                rand::rng().fill_bytes(&mut nonce_bytes);
+
+                let unbound = UnboundKey::new(cipher.algorithm(), &key_bytes).unwrap();
+                let less_safe = LessSafeKey::new(unbound);
+
+                let mut plain = Vec::new();
+                plain.extend_from_slice(&client_session_id.to_be_bytes());
+                plain.extend_from_slice(&client_packet_id.to_be_bytes());
+                plain.push(TYPE_CLIENT_PAYLOAD);
+                plain.extend_from_slice(&get_now_unix().to_be_bytes());
+                plain.extend_from_slice(&0u16.to_be_bytes());
+                write_socks5_target(&target, &mut plain);
+                plain.extend_from_slice(payload);
+
+                let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
+                less_safe
+                    .seal_in_place_append_tag(nonce, Aad::empty(), &mut plain)
+                    .unwrap();
+
+                let mut out = nonce_bytes.to_vec();
+                out.extend_from_slice(&plain);
+                out
+            };
+
+            // Server decrypts client packet
+            let dec =
+                decrypt_client_udp_packet_2022(&client_packet, &key_bytes, cipher).unwrap();
+            assert_eq!(dec.session_id, client_session_id);
+            assert_eq!(dec.packet_id, client_packet_id);
+            assert_eq!(dec.target, target);
+            assert_eq!(dec.payload, payload);
+
+            // Server encrypts response
+            let server_session_id: u64 = 0x9988776655443322;
+            let server_packet_id: u64 = 1;
+            let server_response = encrypt_server_udp_packet_2022(
+                server_session_id,
+                server_packet_id,
+                client_session_id,
+                &target,
+                b"pong 2022",
+                &key_bytes,
+                cipher,
+            )
+            .unwrap();
+
+            assert!(!server_response.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_sliding_window_filter() {
+        let mut filter = SlidingWindowFilter::new();
+        assert!(filter.validate_and_update(1));
+        assert!(filter.validate_and_update(2));
+        assert!(!filter.validate_and_update(1)); // duplicate rejected
+        assert!(!filter.validate_and_update(2)); // duplicate rejected
+        assert!(filter.validate_and_update(10));
+        assert!(filter.validate_and_update(5));
+        assert!(!filter.validate_and_update(5)); // duplicate
+        assert!(filter.validate_and_update(100)); // new far future
+        assert!(!filter.validate_and_update(20)); // too old (diff 80 >= 64)
+    }
+}

@@ -244,3 +244,191 @@ pub async fn run_shadowsocks_udp_listener(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::NetLocation;
+    use crate::shadowsocks::ShadowsocksCipher;
+
+    #[tokio::test]
+    async fn test_shadowsocks_legacy_udp_relay_integration() {
+        let echo_server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_server.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, src)) = echo_server.recv_from(&mut buf).await {
+                let _ = echo_server.send_to(&buf[..n], src).await;
+            }
+        });
+
+        let password = "test-legacy-password";
+        let cipher = ShadowsocksCipher::try_from("aes-128-gcm").unwrap();
+        let ss_config = ShadowsocksConfig::Legacy {
+            cipher,
+            password: password.to_string(),
+        };
+
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let selector = Arc::new(
+            crate::tcp::tcp_client_handler_factory::create_test_selector(
+                vec![crate::config::ResolvedRuleConfig::default()],
+                resolver.clone(),
+            )
+            .unwrap(),
+        );
+
+        let listener_socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let listener_addr = listener_socket.local_addr().unwrap();
+
+        let listener_handle = tokio::spawn({
+            let socket = listener_socket.clone();
+            let config = ss_config.clone();
+            let selector = selector.clone();
+            let resolver = resolver.clone();
+            async move {
+                let _ = run_shadowsocks_udp_listener(socket, config, selector, resolver).await;
+            }
+        });
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = NetLocation::from_str(&echo_addr.to_string(), None).unwrap();
+        let test_payload = b"ping shadowsocks legacy udp";
+
+        // Client encrypts request using legacy codec
+        let key = DefaultKey::new(password, cipher.key_len());
+        let packet = crate::shadowsocks::udp_packet::encrypt_server_udp_packet_legacy(
+            &target,
+            test_payload,
+            &key,
+            cipher,
+        )
+        .unwrap();
+
+        client.send_to(&packet, listener_addr).await.unwrap();
+
+        let mut recv_buf = [0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(3), client.recv(&mut recv_buf))
+            .await
+            .expect("timeout waiting for echo")
+            .unwrap();
+
+        let (resp_target, resp_payload) =
+            crate::shadowsocks::udp_packet::decrypt_client_udp_packet_legacy(
+                &recv_buf[..n],
+                &key,
+                cipher,
+            )
+            .unwrap();
+
+        assert_eq!(resp_payload, test_payload);
+        assert_eq!(resp_target, target);
+
+        listener_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_shadowsocks_2022_udp_relay_integration() {
+        let echo_server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_server.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, src)) = echo_server.recv_from(&mut buf).await {
+                let _ = echo_server.send_to(&buf[..n], src).await;
+            }
+        });
+
+        let cipher = ShadowsocksCipher::try_from("aes-128-gcm").unwrap();
+        let key_bytes = vec![0x33u8; 16].into_boxed_slice();
+        let ss_config = ShadowsocksConfig::Aead2022 {
+            cipher,
+            key_bytes: key_bytes.clone(),
+            identity_keys: Vec::new(),
+        };
+
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let selector = Arc::new(
+            crate::tcp::tcp_client_handler_factory::create_test_selector(
+                vec![crate::config::ResolvedRuleConfig::default()],
+                resolver.clone(),
+            )
+            .unwrap(),
+        );
+
+        let listener_socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let listener_addr = listener_socket.local_addr().unwrap();
+
+        let listener_handle = tokio::spawn({
+            let socket = listener_socket.clone();
+            let config = ss_config.clone();
+            let selector = selector.clone();
+            let resolver = resolver.clone();
+            async move {
+                let _ = run_shadowsocks_udp_listener(socket, config, selector, resolver).await;
+            }
+        });
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = NetLocation::from_str(&echo_addr.to_string(), None).unwrap();
+        let test_payload = b"ping shadowsocks 2022 udp";
+        let client_session_id: u64 = 0xabcdef1234567890;
+        let client_packet_id: u64 = 1;
+
+        // Build client 2022 packet
+        let mut header = [0u8; 16];
+        header[0..8].copy_from_slice(&client_session_id.to_be_bytes());
+        header[8..16].copy_from_slice(&client_packet_id.to_be_bytes());
+
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes.copy_from_slice(&header[4..16]);
+
+        let session_key = crate::shadowsocks::udp_packet::derive_2022_udp_session_key(
+            &key_bytes,
+            &header[0..8],
+            cipher.key_len(),
+        );
+        let unbound = aws_lc_rs::aead::UnboundKey::new(cipher.algorithm(), &session_key).unwrap();
+        let less_safe = aws_lc_rs::aead::LessSafeKey::new(unbound);
+
+        let mut plain = Vec::new();
+        plain.push(crate::shadowsocks::udp_packet::TYPE_CLIENT_PAYLOAD);
+        plain.extend_from_slice(
+            &std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .to_be_bytes(),
+        );
+        plain.extend_from_slice(&0u16.to_be_bytes()); // padding size = 0
+        crate::shadowsocks::udp_packet::write_socks5_target(&target, &mut plain);
+        plain.extend_from_slice(test_payload);
+
+        let nonce = aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
+        less_safe
+            .seal_in_place_append_tag(nonce, aws_lc_rs::aead::Aad::empty(), &mut plain)
+            .unwrap();
+
+        let unbound_cipher =
+            aws_lc_rs::cipher::UnboundCipherKey::new(&aws_lc_rs::cipher::AES_128, &key_bytes)
+                .unwrap();
+        let encrypting_key = aws_lc_rs::cipher::EncryptingKey::ecb(unbound_cipher).unwrap();
+        encrypting_key
+            .less_safe_encrypt(&mut header, aws_lc_rs::cipher::EncryptionContext::None)
+            .unwrap();
+
+        let mut client_packet = header.to_vec();
+        client_packet.extend_from_slice(&plain);
+
+        client.send_to(&client_packet, listener_addr).await.unwrap();
+
+        let mut recv_buf = [0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(3), client.recv(&mut recv_buf))
+            .await
+            .expect("timeout waiting for 2022 echo")
+            .unwrap();
+
+        assert!(n > 16);
+        listener_handle.abort();
+    }
+}
