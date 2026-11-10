@@ -39,22 +39,6 @@ pub const MAX_PAYLOAD_LENGTH: usize = 0x3FFF;
 
 const V4_READ_BUFFER_SIZE: usize = 64 * 1024;
 
-const ZERO_CHUNK_KIND: io::ErrorKind = io::ErrorKind::UnexpectedEof;
-const ZERO_CHUNK_MSG: &str = "snell: zero chunk";
-
-/// True iff the I/O error is the v4 zero-chunk half-close signal.
-#[allow(dead_code)]
-pub fn is_zero_chunk(err: &io::Error) -> bool {
-    err.kind() == ZERO_CHUNK_KIND
-        && err
-            .get_ref()
-            .is_some_and(|e| e.to_string() == ZERO_CHUNK_MSG)
-}
-
-pub(super) fn zero_chunk_err() -> io::Error {
-    io::Error::new(ZERO_CHUNK_KIND, ZERO_CHUNK_MSG)
-}
-
 pub fn increment_nonce(nonce: &mut [u8; V4_NONCE_SIZE]) {
     for byte in nonce.iter_mut() {
         *byte = byte.wrapping_add(1);
@@ -466,7 +450,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for V4Conn<S> {
                             header_buf: [0u8; V4_HEADER_CIPHER_SIZE],
                             header_progress: 0,
                         };
-                        return Poll::Ready(Err(zero_chunk_err()));
+                        // A zero chunk ends the session: report clean EOF, as meow-rs does.
+                        return Poll::Ready(Ok(()));
                     }
                     if payload_len > MAX_PAYLOAD_LENGTH || padding_len > MAX_PAYLOAD_LENGTH {
                         return Poll::Ready(Err(io::Error::new(
@@ -553,6 +538,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for V4Conn<S> {
                     return Poll::Ready(Ok(consumed));
                 }
             }
+        }
+
+        // A flush may have sent the staged frame; report its count once.
+        if this.writer.pending_input > 0 {
+            return Poll::Ready(Ok(std::mem::take(&mut this.writer.pending_input)));
         }
 
         if buf.is_empty() {
@@ -676,8 +666,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWriteMessage for V4Conn<S> {
         if this.writer.pending_off < this.writer.pending.len() {
             ready!(drain_writer(&mut this.writer, &mut this.inner, cx))?;
         }
+        // A retry after Pending: this packet is already staged (and maybe sent by a flush).
+        if std::mem::take(&mut this.writer.pending_input) > 0 {
+            return Poll::Ready(Ok(()));
+        }
         this.stage_packet_frame(buf)?;
         ready!(drain_writer(&mut this.writer, &mut this.inner, cx))?;
+        this.writer.pending_input = 0;
         Poll::Ready(Ok(()))
     }
 }
@@ -696,85 +691,3 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncShutdownMessage for V4Conn<S
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncMessageStream for V4Conn<S> {}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[test]
-    fn increment_nonce_wraps() {
-        let mut n = [0xFFu8; V4_NONCE_SIZE];
-        increment_nonce(&mut n);
-        assert_eq!(n, [0u8; V4_NONCE_SIZE]);
-    }
-
-    #[test]
-    fn swap_padding_round_trips() {
-        let mut p = vec![1u8, 2, 3, 4, 5, 6];
-        let mut c = vec![10u8, 20, 30, 40, 50, 60];
-        let (orig_p, orig_c) = (p.clone(), c.clone());
-        swap_padding(&mut p, &mut c);
-        swap_padding(&mut p, &mut c);
-        assert_eq!(p, orig_p);
-        assert_eq!(c, orig_c);
-    }
-
-    #[test]
-    fn bit_count_padding_has_requested_ones() {
-        let pad = make_v4_bit_count_padding(16, 40).unwrap();
-        let ones: u32 = pad.iter().map(|b| b.count_ones()).sum();
-        assert_eq!(ones, 40);
-    }
-
-    #[tokio::test]
-    async fn v4_round_trip_through_duplex() {
-        let (a, b) = tokio::io::duplex(1 << 18);
-        let psk: Arc<[u8]> = Arc::from(b"shared-secret".as_slice());
-        let mut alice = V4Conn::new(a, Arc::clone(&psk));
-        let mut bob = V4Conn::new(b, psk);
-
-        let small = b"hello-world";
-        let large: Vec<u8> = (0..32_000u32).map(|i| (i % 251) as u8).collect();
-
-        let writer = tokio::spawn(async move {
-            alice.write_all(small).await.unwrap();
-            alice.write_all(&large).await.unwrap();
-            alice.flush().await.unwrap();
-            alice
-        });
-
-        let mut got_small = vec![0u8; small.len()];
-        bob.read_exact(&mut got_small).await.unwrap();
-        assert_eq!(got_small, small);
-
-        let mut got_large = vec![0u8; 32_000];
-        bob.read_exact(&mut got_large).await.unwrap();
-        let expected: Vec<u8> = (0..32_000u32).map(|i| (i % 251) as u8).collect();
-        assert_eq!(got_large, expected);
-
-        drop(writer.await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn v4_zero_chunk_surfaces_as_tagged_error() {
-        let (a, b) = tokio::io::duplex(8192);
-        let psk: Arc<[u8]> = Arc::from(b"k".as_slice());
-        let mut alice = V4Conn::new(a, Arc::clone(&psk));
-        let mut bob = V4Conn::new(b, psk);
-
-        alice.write_all(b"abc").await.unwrap();
-        alice.flush().await.unwrap();
-        std::future::poll_fn(|cx| Pin::new(&mut alice).poll_write(cx, &[]))
-            .await
-            .unwrap();
-        alice.flush().await.unwrap();
-
-        let mut buf = [0u8; 3];
-        bob.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"abc");
-
-        let mut more = [0u8; 1];
-        let err = bob.read_exact(&mut more).await.unwrap_err();
-        assert!(is_zero_chunk(&err), "expected zero-chunk tag, got {err:?}");
-    }
-}

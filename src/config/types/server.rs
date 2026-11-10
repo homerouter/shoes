@@ -25,6 +25,19 @@ pub struct AnyTlsUserConfig {
     pub password: String,
 }
 
+/// Snell server user: `userkey` (userkey authentication) or `password`
+/// (psk authentication), per `multi_user_authentication`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnellUserConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub userkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
 /// NaiveProxy user configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -799,6 +812,8 @@ pub enum ServerProxyConfig {
     },
     Snell {
         cipher: String,
+        /// Shared PSK; empty (omitted) with psk multi-user authentication.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         password: String,
         #[serde(default = "default_true")]
         udp_enabled: bool,
@@ -806,6 +821,12 @@ pub enum ServerProxyConfig {
         version: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        users: Option<OneOrSome<SnellUserConfig>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        multi_user_authentication: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        obfs_mode: Option<String>,
     },
     Vless {
         user_id: String,
@@ -1027,12 +1048,19 @@ pub enum ResolvedServerProxyConfig {
     },
     Snell {
         cipher: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
         password: String,
         udp_enabled: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        users: Vec<SnellUserConfig>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        multi_user_authentication: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        obfs_mode: Option<String>,
     },
     Vless {
         user_id: String,
