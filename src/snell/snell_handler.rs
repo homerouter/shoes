@@ -1664,3 +1664,1678 @@ impl TcpClientHandler for SnellClientHandler {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::poll_fn;
+    use tokio::io::duplex;
+    use crate::tcp::carrier_dialer::RouteKey;
+
+    fn test_server(version: Option<&str>, mode: Option<&str>) -> SnellServerHandler {
+        let cipher = ShadowsocksCipher::try_from("aes-128-gcm").unwrap();
+        SnellServerHandler::new(
+            cipher,
+            "test-psk-12345",
+            true,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(crate::resolver::NativeResolver::new()),
+            version,
+            mode,
+        )
+    }
+
+    fn test_server_with_cipher(
+        cipher_name: &str,
+        version: Option<&str>,
+        mode: Option<&str>,
+    ) -> SnellServerHandler {
+        let cipher = ShadowsocksCipher::try_from(cipher_name).unwrap();
+        SnellServerHandler::new(
+            cipher,
+            "test-psk-12345",
+            true,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(crate::resolver::NativeResolver::new()),
+            version,
+            mode,
+        )
+    }
+
+    fn test_client(version: Option<&str>, mode: Option<&str>) -> SnellClientHandler {
+        let cipher = ShadowsocksCipher::try_from("aes-128-gcm").unwrap();
+        SnellClientHandler::new(
+            cipher,
+            "test-psk-12345",
+            true,
+            version,
+            mode,
+            None,
+            false,
+            false,
+        )
+    }
+
+    fn test_client_with_cipher(
+        cipher_name: &str,
+        version: Option<&str>,
+        mode: Option<&str>,
+    ) -> SnellClientHandler {
+        let cipher = ShadowsocksCipher::try_from(cipher_name).unwrap();
+        SnellClientHandler::new(
+            cipher,
+            "test-psk-12345",
+            true,
+            version,
+            mode,
+            None,
+            false,
+            false,
+        )
+    }
+
+    async fn run_tcp_echo_with_cipher(
+        cipher_name: &str,
+        client_version: Option<&str>,
+        client_mode: Option<&str>,
+        server_version: Option<&str>,
+        server_mode: Option<&str>,
+        expect_reusable: bool,
+    ) {
+        let server = test_server_with_cipher(cipher_name, server_version, server_mode);
+        let client = test_client_with_cipher(cipher_name, client_version, client_mode);
+
+        let (client_io, server_io) = duplex(65536);
+        let target: ResolvedLocation =
+            NetLocation::from_str("example.com:443", None).unwrap().into();
+
+        let client_task = tokio::spawn(async move {
+            let mut result = client
+                .setup_client_tcp_stream(Box::new(client_io), target)
+                .await
+                .unwrap();
+            result
+                .client_stream
+                .write_all(b"hello from client")
+                .await
+                .unwrap();
+            result.client_stream.flush().await.unwrap();
+            let mut buf = [0u8; 17];
+            result.client_stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"reply from server");
+        });
+
+        let server_task = tokio::spawn(async move {
+            let result = server.setup_server_stream(Box::new(server_io)).await.unwrap();
+            let reusable = matches!(result, TcpServerSetupResult::ReusableTcpForward { .. });
+            let (remote_location, mut stream, connection_success_response, initial_remote_data) =
+                match result {
+                    TcpServerSetupResult::TcpForward {
+                        remote_location,
+                        stream,
+                        connection_success_response,
+                        initial_remote_data,
+                        ..
+                    } => (
+                        remote_location,
+                        stream,
+                        connection_success_response,
+                        initial_remote_data,
+                    ),
+                    TcpServerSetupResult::ReusableTcpForward { stream, session } => (
+                        session.remote_location,
+                        stream as Box<dyn AsyncStream>,
+                        session.connection_success_response,
+                        session.initial_remote_data,
+                    ),
+                    _ => panic!("expected a TCP forward"),
+                };
+            assert_eq!(reusable, expect_reusable);
+            assert_eq!(remote_location.to_string(), "example.com:443");
+            if let Some(resp) = connection_success_response {
+                stream.write_all(&resp).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+            let mut received = initial_remote_data
+                .map(|b| b.into_vec())
+                .unwrap_or_default();
+            while received.len() < 17 {
+                let mut chunk = [0u8; 17];
+                let n = stream
+                    .read(&mut chunk[..17 - received.len()])
+                    .await
+                    .unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&chunk[..n]);
+            }
+            assert_eq!(&received[..], b"hello from client");
+            stream.write_all(b"reply from server").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        tokio::try_join!(client_task, server_task).unwrap();
+    }
+
+    async fn run_tcp_echo(
+        client_version: Option<&str>,
+        client_mode: Option<&str>,
+        server_version: Option<&str>,
+        server_mode: Option<&str>,
+        expect_reusable: bool,
+    ) {
+        run_tcp_echo_with_cipher(
+            "aes-128-gcm",
+            client_version,
+            client_mode,
+            server_version,
+            server_mode,
+            expect_reusable,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn snell_v1_client_tcp() {
+        run_tcp_echo_with_cipher(
+            "chacha20-ietf-poly1305",
+            Some("v1"),
+            None,
+            Some("v3"),
+            None,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn snell_v2_client_tcp() {
+        run_tcp_echo_with_cipher(
+            "aes-128-gcm",
+            Some("v2"),
+            None,
+            Some("v3"),
+            None,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn snell_v1_v2_udp_rejected() {
+        let target: ResolvedLocation =
+            NetLocation::from_str("127.0.0.1:53", None).unwrap().into();
+
+        let v1_client = test_client_with_cipher("chacha20-ietf-poly1305", Some("v1"), None);
+        assert!(!v1_client.supports_udp_over_tcp());
+        let (v1_c, _v1_s) = duplex(1024);
+        match v1_client
+            .setup_client_udp_bidirectional(Box::new(v1_c), target.clone())
+            .await
+        {
+            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::Unsupported),
+            Ok(_) => panic!("expected unsupported UDP for v1"),
+        }
+
+        let v2_client = test_client_with_cipher("aes-128-gcm", Some("v2"), None);
+        assert!(!v2_client.supports_udp_over_tcp());
+        let (v2_c, _v2_s) = duplex(1024);
+        match v2_client
+            .setup_client_udp_bidirectional(Box::new(v2_c), target)
+            .await
+        {
+            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::Unsupported),
+            Ok(_) => panic!("expected unsupported UDP for v2"),
+        }
+    }
+
+    #[tokio::test]
+    async fn snell_v3_client_auto_detect_server() {
+        run_tcp_echo(Some("v3"), None, None, None, false).await;
+    }
+
+    #[tokio::test]
+    async fn snell_v4_client_auto_detect_server() {
+        run_tcp_echo(Some("v4"), None, None, None, true).await;
+    }
+
+    #[tokio::test]
+    async fn snell_v5_client_auto_detect_server() {
+        run_tcp_echo(Some("v5"), None, None, None, true).await;
+    }
+
+    #[tokio::test]
+    async fn snell_v6_client_auto_detect_server_default_mode() {
+        run_tcp_echo(Some("v6"), None, None, None, true).await;
+    }
+
+    #[tokio::test]
+    async fn snell_v6_client_server_unshaped_mode() {
+        run_tcp_echo(
+            Some("v6"),
+            Some("unshaped"),
+            Some("v6"),
+            Some("unshaped"),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn snell_v6_client_server_unsafe_raw_mode() {
+        run_tcp_echo(
+            Some("v6"),
+            Some("unsafe-raw"),
+            Some("v6"),
+            Some("unsafe-raw"),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn snell_udp_relay_v4_client_auto_detect_server() {
+        let server = test_server(None, None);
+        let client = test_client(Some("v4"), None);
+
+        let (client_io, server_io) = duplex(65536);
+        let target_location = NetLocation::from_str("127.0.0.1:53", None).unwrap();
+        let target: ResolvedLocation = target_location.clone().into();
+
+        let target_loc_clone = target_location.clone();
+        let client_task = tokio::spawn(async move {
+            let mut client_stream = client
+                .setup_client_udp_bidirectional(Box::new(client_io), target)
+                .await
+                .unwrap();
+            poll_fn(|cx| Pin::new(&mut *client_stream).poll_write_message(cx, b"dns-query"))
+                .await
+                .unwrap();
+            poll_fn(|cx| Pin::new(&mut *client_stream).poll_flush_message(cx))
+                .await
+                .unwrap();
+
+            let mut storage = vec![0u8; 1024];
+            let mut buf = ReadBuf::new(&mut storage);
+            poll_fn(|cx| Pin::new(&mut *client_stream).poll_read_message(cx, &mut buf))
+                .await
+                .unwrap();
+            assert_eq!(buf.filled(), b"dns-response");
+        });
+
+        let server_task = tokio::spawn(async move {
+            let result = server.setup_server_stream(Box::new(server_io)).await.unwrap();
+            let TcpServerSetupResult::MultiDirectionalUdp { mut stream, .. } = result else {
+                panic!("expected MultiDirectionalUdp");
+            };
+            let mut storage = vec![0u8; 1024];
+            let mut buf = ReadBuf::new(&mut storage);
+            let src_loc =
+                poll_fn(|cx| Pin::new(&mut *stream).poll_read_targeted_message(cx, &mut buf))
+                    .await
+                    .unwrap();
+            assert_eq!(src_loc, target_loc_clone);
+            assert_eq!(buf.filled(), b"dns-query");
+
+            poll_fn(|cx| {
+                Pin::new(&mut *stream)
+                    .poll_write_sourced_message(cx, b"dns-response", &target_loc_clone)
+            })
+            .await
+            .unwrap();
+            poll_fn(|cx| Pin::new(&mut *stream).poll_flush_message(cx))
+                .await
+                .unwrap();
+        });
+
+        tokio::try_join!(client_task, server_task).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snell_udp_relay_v6_client_auto_detect_server() {
+        let server = test_server(None, None);
+        let client = test_client(Some("v6"), None);
+
+        let (client_io, server_io) = duplex(65536);
+        let target_location = NetLocation::from_str("127.0.0.1:53", None).unwrap();
+        let target: ResolvedLocation = target_location.clone().into();
+
+        let target_loc_clone = target_location.clone();
+        let client_task = tokio::spawn(async move {
+            let mut client_stream = client
+                .setup_client_udp_bidirectional(Box::new(client_io), target)
+                .await
+                .unwrap();
+            poll_fn(|cx| Pin::new(&mut *client_stream).poll_write_message(cx, b"dns-query-v6"))
+                .await
+                .unwrap();
+            poll_fn(|cx| Pin::new(&mut *client_stream).poll_flush_message(cx))
+                .await
+                .unwrap();
+
+            let mut storage = vec![0u8; 1024];
+            let mut buf = ReadBuf::new(&mut storage);
+            poll_fn(|cx| Pin::new(&mut *client_stream).poll_read_message(cx, &mut buf))
+                .await
+                .unwrap();
+            assert_eq!(buf.filled(), b"dns-response-v6");
+        });
+
+        let server_task = tokio::spawn(async move {
+            let result = server.setup_server_stream(Box::new(server_io)).await.unwrap();
+            let TcpServerSetupResult::MultiDirectionalUdp { mut stream, .. } = result else {
+                panic!("expected MultiDirectionalUdp");
+            };
+            let mut storage = vec![0u8; 1024];
+            let mut buf = ReadBuf::new(&mut storage);
+            let src_loc =
+                poll_fn(|cx| Pin::new(&mut *stream).poll_read_targeted_message(cx, &mut buf))
+                    .await
+                    .unwrap();
+            assert_eq!(src_loc, target_loc_clone);
+            assert_eq!(buf.filled(), b"dns-query-v6");
+
+            poll_fn(|cx| {
+                Pin::new(&mut *stream)
+                    .poll_write_sourced_message(cx, b"dns-response-v6", &target_loc_clone)
+            })
+            .await
+            .unwrap();
+            poll_fn(|cx| Pin::new(&mut *stream).poll_flush_message(cx))
+                .await
+                .unwrap();
+        });
+
+        tokio::try_join!(client_task, server_task).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snell_wrong_password_rejected() {
+        let cipher = ShadowsocksCipher::try_from("aes-128-gcm").unwrap();
+        let server = SnellServerHandler::new(
+            cipher,
+            "correct-psk",
+            true,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(crate::resolver::NativeResolver::new()),
+            None,
+            None,
+        );
+        let client = SnellClientHandler::new(
+            cipher,
+            "wrong-psk",
+            true,
+            Some("v4"),
+            None,
+            None,
+            false,
+            false,
+        );
+
+        let (client_io, server_io) = duplex(65536);
+        let target: ResolvedLocation =
+            NetLocation::from_str("example.com:443", None).unwrap().into();
+
+        let client_task = tokio::spawn(async move {
+            if let Ok(mut res) = client
+                .setup_client_tcp_stream(Box::new(client_io), target)
+                .await
+            {
+                let _ = res.client_stream.write_all(b"payload").await;
+                let _ = res.client_stream.flush().await;
+            }
+        });
+
+        let server_task = tokio::spawn(async move {
+            let res = server.setup_server_stream(Box::new(server_io)).await;
+            assert!(res.is_err());
+        });
+
+        let _ = tokio::join!(client_task, server_task);
+    }
+
+    #[tokio::test]
+    async fn snell_client_returns_before_reply() {
+        let client = test_client(Some("v4"), None);
+        let (client_io, _server_io) = duplex(65536);
+        let target: ResolvedLocation =
+            NetLocation::from_str("example.com:443", None).unwrap().into();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.setup_client_tcp_stream(Box::new(client_io), target),
+        )
+        .await
+        .expect("setup must not wait for the reply")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn snell_client_surfaces_error_reply() {
+        let server = test_server(None, None);
+        let client = test_client(Some("v4"), None);
+        let (client_io, server_io) = duplex(65536);
+        // The server side runs concurrently so a client that waits for the
+        // reply during setup fails instead of hanging.
+        let server_task = tokio::spawn(async move {
+            let (mut framed, _) = server
+                .detect_and_frame_stream(Box::new(server_io))
+                .await
+                .unwrap();
+            let mut request = [0u8; 64];
+            let _ = framed.read(&mut request).await.unwrap();
+            write_all(&mut framed, b"\x02\x65\x0aRemote EOF").await.unwrap();
+            framed.flush().await.unwrap();
+            framed
+        });
+        let target: ResolvedLocation =
+            NetLocation::from_str("example.com:443", None).unwrap().into();
+        let mut result = client
+            .setup_client_tcp_stream(Box::new(client_io), target)
+            .await
+            .unwrap();
+        let err = result.client_stream.read(&mut [0u8; 8]).await.unwrap_err();
+        assert_eq!(err.to_string(), "snell error 0x65: Remote EOF");
+        drop(server_task.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn snell_client_lazy_request_write_packs_payload() {
+        let server = test_server(Some("v4"), None);
+        let client = test_client(Some("v4"), None);
+        let (client_io, server_io) = duplex(65536);
+        let target: ResolvedLocation =
+            NetLocation::from_str("example.com:443", None).unwrap().into();
+
+        let mut res = client
+            .setup_client_tcp_stream(Box::new(client_io), target)
+            .await
+            .unwrap();
+
+        // Write initial payload before reading: must be packed into first record.
+        res.client_stream
+            .write_all(b"lazy payload chunk")
+            .await
+            .unwrap();
+        res.client_stream.flush().await.unwrap();
+
+        let server_res = server
+            .setup_server_stream(Box::new(server_io))
+            .await
+            .unwrap();
+        let initial_data = match server_res {
+            TcpServerSetupResult::TcpForward {
+                initial_remote_data,
+                ..
+            } => initial_remote_data,
+            TcpServerSetupResult::ReusableTcpForward { session, .. } => {
+                session.initial_remote_data
+            }
+            _ => panic!("expected forward"),
+        };
+        assert_eq!(
+            initial_data.as_deref(),
+            Some(&b"lazy payload chunk"[..]),
+            "initial payload must be bundled in the request record"
+        );
+    }
+
+    #[tokio::test]
+    async fn snell_client_lazy_request_read_before_write() {
+        let server = test_server(Some("v4"), None);
+        let client = test_client(Some("v4"), None);
+        let (client_io, server_io) = duplex(65536);
+        let target: ResolvedLocation =
+            NetLocation::from_str("example.com:443", None).unwrap().into();
+
+        let mut res = client
+            .setup_client_tcp_stream(Box::new(client_io), target)
+            .await
+            .unwrap();
+
+        // Server task: wait for request, then send greeting reply
+        let server_task = tokio::spawn(async move {
+            let server_res = server
+                .setup_server_stream(Box::new(server_io))
+                .await
+                .unwrap();
+            let (mut stream, initial_data) = match server_res {
+                TcpServerSetupResult::TcpForward {
+                    stream,
+                    initial_remote_data,
+                    ..
+                } => (stream, initial_remote_data),
+                TcpServerSetupResult::ReusableTcpForward { stream, session } => {
+                    (stream as Box<dyn AsyncStream>, session.initial_remote_data)
+                }
+                _ => panic!("expected forward"),
+            };
+            assert!(initial_data.is_none());
+            stream.write_all(b"server greeting").await.unwrap();
+            stream.flush().await.unwrap();
+            stream
+        });
+
+        // Client reads first before writing: must not deadlock
+        let mut buf = [0u8; 15];
+        res.client_stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"server greeting");
+        drop(server_task.await.unwrap());
+    }
+
+    struct SingleMockDialer {
+        key: RouteKey,
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+        stream: parking_lot::Mutex<Option<Box<dyn AsyncStream>>>,
+    }
+
+    impl std::fmt::Debug for SingleMockDialer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SingleMockDialer")
+                .field("key", &self.key)
+                .field("dials", &self.dials)
+                .finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CarrierDialer for SingleMockDialer {
+        fn route_key(&self) -> &RouteKey {
+            &self.key
+        }
+
+        async fn open_stream(&self) -> std::io::Result<Box<dyn AsyncStream>> {
+            self.dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.stream
+                .lock()
+                .take()
+                .ok_or_else(|| std::io::Error::other("mock dialer exhausted"))
+        }
+    }
+
+    #[tokio::test]
+    async fn snell_client_connection_reuse_tcp() {
+        let server = test_server(Some("v4"), None);
+        let client = SnellClientHandler::new(
+            ShadowsocksCipher::try_from("aes-128-gcm").unwrap(),
+            "test-psk-12345",
+            false,
+            Some("v4"),
+            None,
+            None,
+            true,
+            false,
+        );
+
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (client_io, server_io) = duplex(65536);
+        let dialer = Arc::new(SingleMockDialer {
+            key: RouteKey(vec![77]),
+            dials: dials.clone(),
+            stream: parking_lot::Mutex::new(Some(Box::new(client_io))),
+        });
+
+        let server_task = tokio::spawn(async move {
+            let res = server
+                .setup_server_stream(Box::new(server_io))
+                .await
+                .unwrap();
+            let (mut stream, session) = match res {
+                TcpServerSetupResult::ReusableTcpForward { stream, session } => {
+                    (stream, session)
+                }
+                _ => panic!("expected reusable forward"),
+            };
+            assert_eq!(session.remote_location.to_string(), "first.example.com:443");
+            assert_eq!(session.initial_remote_data.as_deref(), Some(b"req-1" as &[u8]));
+            stream.write_all(b"res-1").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut drain = [0u8; 8];
+            assert_eq!(stream.read(&mut drain).await.unwrap(), 0);
+
+            let next = stream.next_request().await.unwrap().unwrap();
+            let (mut stream2, session2) = match next {
+                TcpServerSetupResult::ReusableTcpForward { stream, session } => {
+                    (stream, session)
+                }
+                _ => panic!("expected second reusable forward"),
+            };
+            assert_eq!(
+                session2.remote_location.to_string(),
+                "second.example.com:443"
+            );
+            assert_eq!(session2.initial_remote_data.as_deref(), Some(b"req-2" as &[u8]));
+            stream2.write_all(b"res-2").await.unwrap();
+            stream2.shutdown().await.unwrap();
+            let mut drain2 = [0u8; 8];
+            assert_eq!(stream2.read(&mut drain2).await.unwrap(), 0);
+        });
+
+        let target1: ResolvedLocation =
+            NetLocation::from_str("first.example.com:443", None)
+                .unwrap()
+                .into();
+        let d1: Arc<dyn CarrierDialer> = dialer.clone();
+        let transport1 = ClientTransport {
+            route: d1.clone(),
+            open: Box::pin(async move { d1.open_stream().await }),
+        };
+        let mut conn1 = client
+            .connect_client_tcp(transport1, target1)
+            .await
+            .unwrap();
+        conn1.client_stream.write_all(b"req-1").await.unwrap();
+        conn1.client_stream.flush().await.unwrap();
+        let mut res1 = [0u8; 5];
+        conn1.client_stream.read_exact(&mut res1).await.unwrap();
+        assert_eq!(&res1, b"res-1");
+        conn1.client_stream.shutdown().await.unwrap();
+        let mut eof1 = [0u8; 8];
+        assert_eq!(conn1.client_stream.read(&mut eof1).await.unwrap(), 0);
+        drop(conn1);
+
+        let target2: ResolvedLocation =
+            NetLocation::from_str("second.example.com:443", None)
+                .unwrap()
+                .into();
+        let d2: Arc<dyn CarrierDialer> = dialer.clone();
+        let transport2 = ClientTransport {
+            route: d2.clone(),
+            open: Box::pin(async move { d2.open_stream().await }),
+        };
+        let mut conn2 = client
+            .connect_client_tcp(transport2, target2)
+            .await
+            .unwrap();
+        conn2.client_stream.write_all(b"req-2").await.unwrap();
+        conn2.client_stream.flush().await.unwrap();
+        let mut res2 = [0u8; 5];
+        conn2.client_stream.read_exact(&mut res2).await.unwrap();
+        assert_eq!(&res2, b"res-2");
+        conn2.client_stream.shutdown().await.unwrap();
+        let mut eof2 = [0u8; 8];
+        assert_eq!(conn2.client_stream.read(&mut eof2).await.unwrap(), 0);
+        drop(conn2);
+
+        server_task.await.unwrap();
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "carrier dialer must only be called once when connection is reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn snell_v6_udp_rejects_datagram_in_request_record() {
+        let server = test_server(None, None);
+        let client = test_client(Some("v6"), None);
+        let (client_io, server_io) = duplex(65536);
+        let mut framed = client.frame_stream(Box::new(client_io));
+        // Request and first datagram in one write, so one v6 record.
+        write_all(&mut framed, &[1, 6, 0, 0xde, 0xad]).await.unwrap();
+        framed.flush().await.unwrap();
+        let err = server
+            .setup_server_stream(Box::new(server_io))
+            .await
+            .err()
+            .expect("v6 UDP with a datagram in the request record must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    const PSK: &[u8] = b"test-psk-12345";
+    type Framed = SnellFramedStream<Box<dyn AsyncStream>>;
+
+    fn frame_duplex(io: tokio::io::DuplexStream, v6: bool) -> Framed {
+        let io: Box<dyn AsyncStream> = Box::new(io);
+        if v6 {
+            SnellFramedStream::V6(V6Conn::new(
+                io,
+                Arc::from(PSK),
+                V6Codec::new(SnellV6Mode::Default, PSK),
+            ))
+        } else {
+            SnellFramedStream::V4(V4Conn::new(io, Arc::from(PSK)))
+        }
+    }
+
+    fn framed_pair(v6: bool) -> (Framed, Framed) {
+        let (a, b) = duplex(1 << 20);
+        (frame_duplex(a, v6), frame_duplex(b, v6))
+    }
+
+    fn tunnel_pair(v6: bool, reuse: bool) -> (SnellTunnelStream, Framed) {
+        let (server, peer) = framed_pair(v6);
+        let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+        (
+            SnellTunnelStream::new(server, reuse, true, selector, Arc::new(SnellAuth::Single)),
+            peer,
+        )
+    }
+
+    async fn send_zero_chunk(conn: &mut Framed) {
+        poll_fn(|cx| Pin::new(&mut *conn).poll_write(cx, &[]))
+            .await
+            .unwrap();
+        conn.flush().await.unwrap();
+    }
+
+    /// Reads until EOF; panics after 5 s so a server bug fails instead of hanging.
+    async fn read_to_eof<S: AsyncRead + Unpin>(conn: &mut S) -> Vec<u8> {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read(&mut buf))
+                .await
+                .expect("timed out waiting for EOF")
+                .unwrap();
+            if n == 0 {
+                return got;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// True when a further read stays pending: a zero chunk, not a closed connection.
+    async fn still_open(conn: &mut Framed) -> bool {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            conn.read(&mut [0u8; 1]),
+        )
+        .await
+        .is_err()
+    }
+
+    #[tokio::test]
+    async fn tunnel_reply_rides_with_first_payload() {
+        for v6 in [false, true] {
+            let (mut server, mut peer) = tunnel_pair(v6, true);
+            server.write_all(b"data").await.unwrap();
+            server.flush().await.unwrap();
+            let mut record = [0u8; 64];
+            let mut buf = ReadBuf::new(&mut record);
+            poll_fn(|cx| Pin::new(&mut peer).poll_read_message(cx, &mut buf))
+                .await
+                .unwrap();
+            assert_eq!(buf.filled(), b"\x00data", "v6={v6}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tunnel_reply_survives_pending_inner_write() {
+        for v6 in [false, true] {
+            let (a, b) = duplex(64);
+            let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+            let mut server = SnellTunnelStream::new(
+                frame_duplex(a, v6),
+                true,
+                true,
+                selector,
+                Arc::new(SnellAuth::Single),
+            );
+            let mut peer = frame_duplex(b, v6);
+            let payload: Vec<u8> = (0..40_000u32).map(|i| i as u8).collect();
+            let expected = [&[0u8][..], &payload].concat();
+            let reader = tokio::spawn(async move {
+                let mut got = vec![0u8; expected.len()];
+                peer.read_exact(&mut got).await.unwrap();
+                assert!(got == expected, "v6={v6}");
+            });
+            server.write_all(&payload).await.unwrap();
+            server.flush().await.unwrap();
+            reader.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reuse_shutdown_after_data_sends_zero_chunk() {
+        for v6 in [false, true] {
+            let (mut server, mut peer) = tunnel_pair(v6, true);
+            server.write_all(b"x").await.unwrap();
+            server.shutdown().await.unwrap();
+            assert_eq!(read_to_eof(&mut peer).await, b"\x00x", "v6={v6}");
+            assert!(still_open(&mut peer).await, "zero chunk, not close: v6={v6}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reuse_shutdown_before_data_replies_remote_eof_and_closes() {
+        for v6 in [false, true] {
+            let (mut server, mut peer) = tunnel_pair(v6, true);
+            server.shutdown().await.unwrap();
+            let got = read_to_eof(&mut peer).await;
+            assert_eq!(got, REMOTE_EOF_REPLY, "v6={v6}");
+            assert!(!still_open(&mut peer).await, "closed: v6={v6}");
+            assert_eq!(server.read(&mut [0u8; 8]).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn single_shutdown_before_data() {
+        let (mut server, mut peer) = tunnel_pair(false, false);
+        server.shutdown().await.unwrap();
+        assert_eq!(read_to_eof(&mut peer).await, END_OF_FILE_REPLY);
+        let (mut server, mut peer) = tunnel_pair(true, false);
+        server.shutdown().await.unwrap();
+        let err = peer.read(&mut [0u8; 8]).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn single_shutdown_after_data_closes_without_zero_chunk() {
+        for v6 in [false, true] {
+            let (a, mut raw) = duplex(1 << 16);
+            let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+            let mut server = SnellTunnelStream::new(
+                frame_duplex(a, v6),
+                false,
+                true,
+                selector,
+                Arc::new(SnellAuth::Single),
+            );
+
+            server.write_all(b"x").await.unwrap();
+            server.flush().await.unwrap();
+
+            let mut discard = [0u8; 1024];
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    raw.read(&mut discard),
+                )
+                .await
+                {
+                    Ok(Ok(n)) if n > 0 => {}
+                    _ => break,
+                }
+            }
+
+            server.shutdown().await.unwrap();
+            let mut rest = Vec::new();
+            raw.read_to_end(&mut rest).await.unwrap();
+            assert!(rest.is_empty(), "expected no bytes after shutdown: v6={v6}");
+            assert_eq!(server.read(&mut [0u8; 8]).await.unwrap(), 0);
+        }
+
+        // Mirror assertion for reuse mode: shutdown produces a zero chunk and stays open.
+        for v6 in [false, true] {
+            let (a, mut raw) = duplex(1 << 16);
+            let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+            let mut server = SnellTunnelStream::new(
+                frame_duplex(a, v6),
+                true,
+                true,
+                selector,
+                Arc::new(SnellAuth::Single),
+            );
+
+            server.write_all(b"x").await.unwrap();
+            server.flush().await.unwrap();
+
+            let mut discard = [0u8; 1024];
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    raw.read(&mut discard),
+                )
+                .await
+                {
+                    Ok(Ok(n)) if n > 0 => {}
+                    _ => break,
+                }
+            }
+
+            server.shutdown().await.unwrap();
+            let mut zero_chunk = [0u8; 1024];
+            let n = raw.read(&mut zero_chunk).await.unwrap();
+            assert!(n > 0, "expected zero chunk on raw transport: v6={v6}");
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    raw.read(&mut [0u8; 1]),
+                )
+                .await
+                .is_err(),
+                "expected raw transport to stay open: v6={v6}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_discards_until_client_zero_chunk() {
+        for v6 in [false, true] {
+            let (mut server, mut peer) = tunnel_pair(v6, true);
+            server.write_all(b"x").await.unwrap();
+            server.shutdown().await.unwrap();
+            peer.write_all(&[7u8; 1000]).await.unwrap();
+            send_zero_chunk(&mut peer).await;
+            assert_eq!(server.read(&mut [0u8; 64]).await.unwrap(), 0, "v6={v6}");
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_errors_past_limit() {
+        let (mut server, mut peer) = tunnel_pair(false, true);
+        server.write_all(b"x").await.unwrap();
+        server.shutdown().await.unwrap();
+        let writer = tokio::spawn(async move {
+            let chunk = [7u8; 16 * 1024];
+            for _ in 0..(DRAIN_LIMIT / chunk.len() + 1) {
+                if peer.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+            let _ = peer.flush().await;
+            peer
+        });
+        let err = server.read(&mut [0u8; 64]).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        drop(server);
+        let _ = writer.await;
+    }
+
+    fn request(cmd: u8) -> Vec<u8> {
+        let mut r = vec![1, cmd, 0];
+        if cmd == CMD_CONNECT || cmd == CMD_CONNECT_V2 {
+            let host = b"example.com";
+            r.push(host.len() as u8);
+            r.extend_from_slice(host);
+            r.extend_from_slice(&443u16.to_be_bytes());
+        }
+        r
+    }
+
+    fn request_with_id(cmd: u8, id: &[u8]) -> Vec<u8> {
+        let mut r = vec![1, cmd, id.len() as u8];
+        r.extend_from_slice(id);
+        r.extend_from_slice(&request(cmd)[3..]);
+        r
+    }
+
+    fn users_server(
+        version: &str,
+        mode: Option<&str>,
+        password: &str,
+        authentication: &str,
+        users: &[(&str, &str)],
+    ) -> SnellServerHandler {
+        let users: Vec<crate::config::SnellUserConfig> = users
+            .iter()
+            .map(|(name, secret)| crate::config::SnellUserConfig {
+                name: name.to_string(),
+                userkey: (authentication == "userkey").then(|| secret.to_string()),
+                password: (authentication == "psk").then(|| secret.to_string()),
+            })
+            .collect();
+        let v6_mode =
+            (version == "v6").then(|| mode.and_then(SnellV6Mode::parse).unwrap_or_default());
+        SnellServerHandler::new(
+            ShadowsocksCipher::try_from("aes-128-gcm").unwrap(),
+            password,
+            true,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(crate::resolver::NativeResolver::new()),
+            Some(version),
+            mode,
+        )
+        .with_auth(SnellAuth::new(&users, Some(authentication), v6_mode))
+    }
+
+    /// Everything a client with `psk` sends for `payload`, then EOF.
+    async fn client_bytes(psk: &[u8], mode: Option<SnellV6Mode>, payload: &[u8]) -> Vec<u8> {
+        let (io, mut tap) = duplex(1 << 16);
+        let io: Box<dyn AsyncStream> = Box::new(io);
+        let mut conn = match mode {
+            Some(mode) => {
+                SnellFramedStream::V6(V6Conn::new(io, Arc::from(psk), V6Codec::new(mode, psk)))
+            }
+            None => SnellFramedStream::V4(V4Conn::new(io, Arc::from(psk))),
+        };
+        write_all(&mut conn, payload).await.unwrap();
+        conn.flush().await.unwrap();
+        drop(conn);
+        let mut bytes = Vec::new();
+        tap.read_to_end(&mut bytes).await.unwrap();
+        bytes
+    }
+
+    /// Feeds raw client bytes to `server` and returns its setup result.
+    async fn setup_with(
+        server: &SnellServerHandler,
+        bytes: &[u8],
+    ) -> std::io::Result<TcpServerSetupResult> {
+        let (mut feed, server_io) = duplex(1 << 16);
+        feed.write_all(bytes).await.unwrap();
+        // Closed first, so a short client reaches EOF instead of waiting.
+        drop(feed);
+        server.setup_server_stream(Box::new(server_io)).await
+    }
+
+    #[tokio::test]
+    async fn userkey_first_request() {
+        let server =
+            users_server("v5", None, "test-psk-12345", "userkey", &[("alice", "alice-key")]);
+        let ok = client_bytes(PSK, None, &request_with_id(CMD_CONNECT_V2, b"alice-key")).await;
+        assert!(matches!(
+            setup_with(&server, &ok).await,
+            Ok(TcpServerSetupResult::ReusableTcpForward { .. })
+        ));
+        for cmd in [CMD_CONNECT, CMD_CONNECT_V2, CMD_UDP] {
+            let bad = client_bytes(PSK, None, &request_with_id(cmd, b"mallory")).await;
+            let error = setup_with(&server, &bad).await.err().unwrap();
+            assert_eq!(error.to_string(), "snell: bad user key", "cmd {cmd}");
+        }
+        // Ping carries no key and is still answered.
+        let (client_io, server_io) = duplex(1 << 16);
+        let mut peer = SnellFramedStream::V4(V4Conn::new(
+            Box::new(client_io) as Box<dyn AsyncStream>,
+            Arc::from(PSK),
+        ));
+        write_all(&mut peer, &request(CMD_PING)).await.unwrap();
+        peer.flush().await.unwrap();
+        let error = server.setup_server_stream(Box::new(server_io)).await.err().unwrap();
+        assert_eq!(error.to_string(), "responded to ping");
+        let mut pong = [0u8; 1];
+        peer.read_exact(&mut pong).await.unwrap();
+        assert_eq!(pong, [0x01]);
+    }
+
+    #[tokio::test]
+    async fn userkey_reused_request_is_checked() {
+        for (key, accepted) in [(&b"bob-key"[..], true), (b"mallory", false)] {
+            let server = users_server(
+                "v5",
+                None,
+                "test-psk-12345",
+                "userkey",
+                &[("alice", "alice-key"), ("bob", "bob-key")],
+            );
+            let (client_io, server_io) = duplex(1 << 16);
+            let mut peer = SnellFramedStream::V4(V4Conn::new(
+                Box::new(client_io) as Box<dyn AsyncStream>,
+                Arc::from(PSK),
+            ));
+            write_all(&mut peer, &request_with_id(CMD_CONNECT_V2, b"alice-key")).await.unwrap();
+            peer.flush().await.unwrap();
+            let Ok(TcpServerSetupResult::ReusableTcpForward { mut stream, .. }) =
+                server.setup_server_stream(Box::new(server_io)).await
+            else {
+                panic!("first request must be accepted");
+            };
+            stream.write_all(b"x").await.unwrap();
+            stream.shutdown().await.unwrap();
+            assert_eq!(read_to_eof(&mut peer).await, b"\x00x");
+            send_zero_chunk(&mut peer).await;
+            assert_eq!(stream.read(&mut [0u8; 8]).await.unwrap(), 0);
+            write_all(&mut peer, &request_with_id(CMD_CONNECT_V2, key)).await.unwrap();
+            peer.flush().await.unwrap();
+            let next = stream.next_request().await;
+            assert_eq!(next.is_ok(), accepted, "{key:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn psk_users_connect_on_v5_and_v6() {
+        let users = [("alice", "alice-psk-0001"), ("bob", "bob-psk-000002")];
+        for (version, mode) in [("v5", None), ("v6", Some("default")), ("v6", Some("unshaped"))] {
+            let server = users_server(version, mode, "", "psk", &users);
+            let v6_mode = mode.and_then(SnellV6Mode::parse);
+            for (name, psk) in users {
+                let bytes = client_bytes(psk.as_bytes(), v6_mode, &request(CMD_CONNECT_V2)).await;
+                assert!(
+                    setup_with(&server, &bytes).await.is_ok(),
+                    "{version} {mode:?} {name}"
+                );
+            }
+            let bytes = client_bytes(b"nobody-psk-0001", v6_mode, &request(CMD_CONNECT_V2)).await;
+            let error = setup_with(&server, &bytes).await.err().unwrap();
+            assert_eq!(
+                error.to_string(),
+                "snell: authentication failed: no matching PSK",
+                "{version} {mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn psk_short_connection_errors() {
+        let server = users_server("v5", None, "", "psk", &[("alice", "alice-psk-0001")]);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            setup_with(&server, &[0u8; 10]),
+        )
+        .await
+        .expect("must not hang");
+        assert!(result.is_err());
+    }
+
+    /// psk mode reads the longest user head before matching; a v6 opening
+    /// record (padded to the profile's target size) must always be longer, or
+    /// a client waiting for the reply would stall.
+    #[tokio::test]
+    async fn psk_v6_opening_record_covers_every_user_head() {
+        let mode = Some(SnellV6Mode::Default);
+        let mut shortest_record = usize::MAX;
+        let mut longest_head = 0;
+        for n in 0..64 {
+            let psk = format!("user-psk-{n:04}");
+            let server = users_server("v6", Some("default"), "", "psk", &[("u", &psk)]);
+            longest_head = longest_head.max(server.auth.psk_head_len());
+            let bytes = client_bytes(psk.as_bytes(), mode, &request(CMD_CONNECT_V2)).await;
+            shortest_record = shortest_record.min(bytes.len());
+        }
+        assert!(
+            shortest_record >= longest_head,
+            "opening record {shortest_record} < user head {longest_head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_v5_connection_is_refused() {
+        // Explicit v5 and auto-detected v4 framing both check the salt.
+        for version in [Some("v5"), None] {
+            let server = test_server(version, None);
+            let bytes = client_bytes(PSK, None, &request(CMD_CONNECT)).await;
+            assert!(setup_with(&server, &bytes).await.is_ok(), "{version:?}");
+            let error = setup_with(&server, &bytes).await.err().unwrap();
+            assert_eq!(error.to_string(), "snell: duplicated salt", "{version:?}");
+            let fresh = client_bytes(PSK, None, &request(CMD_CONNECT)).await;
+            assert!(setup_with(&server, &fresh).await.is_ok(), "{version:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn replayed_v6_connection_is_not_checked() {
+        let server = test_server(Some("v6"), None);
+        let bytes =
+            client_bytes(PSK, Some(SnellV6Mode::Default), &request(CMD_CONNECT)).await;
+        assert!(setup_with(&server, &bytes).await.is_ok());
+        assert!(setup_with(&server, &bytes).await.is_ok());
+    }
+
+    /// Runs one data session to completion: reply, zero chunks both ways.
+    async fn end_session(server: &mut SnellTunnelStream, peer: &mut Framed) {
+        server.write_all(b"x").await.unwrap();
+        server.shutdown().await.unwrap();
+        assert_eq!(read_to_eof(peer).await, b"\x00x");
+        send_zero_chunk(peer).await;
+        assert_eq!(server.read(&mut [0u8; 8]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn next_request_connect_commands_continue() {
+        for v6 in [false, true] {
+            for cmd in [CMD_CONNECT_V2, CMD_CONNECT] {
+                let (mut server, mut peer) = tunnel_pair(v6, true);
+                end_session(&mut server, &mut peer).await;
+                write_all(&mut peer, &request(cmd)).await.unwrap();
+                peer.flush().await.unwrap();
+                let next = Box::new(server).next_request().await.unwrap();
+                let Some(TcpServerSetupResult::ReusableTcpForward { session, .. }) = next else {
+                    panic!("expected another session: v6={v6} cmd={cmd}");
+                };
+                assert_eq!(session.remote_location.to_string(), "example.com:443");
+                assert!(session.connection_success_response.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn next_request_udp_becomes_relay() {
+        for v6 in [false, true] {
+            let (mut server, mut peer) = tunnel_pair(v6, true);
+            end_session(&mut server, &mut peer).await;
+            write_all(&mut peer, &request(CMD_UDP)).await.unwrap();
+            peer.flush().await.unwrap();
+            let next = Box::new(server).next_request().await.unwrap();
+            assert!(
+                matches!(next, Some(TcpServerSetupResult::MultiDirectionalUdp { .. })),
+                "v6={v6}"
+            );
+            let mut reply = [0u8; 1];
+            peer.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [0x00], "v6={v6}");
+        }
+    }
+
+    #[tokio::test]
+    async fn next_request_v6_udp_rejects_datagram_in_request_record() {
+        let (mut server, mut peer) = tunnel_pair(true, true);
+        end_session(&mut server, &mut peer).await;
+        write_all(&mut peer, &[1, CMD_UDP, 0, 0xde, 0xad]).await.unwrap();
+        peer.flush().await.unwrap();
+        let err = Box::new(server).next_request().await.err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn next_request_ping_pongs_and_closes() {
+        let (mut server, mut peer) = tunnel_pair(false, true);
+        end_session(&mut server, &mut peer).await;
+        write_all(&mut peer, &request(CMD_PING)).await.unwrap();
+        peer.flush().await.unwrap();
+        assert!(Box::new(server).next_request().await.unwrap().is_none());
+        let mut pong = [0u8; 1];
+        peer.read_exact(&mut pong).await.unwrap();
+        assert_eq!(pong, [0x01]);
+    }
+
+    #[tokio::test]
+    async fn next_request_client_close_ends_quietly() {
+        let (mut server, mut peer) = tunnel_pair(false, true);
+        end_session(&mut server, &mut peer).await;
+        drop(peer);
+        assert!(Box::new(server).next_request().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn next_request_unknown_command_errors() {
+        let (mut server, mut peer) = tunnel_pair(false, true);
+        end_session(&mut server, &mut peer).await;
+        write_all(&mut peer, &[1, 9, 0]).await.unwrap();
+        peer.flush().await.unwrap();
+        assert!(Box::new(server).next_request().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn first_cmd1_is_single_tunnel() {
+        let server = test_server(None, None);
+        let (client_io, server_io) = duplex(65536);
+        let mut framed = test_client(Some("v4"), None).frame_stream(Box::new(client_io));
+        write_all(&mut framed, &request(CMD_CONNECT)).await.unwrap();
+        framed.flush().await.unwrap();
+        let result = server.setup_server_stream(Box::new(server_io)).await.unwrap();
+        let TcpServerSetupResult::TcpForward {
+            connection_success_response,
+            ..
+        } = result
+        else {
+            panic!("cmd 1 must be a single TcpForward");
+        };
+        assert!(connection_success_response.is_none(), "reply is deferred");
+    }
+
+    /// Serves every connect from a fresh echo task (or refuses it).
+    #[derive(Debug)]
+    struct EchoConnector {
+        refuse: bool,
+    }
+
+    #[async_trait]
+    impl crate::tcp::socket_connector::SocketConnector for EchoConnector {
+        async fn connect(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: &ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncStream>> {
+            if self.refuse {
+                return Err(std::io::ErrorKind::ConnectionRefused.into());
+            }
+            let (ours, mut theirs) = duplex(1 << 20);
+            tokio::spawn(async move {
+                let mut data = Vec::new();
+                if theirs.read_to_end(&mut data).await.is_ok() {
+                    let _ = theirs.write_all(&data).await;
+                    let _ = theirs.shutdown().await;
+                }
+            });
+            Ok(Box::new(ours))
+        }
+
+        async fn connect_udp_bidirectional(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            unreachable!()
+        }
+
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    /// A raw client connection to a Snell server running in `process_stream`.
+    fn connect_e2e(
+        version: &str,
+        mode: Option<&str>,
+        refuse: bool,
+    ) -> (Framed, tokio::task::JoinHandle<std::io::Result<()>>) {
+        use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
+        use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+        let chain = ClientProxyChain::new(
+            vec![InitialHopEntry::Direct(Arc::new(EchoConnector { refuse }))],
+            vec![],
+        );
+        let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+            vec![crate::address::NetLocationMask::ANY],
+            ConnectAction::new_allow(None, ClientChainGroup::new(vec![chain])),
+        )]));
+        let cipher = ShadowsocksCipher::try_from("aes-128-gcm").unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let server = SnellServerHandler::new(
+            cipher,
+            "test-psk-12345",
+            true,
+            selector,
+            resolver.clone(),
+            mode.map(|_| version),
+            mode,
+        );
+        let (client_io, server_io) = duplex(1 << 20);
+        let task = tokio::spawn(crate::tcp::tcp_server::process_stream(
+            server_io,
+            Arc::new(server),
+            resolver,
+        ));
+        let framed = test_client(Some(version), mode).frame_stream(Box::new(client_io));
+        (framed, task)
+    }
+
+    /// One session: request + payload, zero chunk, everything until EOF.
+    async fn e2e_session(conn: &mut Framed, cmd: u8, payload: &[u8]) -> Vec<u8> {
+        write_all(conn, &[request(cmd), payload.to_vec()].concat()).await.unwrap();
+        send_zero_chunk(conn).await;
+        read_to_eof(conn).await
+    }
+
+    fn e2e_cases() -> [(&'static str, Option<&'static str>); 5] {
+        [
+            ("v4", None),
+            ("v5", None),
+            ("v6", None),
+            ("v6", Some("unshaped")),
+            ("v6", Some("unsafe-raw")),
+        ]
+    }
+
+    #[tokio::test]
+    async fn reuse_serves_mixed_sessions_then_ping() {
+        for (version, mode) in e2e_cases() {
+            let (mut conn, task) = connect_e2e(version, mode, false);
+            for (i, cmd) in [CMD_CONNECT_V2, CMD_CONNECT, CMD_CONNECT_V2].into_iter().enumerate() {
+                let payload = format!("session {i}");
+                let got = e2e_session(&mut conn, cmd, payload.as_bytes()).await;
+                assert_eq!(got, [b"\x00", payload.as_bytes()].concat(), "{version} {mode:?} #{i}");
+            }
+            write_all(&mut conn, &request(CMD_PING)).await.unwrap();
+            conn.flush().await.unwrap();
+            assert_eq!(read_to_eof(&mut conn).await, [0x01], "{version} {mode:?} pong");
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pipelined_request_is_served() {
+        for (version, mode) in e2e_cases() {
+            let (mut conn, _task) = connect_e2e(version, mode, false);
+            write_all(&mut conn, &[request(CMD_CONNECT_V2), b"one".to_vec()].concat())
+                .await
+                .unwrap();
+            send_zero_chunk(&mut conn).await;
+            // Second request goes out before the first reply is read.
+            write_all(&mut conn, &[request(CMD_CONNECT_V2), b"two".to_vec()].concat())
+                .await
+                .unwrap();
+            send_zero_chunk(&mut conn).await;
+            assert_eq!(read_to_eof(&mut conn).await, b"\x00one", "{version} {mode:?}");
+            assert_eq!(read_to_eof(&mut conn).await, b"\x00two", "{version} {mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn large_payload_round_trips() {
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        for (version, mode) in e2e_cases() {
+            let (mut conn, _task) = connect_e2e(version, mode, false);
+            let got = e2e_session(&mut conn, CMD_CONNECT_V2, &payload).await;
+            assert_eq!(got[0], 0x00, "{version} {mode:?}");
+            assert!(got[1..] == payload[..], "{version} {mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fifty_sessions_on_one_connection() {
+        for (version, mode) in e2e_cases() {
+            let (mut conn, _task) = connect_e2e(version, mode, false);
+            for i in 0..50u32 {
+                let payload = i.to_be_bytes();
+                let got = e2e_session(&mut conn, CMD_CONNECT_V2, &payload).await;
+                assert_eq!(got, [&[0u8][..], &payload].concat(), "{version} {mode:?} #{i}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_connect_replies_remote_eof() {
+        for (version, mode) in e2e_cases() {
+            let (mut conn, task) = connect_e2e(version, mode, true);
+            let got = e2e_session(&mut conn, CMD_CONNECT_V2, b"x").await;
+            assert_eq!(got, REMOTE_EOF_REPLY, "{version} {mode:?}");
+            assert!(task.await.unwrap().is_err(), "connect failure is reported");
+        }
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_ends_connection() {
+        let (mut conn, task) = connect_e2e("v4", None, false);
+        write_all(&mut conn, &[request(CMD_CONNECT_V2), b"half".to_vec()].concat())
+            .await
+            .unwrap();
+        conn.flush().await.unwrap();
+        drop(conn);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("server task must finish after the client disconnects")
+            .unwrap()
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn snell_v5_http_obfs_roundtrip() {
+        use crate::snell::obfs::SnellObfsMode;
+
+        let server = test_server(Some("v5"), None).with_obfs(Some(SnellObfsMode::Http));
+        let client = test_client(Some("v5"), None).with_obfs(
+            Some(SnellObfsMode::Http),
+            Some("obfs.example.com"),
+            Some("/custom-path"),
+        );
+
+        let (client_io, server_io) = duplex(65536);
+        let target: ResolvedLocation =
+            NetLocation::from_str("example.com:443", None).unwrap().into();
+
+        let client_task = tokio::spawn(async move {
+            let mut res = client
+                .setup_client_tcp_stream(Box::new(client_io), target)
+                .await
+                .unwrap();
+            res.client_stream.write_all(b"ping-payload").await.unwrap();
+            res.client_stream.flush().await.unwrap();
+
+            let mut reply = [0u8; 12];
+            res.client_stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"pong-payload");
+        });
+
+        let server_task = tokio::spawn(async move {
+            let res = server
+                .setup_server_stream(Box::new(server_io))
+                .await
+                .unwrap();
+            let (mut stream, session) = match res {
+                TcpServerSetupResult::ReusableTcpForward { stream, session } => {
+                    (stream, session)
+                }
+                _ => panic!("expected ReusableTcpForward"),
+            };
+            assert_eq!(
+                session.initial_remote_data.as_deref(),
+                Some(b"ping-payload" as &[u8])
+            );
+            stream.write_all(b"pong-payload").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        tokio::try_join!(client_task, server_task).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snell_http_obfs_connection_reuse_tcp() {
+        use crate::snell::obfs::SnellObfsMode;
+
+        let server = test_server(Some("v5"), None).with_obfs(Some(SnellObfsMode::Http));
+        let client = SnellClientHandler::new(
+            ShadowsocksCipher::try_from("aes-128-gcm").unwrap(),
+            "test-psk-12345",
+            false,
+            Some("v5"),
+            None,
+            None,
+            true,
+            false,
+        )
+        .with_obfs(
+            Some(SnellObfsMode::Http),
+            Some("reuse.example.com"),
+            Some("/"),
+        );
+
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (client_io, server_io) = duplex(65536);
+        let dialer = Arc::new(SingleMockDialer {
+            key: RouteKey(vec![88]),
+            dials: dials.clone(),
+            stream: parking_lot::Mutex::new(Some(Box::new(client_io))),
+        });
+
+        let server_task = tokio::spawn(async move {
+            let res = server
+                .setup_server_stream(Box::new(server_io))
+                .await
+                .unwrap();
+            let (mut stream, session) = match res {
+                TcpServerSetupResult::ReusableTcpForward { stream, session } => {
+                    (stream, session)
+                }
+                _ => panic!("expected reusable forward"),
+            };
+            assert_eq!(session.remote_location.to_string(), "first.example.com:443");
+            assert_eq!(session.initial_remote_data.as_deref(), Some(b"req-1" as &[u8]));
+            stream.write_all(b"res-1").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut drain = [0u8; 8];
+            assert_eq!(stream.read(&mut drain).await.unwrap(), 0);
+
+            let next = stream.next_request().await.unwrap().unwrap();
+            let (mut stream2, session2) = match next {
+                TcpServerSetupResult::ReusableTcpForward { stream, session } => {
+                    (stream, session)
+                }
+                _ => panic!("expected second reusable forward"),
+            };
+            assert_eq!(
+                session2.remote_location.to_string(),
+                "second.example.com:443"
+            );
+            assert_eq!(session2.initial_remote_data.as_deref(), Some(b"req-2" as &[u8]));
+            stream2.write_all(b"res-2").await.unwrap();
+            stream2.shutdown().await.unwrap();
+            let mut drain2 = [0u8; 8];
+            assert_eq!(stream2.read(&mut drain2).await.unwrap(), 0);
+        });
+
+        let target1: ResolvedLocation =
+            NetLocation::from_str("first.example.com:443", None)
+                .unwrap()
+                .into();
+        let d1: Arc<dyn CarrierDialer> = dialer.clone();
+        let transport1 = ClientTransport {
+            route: d1.clone(),
+            open: Box::pin(async move { d1.open_stream().await }),
+        };
+        let mut conn1 = client
+            .connect_client_tcp(transport1, target1)
+            .await
+            .unwrap();
+        conn1.client_stream.write_all(b"req-1").await.unwrap();
+        conn1.client_stream.flush().await.unwrap();
+        let mut res1 = [0u8; 5];
+        conn1.client_stream.read_exact(&mut res1).await.unwrap();
+        assert_eq!(&res1, b"res-1");
+        conn1.client_stream.shutdown().await.unwrap();
+        let mut eof1 = [0u8; 8];
+        assert_eq!(conn1.client_stream.read(&mut eof1).await.unwrap(), 0);
+        drop(conn1);
+
+        let target2: ResolvedLocation =
+            NetLocation::from_str("second.example.com:443", None)
+                .unwrap()
+                .into();
+        let d2: Arc<dyn CarrierDialer> = dialer.clone();
+        let transport2 = ClientTransport {
+            route: d2.clone(),
+            open: Box::pin(async move { d2.open_stream().await }),
+        };
+        let mut conn2 = client
+            .connect_client_tcp(transport2, target2)
+            .await
+            .unwrap();
+        conn2.client_stream.write_all(b"req-2").await.unwrap();
+        conn2.client_stream.flush().await.unwrap();
+        let mut res2 = [0u8; 5];
+        conn2.client_stream.read_exact(&mut res2).await.unwrap();
+        assert_eq!(&res2, b"res-2");
+        conn2.client_stream.shutdown().await.unwrap();
+        let mut eof2 = [0u8; 8];
+        assert_eq!(conn2.client_stream.read(&mut eof2).await.unwrap(), 0);
+        drop(conn2);
+
+        server_task.await.unwrap();
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "HTTP obfs connection must be reused from the pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn snell_v3_tls_obfs_client_to_mock_server() {
+        use crate::snell::obfs::SnellObfsMode;
+
+        let client = test_client_with_cipher(
+            "chacha20-ietf-poly1305",
+            Some("v3"),
+            None,
+        )
+        .with_obfs(
+            Some(SnellObfsMode::Tls),
+            Some("obfs.example.com"),
+            None,
+        );
+
+        let (client_io, mut server_mock) = duplex(65536);
+        let target: ResolvedLocation =
+            NetLocation::from_str("example.com:443", None).unwrap().into();
+
+        let client_task = tokio::spawn(async move {
+            let mut res = client
+                .setup_client_tcp_stream(Box::new(client_io), target)
+                .await
+                .unwrap();
+            res.client_stream.write_all(b"client-data").await.unwrap();
+            res.client_stream.flush().await.unwrap();
+        });
+
+        // Server mock reads ClientHello
+        let mut hello_buf = vec![0u8; 2048];
+        let n = server_mock.read(&mut hello_buf).await.unwrap();
+        assert_eq!(&hello_buf[0..3], &[0x16, 0x03, 0x01]);
+        assert!(hello_buf[..n].windows(16).any(|w| w == b"obfs.example.com"));
+
+        client_task.await.unwrap();
+    }
+}

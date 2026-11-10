@@ -172,3 +172,129 @@ pub async fn drain_server(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::duplex;
+
+    #[derive(Debug)]
+    struct MockDialer {
+        key: RouteKey,
+        dials: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl CarrierDialer for MockDialer {
+        fn route_key(&self) -> &RouteKey {
+            &self.key
+        }
+
+        async fn open_stream(&self) -> std::io::Result<Box<dyn AsyncStream>> {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            let (client, _) = duplex(4096);
+            Ok(Box::new(client))
+        }
+    }
+
+    fn mock_framed_stream() -> SnellFramedStream<Box<dyn AsyncStream>> {
+        let (client, _) = duplex(4096);
+        let client_box: Box<dyn AsyncStream> = Box::new(client);
+        SnellFramedStream::V4(crate::snell::v4::V4Conn::new(
+            client_box,
+            Arc::from(b"test-password-12345678" as &[u8]),
+        ))
+    }
+
+    #[test]
+    fn constants_match_sing_snell_spec() {
+        assert_eq!(POOL_SIZE, 10);
+        assert_eq!(POOL_MAX_AGE, Duration::from_secs(180));
+        assert_eq!(POOL_SWEEP_INTERVAL, Duration::from_secs(20));
+        assert_eq!(WAITING_DISCARD_LIMIT, 0x80001);
+    }
+
+    #[tokio::test]
+    async fn pool_take_and_put() {
+        let pool = SnellClientPool::new();
+        assert!(pool.is_empty(), "new pool must be empty");
+        let key = RouteKey(vec![42]);
+        let dialer = Arc::new(MockDialer {
+            key: key.clone(),
+            dials: Arc::new(AtomicUsize::new(0)),
+        });
+
+        pool.put(dialer.clone(), mock_framed_stream());
+        assert_eq!(pool.len(), 1, "entry should be in pool");
+        assert!(!pool.is_empty());
+
+        let taken = pool.take(&key);
+        assert!(taken.is_some(), "should take cached entry");
+        assert_eq!(pool.len(), 0, "pool should now be empty");
+        assert!(pool.is_empty());
+
+        let taken2 = pool.take(&key);
+        assert!(taken2.is_none(), "second take should be None");
+    }
+
+    #[tokio::test]
+    async fn pool_capacity_limit() {
+        let pool = SnellClientPool::new();
+        for i in 0..15 {
+            let dialer = Arc::new(MockDialer {
+                key: RouteKey(vec![i]),
+                dials: Arc::new(AtomicUsize::new(0)),
+            });
+            pool.put(dialer, mock_framed_stream());
+        }
+        assert_eq!(pool.len(), POOL_SIZE, "pool must not exceed capacity 10");
+    }
+
+    #[tokio::test]
+    async fn pool_ttl_expiry() {
+        let pool = SnellClientPool::new();
+        let key = RouteKey(vec![99]);
+        let dialer = Arc::new(MockDialer {
+            key: key.clone(),
+            dials: Arc::new(AtomicUsize::new(0)),
+        });
+
+        // Insert entry with an artificially expired timestamp
+        {
+            let mut state = pool.inner.lock();
+            state.entries.push(IdleEntry {
+                stream: mock_framed_stream(),
+                idle_since: Instant::now() - Duration::from_secs(200),
+                route: dialer,
+            });
+        }
+        assert_eq!(pool.len(), 1);
+
+        // Take purges expired entries
+        let taken = pool.take(&key);
+        assert!(taken.is_none(), "expired entry must not be taken");
+        assert_eq!(pool.len(), 0, "expired entry must be purged");
+    }
+
+    #[tokio::test]
+    async fn pool_closed_rejects_put_and_take() {
+        let pool = SnellClientPool::new();
+        let key = RouteKey(vec![1]);
+        let dialer = Arc::new(MockDialer {
+            key: key.clone(),
+            dials: Arc::new(AtomicUsize::new(0)),
+        });
+
+        pool.put(dialer.clone(), mock_framed_stream());
+        assert_eq!(pool.len(), 1);
+
+        pool.close();
+        assert_eq!(pool.len(), 0);
+        assert!(pool.is_empty());
+        assert!(pool.take(&key).is_none());
+
+        pool.put(dialer, mock_framed_stream());
+        assert_eq!(pool.len(), 0);
+        assert!(pool.is_empty());
+    }
+}

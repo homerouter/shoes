@@ -967,3 +967,484 @@ async fn run_listener(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_quic_initial_detection() {
+        assert!(is_quic_initial(&[0xc0, 0, 0, 0, 1]));
+        assert!(is_quic_initial(&[0xd0, 0x6b, 0x33, 0x43, 0xcf]));
+        assert!(!is_quic_initial(&[0xe0, 0, 0, 0, 1]));
+        assert!(!is_quic_initial(&[0xc0, 0, 0, 0, 0]));
+        assert!(!is_quic_initial(&[0xc0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn test_quic_looking() {
+        assert!(is_quic_looking(0xc0));
+        assert!(is_quic_looking(0xff));
+        assert!(is_quic_looking(0x40));
+        assert!(is_quic_looking(0x7f));
+        assert!(!is_quic_looking(0x00));
+        assert!(!is_quic_looking(0x3f));
+        assert!(!is_quic_looking(0x80));
+        assert!(!is_quic_looking(0xbf));
+    }
+
+    #[test]
+    fn test_quic_proxy_init_roundtrip() {
+        let psk = b"test-snell-psk";
+        let user_key = b"alice";
+        let target = NetLocation::from_str("example.com:443", None).unwrap();
+        let payload = vec![0xc0, 0, 0, 0, 1, 1, 2, 3, 4, 5];
+
+        let encoded = encode_quic_proxy_init(psk, user_key, &target, &payload).unwrap();
+
+        // Ensure salt does not look like QUIC
+        assert!(!is_quic_looking(encoded[0]));
+
+        let (decoded_target, decoded_user_key, decoded_payload) =
+            decode_quic_proxy_init(psk, &encoded).unwrap();
+
+        assert_eq!(decoded_target, target);
+        assert_eq!(decoded_user_key, user_key);
+        assert_eq!(decoded_payload, payload);
+    }
+
+    #[test]
+    fn test_quic_proxy_multi_frame_roundtrip() {
+        let psk = b"test-snell-psk";
+        let user_key = b"";
+        let target = NetLocation::from_str("1.1.1.1:443", None).unwrap();
+        let payload = vec![0x40u8; 3500]; // Multi-frame chunking test (> 1417)
+
+        let encoded = encode_quic_proxy_init(psk, user_key, &target, &payload).unwrap();
+        let (decoded_target, decoded_user_key, decoded_payload) =
+            decode_quic_proxy_init(psk, &encoded).unwrap();
+
+        assert_eq!(decoded_target, target);
+        assert_eq!(decoded_user_key, user_key);
+        assert_eq!(decoded_payload, payload);
+    }
+
+    #[test]
+    fn test_quic_proxy_wrong_psk_fails() {
+        let psk = b"test-snell-psk";
+        let wrong_psk = b"wrong-snell-psk";
+        let target = NetLocation::from_str("example.com:443", None).unwrap();
+        let payload = vec![0xc0, 0, 0, 0, 1];
+
+        let encoded = encode_quic_proxy_init(psk, b"", &target, &payload).unwrap();
+        assert!(decode_quic_proxy_init(wrong_psk, &encoded).is_err());
+    }
+
+    #[test]
+    fn test_quic_proxy_truncated_fails() {
+        let psk = b"test-snell-psk";
+        let target = NetLocation::from_str("example.com:443", None).unwrap();
+        let payload = vec![0xc0, 0, 0, 0, 1];
+
+        let encoded = encode_quic_proxy_init(psk, b"", &target, &payload).unwrap();
+        assert!(decode_quic_proxy_init(psk, &encoded[..encoded.len() - 1]).is_err());
+    }
+
+    use crate::config::SnellUserConfig;
+    use crate::snell::auth::SnellAuth;
+
+    const SHARED: &[u8] = b"snell-secret-psk-12345";
+
+    /// UDP echo server; replies are `tag` + the datagram.
+    async fn echo_server(tag: &'static [u8]) -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+                let _ = socket.send_to(&[tag, &buf[..n]].concat(), src).await;
+            }
+        });
+        addr
+    }
+
+    /// Echoes each datagram, then repeats it every 100 ms four more times.
+    async fn chatty_server() -> SocketAddr {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+                let (socket, data) = (socket.clone(), buf[..n].to_vec());
+                tokio::spawn(async move {
+                    for _ in 0..5 {
+                        let _ = socket.send_to(&data, src).await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn users(authentication: &str, secrets: &[&str]) -> SnellAuth {
+        let users: Vec<SnellUserConfig> = secrets
+            .iter()
+            .enumerate()
+            .map(|(i, secret)| SnellUserConfig {
+                name: format!("user{i}"),
+                userkey: (authentication == "userkey").then(|| secret.to_string()),
+                password: (authentication == "psk").then(|| secret.to_string()),
+            })
+            .collect();
+        SnellAuth::new(&users, Some(authentication), None)
+    }
+
+    /// Starts a listener; returns its address.
+    async fn listener(auth: SnellAuth, idle_timeout: Duration) -> SocketAddr {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let selector = Arc::new(
+            crate::tcp::tcp_client_handler_factory::create_test_selector(
+                vec![crate::config::ResolvedRuleConfig::default()],
+                resolver.clone(),
+            )
+            .unwrap(),
+        );
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(run_listener(
+            socket,
+            Arc::from(SHARED),
+            Arc::new(auth),
+            selector,
+            resolver,
+            idle_timeout,
+        ));
+        addr
+    }
+
+    async fn client() -> tokio::net::UdpSocket {
+        tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()
+    }
+
+    fn init(psk: &[u8], key: &[u8], target: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let target = NetLocation::from_str(&target.to_string(), None).unwrap();
+        encode_quic_proxy_init(psk, key, &target, payload).unwrap()
+    }
+
+    /// The next datagram within `wait`, if any.
+    async fn recv(client: &tokio::net::UdpSocket, wait: Duration) -> Option<Vec<u8>> {
+        let mut buf = [0u8; 4096];
+        let n = tokio::time::timeout(wait, client.recv(&mut buf)).await.ok()?.ok()?;
+        Some(buf[..n].to_vec())
+    }
+
+    const REPLY: Duration = Duration::from_secs(3);
+    const SILENCE: Duration = Duration::from_millis(500);
+
+    #[tokio::test]
+    async fn shared_password_session_forwards_both_ways() {
+        let echo = echo_server(b"").await;
+        let proxy = listener(SnellAuth::new(&[], None, None), SESSION_IDLE_TIMEOUT).await;
+        let client = client().await;
+        client.send_to(&init(SHARED, b"", echo, b"\xc0first"), proxy).await.unwrap();
+        assert_eq!(recv(&client, REPLY).await.unwrap(), b"\xc0first");
+        client.send_to(b"\x40follow-up", proxy).await.unwrap();
+        assert_eq!(recv(&client, REPLY).await.unwrap(), b"\x40follow-up");
+    }
+
+    #[tokio::test]
+    async fn userkey_init_needs_a_known_key() {
+        let echo = echo_server(b"").await;
+        let proxy = listener(users("userkey", &["alice-key"]), SESSION_IDLE_TIMEOUT).await;
+        let good = client().await;
+        good.send_to(&init(SHARED, b"alice-key", echo, b"\xc0ok"), proxy).await.unwrap();
+        assert_eq!(recv(&good, REPLY).await.unwrap(), b"\xc0ok");
+        let bad = client().await;
+        bad.send_to(&init(SHARED, b"mallory", echo, b"\xc0no"), proxy).await.unwrap();
+        assert_eq!(recv(&bad, SILENCE).await, None);
+        bad.send_to(b"\x40no-session", proxy).await.unwrap();
+        assert_eq!(recv(&bad, SILENCE).await, None);
+    }
+
+    #[tokio::test]
+    async fn psk_users_each_open_their_own_session() {
+        let echo = echo_server(b"").await;
+        let secrets = ["alice-psk-0001", "bob-psk-000002"];
+        let proxy = listener(users("psk", &secrets), SESSION_IDLE_TIMEOUT).await;
+        for secret in secrets {
+            let client = client().await;
+            client.send_to(&init(secret.as_bytes(), b"", echo, b"\xc0hi"), proxy).await.unwrap();
+            assert_eq!(recv(&client, REPLY).await.unwrap(), b"\xc0hi", "{secret}");
+            // A duplicate init is decoded with this user's PSK, not a shared one.
+            client.send_to(&init(secret.as_bytes(), b"", echo, b"\xc0again"), proxy).await.unwrap();
+            assert_eq!(recv(&client, REPLY).await.unwrap(), b"\xc0again", "{secret}");
+        }
+        let stranger = client().await;
+        stranger.send_to(&init(b"nobody-psk-01", b"", echo, b"\xc0x"), proxy).await.unwrap();
+        assert_eq!(recv(&stranger, SILENCE).await, None);
+    }
+
+    #[tokio::test]
+    async fn duplicate_init_keeps_the_original_target() {
+        let first = echo_server(b"first:").await;
+        let second = echo_server(b"second:").await;
+        let proxy = listener(SnellAuth::new(&[], None, None), SESSION_IDLE_TIMEOUT).await;
+        let client = client().await;
+        client.send_to(&init(SHARED, b"", first, b"\xc0a"), proxy).await.unwrap();
+        assert_eq!(recv(&client, REPLY).await.unwrap(), b"first:\xc0a");
+        client.send_to(&init(SHARED, b"", second, b"\xc0b"), proxy).await.unwrap();
+        assert_eq!(recv(&client, REPLY).await.unwrap(), b"first:\xc0b");
+    }
+
+    #[tokio::test]
+    async fn duplicate_init_stays_in_order() {
+        let echo = echo_server(b"").await;
+        let proxy = listener(SnellAuth::new(&[], None, None), SESSION_IDLE_TIMEOUT).await;
+        let client = client().await;
+        client.send_to(&init(SHARED, b"", echo, b"\xc0open"), proxy).await.unwrap();
+        assert_eq!(recv(&client, REPLY).await.unwrap(), b"\xc0open");
+        client.send_to(&init(SHARED, b"", echo, b"\xc0dup"), proxy).await.unwrap();
+        client.send_to(b"\x40raw", proxy).await.unwrap();
+        assert_eq!(recv(&client, REPLY).await.unwrap(), b"\xc0dup");
+        assert_eq!(recv(&client, REPLY).await.unwrap(), b"\x40raw");
+    }
+
+    #[tokio::test]
+    async fn empty_payload_init_is_refused() {
+        let echo = echo_server(b"").await;
+        let proxy = listener(SnellAuth::new(&[], None, None), SESSION_IDLE_TIMEOUT).await;
+        let client = client().await;
+        client.send_to(&init(SHARED, b"", echo, b""), proxy).await.unwrap();
+        client.send_to(b"\x40after-empty", proxy).await.unwrap();
+        assert_eq!(recv(&client, SILENCE).await, None);
+    }
+
+    #[tokio::test]
+    async fn packets_during_authentication_are_forwarded() {
+        let echo = echo_server(b"").await;
+        // The matching user is tried last, so the init takes a while to open.
+        let secrets: Vec<String> = (0..8).map(|i| format!("user-psk-{i:04}")).collect();
+        let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+        let proxy = listener(users("psk", &secrets), SESSION_IDLE_TIMEOUT).await;
+        let client = client().await;
+        client.send_to(&init(b"user-psk-0007", b"", echo, b"\xc00"), proxy).await.unwrap();
+        // Two held packets: with the init payload they fit UdpRelay's queue of 4.
+        for packet in [b"\x401", b"\x402"] {
+            client.send_to(packet, proxy).await.unwrap();
+        }
+        for expected in [b"\xc00", b"\x401", b"\x402"] {
+            assert_eq!(recv(&client, REPLY).await.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_buffer_is_bounded() {
+        let echo = echo_server(b"").await;
+        let secrets: Vec<String> = (0..8).map(|i| format!("user-psk-{i:04}")).collect();
+        let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+        let proxy = listener(users("psk", &secrets), SESSION_IDLE_TIMEOUT).await;
+        let client = client().await;
+        client.send_to(&init(b"user-psk-0007", b"", echo, b"\xc0init"), proxy).await.unwrap();
+        for i in 0..20u8 {
+            client.send_to(&[0x40, i], proxy).await.unwrap();
+        }
+        let mut replies = Vec::new();
+        while let Some(reply) = recv(&client, SILENCE).await {
+            replies.push(reply);
+        }
+        assert_eq!(replies[0], b"\xc0init");
+        // Exactly 8 packets were held while the init was decoded, and all of
+        // them reach the target.
+        assert_eq!(replies.len(), 1 + PENDING_PACKET_LIMIT, "{replies:?}");
+    }
+
+    #[tokio::test]
+    async fn idle_session_expires() {
+        let echo = echo_server(b"").await;
+        let idle = Duration::from_millis(300);
+        let proxy = listener(SnellAuth::new(&[], None, None), idle).await;
+        let client = client().await;
+        client.send_to(&init(SHARED, b"", echo, b"\xc0open"), proxy).await.unwrap();
+        assert_eq!(recv(&client, REPLY).await.unwrap(), b"\xc0open");
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        client.send_to(b"\x40late", proxy).await.unwrap();
+        assert_eq!(recv(&client, SILENCE).await, None);
+    }
+
+    #[tokio::test]
+    async fn replies_do_not_refresh_idle() {
+        let chatty = chatty_server().await;
+        let idle = Duration::from_millis(300);
+        let proxy = listener(SnellAuth::new(&[], None, None), idle).await;
+        let client = client().await;
+        client.send_to(&init(SHARED, b"", chatty, b"\xc0open"), proxy).await.unwrap();
+        // Replies keep arriving every 100 ms, but the client stays quiet.
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        client.send_to(b"\x40fresh", proxy).await.unwrap();
+        let deadline = tokio::time::Instant::now() + SILENCE;
+        while let Some(reply) =
+            recv(&client, deadline.saturating_duration_since(tokio::time::Instant::now())).await
+        {
+            assert_ne!(reply, b"\x40fresh", "the session outlived its idle timeout");
+        }
+    }
+
+    #[tokio::test]
+    async fn init_flood_does_not_stall_a_live_session() {
+        let echo = echo_server(b"").await;
+        let secrets: Vec<String> = (0..16).map(|i| format!("user-psk-{i:04}")).collect();
+        let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+        let proxy = listener(users("psk", &secrets), SESSION_IDLE_TIMEOUT).await;
+        let live = client().await;
+        live.send_to(&init(b"user-psk-0000", b"", echo, b"\xc0open"), proxy).await.unwrap();
+        assert_eq!(recv(&live, REPLY).await.unwrap(), b"\xc0open");
+        // Each garbage init costs 16 failed KDF tries. Blocking sockets queue
+        // the whole flood before the listener gets to run.
+        let flood: Vec<_> = (0..64)
+            .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+            .collect();
+        for source in &flood {
+            source.send_to(&[0x01; 200], proxy).unwrap();
+        }
+        let started = std::time::Instant::now();
+        live.send_to(b"\x40still-here", proxy).await.unwrap();
+        assert_eq!(recv(&live, REPLY).await.unwrap(), b"\x40still-here");
+        assert!(started.elapsed() < Duration::from_millis(300), "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn client_quic_udp_stream_sends_init_and_receives_echo() {
+        let echo = echo_server(b"echo:").await;
+        let proxy = listener(SnellAuth::new(&[], None, None), SESSION_IDLE_TIMEOUT).await;
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.connect(proxy).await.unwrap();
+
+        let mut stream = QuicUdpStream::new(
+            sock,
+            Arc::from(SHARED),
+            vec![],
+            NetLocation::from_str(&echo.to_string(), None).unwrap(),
+        );
+        assert!(stream.local_addr().is_ok());
+
+        // Send Initial packet (starts with 0xc0, version != 0)
+        let init_pkt = b"\xc0\x00\x00\x00\x01\x00payload";
+        futures::future::poll_fn(|cx| {
+            Pin::new(&mut stream).poll_write_message(cx, init_pkt)
+        })
+        .await
+        .unwrap();
+
+        let mut buf = [0u8; 100];
+        let mut read_buf = ReadBuf::new(&mut buf);
+        futures::future::poll_fn(|cx| {
+            Pin::new(&mut stream).poll_read_message(cx, &mut read_buf)
+        })
+        .await
+        .unwrap();
+        assert_eq!(read_buf.filled(), b"echo:\xc0\x00\x00\x00\x01\x00payload");
+
+        // Send short header packet (starts with 0x40): should go raw
+        let raw_pkt = b"\x40subsequent-data";
+        futures::future::poll_fn(|cx| {
+            Pin::new(&mut stream).poll_write_message(cx, raw_pkt)
+        })
+        .await
+        .unwrap();
+
+        let mut buf2 = [0u8; 100];
+        let mut read_buf2 = ReadBuf::new(&mut buf2);
+        futures::future::poll_fn(|cx| {
+            Pin::new(&mut stream).poll_read_message(cx, &mut read_buf2)
+        })
+        .await
+        .unwrap();
+        assert_eq!(read_buf2.filled(), b"echo:\x40subsequent-data");
+    }
+
+    #[tokio::test]
+    async fn client_quic_proxy_stream_falls_back_on_non_quic() {
+        let fallback_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fc = fallback_called.clone();
+        let written = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let written_clone = written.clone();
+        let (c1, _s1) = tokio::io::duplex(1024);
+
+        struct MockMessageStream(Arc<parking_lot::Mutex<Vec<Vec<u8>>>>);
+        impl AsyncReadMessage for MockMessageStream {
+            fn poll_read_message(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl AsyncWriteMessage for MockMessageStream {
+            fn poll_write_message(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<()>> {
+                self.0.lock().push(buf.to_vec());
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncFlushMessage for MockMessageStream {
+            fn poll_flush_message(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncShutdownMessage for MockMessageStream {
+            fn poll_shutdown_message(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncPing for MockMessageStream {
+            fn supports_ping(&self) -> bool {
+                false
+            }
+            fn poll_write_ping(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<bool>> {
+                Poll::Ready(Ok(false))
+            }
+        }
+        impl AsyncMessageStream for MockMessageStream {}
+
+        let stream = SnellQuicProxyStream::new(
+            Box::new(c1),
+            NetLocation::from_str("example.com:53", None).unwrap(),
+            Some("127.0.0.1:9999".parse().unwrap()),
+            Arc::from(SHARED),
+            vec![],
+            Box::new(move |raw, _target| {
+                fc.store(true, std::sync::atomic::Ordering::SeqCst);
+                let w = written_clone.clone();
+                drop(raw);
+                Box::pin(async move {
+                    Ok(Box::new(MockMessageStream(w)) as Box<dyn AsyncMessageStream>)
+                })
+            }),
+        );
+        let mut stream = stream;
+        // Non-QUIC packet: first byte 0x00
+        futures::future::poll_fn(|cx| {
+            Pin::new(&mut stream).poll_write_message(cx, b"\x00dns-request")
+        })
+        .await
+        .unwrap();
+        assert!(fallback_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            written.lock().as_slice(),
+            &[b"\x00dns-request".to_vec()]
+        );
+    }
+}

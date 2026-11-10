@@ -692,3 +692,189 @@ impl<S: AsyncStream> AsyncStream for TlsObfsClientStream<S> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn http_obfs_client_write_and_server_read() {
+        let (client_raw, server_raw) = tokio::io::duplex(2048);
+        let mut client = HttpObfsStream::new_client(client_raw, Some("example.com"), Some("/ws"));
+        let mut server = HttpObfsStream::new_server(server_raw);
+
+        // Client writes data
+        client.write_all(b"payload 12345").await.unwrap();
+        client.flush().await.unwrap();
+
+        // Server reads data, header stripped
+        let mut buf = [0u8; 100];
+        let n = server.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"payload 12345");
+    }
+
+    #[tokio::test]
+    async fn http_obfs_server_write_and_client_read() {
+        let (client_raw, server_raw) = tokio::io::duplex(2048);
+        let mut client = HttpObfsStream::new_client(client_raw, None, None);
+        let mut server = HttpObfsStream::new_server(server_raw);
+
+        // Client initiates handshake
+        client.write_all(b"client hello").await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut buf = [0u8; 100];
+        let n = server.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"client hello");
+
+        // Server replies
+        server.write_all(b"server reply 6789").await.unwrap();
+        server.flush().await.unwrap();
+
+        let mut reply = [0u8; 100];
+        let n = client.read(&mut reply).await.unwrap();
+        assert_eq!(&reply[..n], b"server reply 6789");
+    }
+
+    #[tokio::test]
+    async fn http_obfs_subsequent_raw_transfer() {
+        let (client_raw, server_raw) = tokio::io::duplex(2048);
+        let mut client = HttpObfsStream::new_client(client_raw, None, None);
+        let mut server = HttpObfsStream::new_server(server_raw);
+
+        // First packet carries HTTP obfs headers
+        client.write_all(b"p1").await.unwrap();
+        client.flush().await.unwrap();
+        let mut buf = [0u8; 10];
+        let n = server.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"p1");
+
+        server.write_all(b"r1").await.unwrap();
+        server.flush().await.unwrap();
+        let mut reply = [0u8; 10];
+        let n = client.read(&mut reply).await.unwrap();
+        assert_eq!(&reply[..n], b"r1");
+
+        // Subsequent packets pass raw
+        client.write_all(b"raw-client-data").await.unwrap();
+        client.flush().await.unwrap();
+        let mut buf2 = [0u8; 20];
+        let n = server.read(&mut buf2).await.unwrap();
+        assert_eq!(&buf2[..n], b"raw-client-data");
+
+        server.write_all(b"raw-server-data").await.unwrap();
+        server.flush().await.unwrap();
+        let mut reply2 = [0u8; 20];
+        let n = client.read(&mut reply2).await.unwrap();
+        assert_eq!(&reply2[..n], b"raw-server-data");
+    }
+
+    #[tokio::test]
+    async fn http_obfs_partial_chunked_reads() {
+        let (client_raw, server_raw) = tokio::io::duplex(2048);
+        let mut client = HttpObfsStream::new_client(client_raw, None, None);
+        let mut server = HttpObfsStream::new_server(server_raw);
+
+        client.write_all(b"abcdefghij").await.unwrap();
+        client.flush().await.unwrap();
+
+        // Read in 3-byte chunks
+        let mut collected = Vec::new();
+        let mut chunk = [0u8; 3];
+        while collected.len() < 10 {
+            let n = server.read(&mut chunk).await.unwrap();
+            assert!(n > 0);
+            collected.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(collected, b"abcdefghij");
+    }
+
+    fn make_test_tls_server_hello(payload: &[u8]) -> Vec<u8> {
+        use rand::Rng;
+        let mut buf = Vec::with_capacity(105 + 2 + payload.len());
+        let mut random_bytes = [0u8; 28];
+        let mut session_id = [0u8; 32];
+        rand::rng().fill_bytes(&mut random_bytes);
+        rand::rng().fill_bytes(&mut session_id);
+        let now = 1_700_000_000u32;
+
+        buf.push(0x16);
+        buf.extend_from_slice(&0x0301u16.to_be_bytes());
+        buf.extend_from_slice(&91u16.to_be_bytes());
+        buf.extend_from_slice(&[2, 0, 0, 87, 0x03, 0x03]);
+        buf.extend_from_slice(&now.to_be_bytes());
+        buf.extend_from_slice(&random_bytes);
+        buf.push(32);
+        buf.extend_from_slice(&session_id);
+        buf.extend_from_slice(&[
+            0xcc, 0xa8, 0, 0, 0, 0xff, 1, 0, 1, 0, 0, 0x17, 0, 0, 0, 0x0b, 0, 2, 1, 0,
+        ]);
+        buf.extend_from_slice(&[0x14, 0x03, 0x03, 0, 1, 1]);
+        buf.extend_from_slice(&[0x16, 0x03, 0x03]);
+        buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    fn make_test_tls_app_data(payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(5 + payload.len());
+        buf.extend_from_slice(&[0x17, 0x03, 0x03]);
+        buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[tokio::test]
+    async fn tls_obfs_client_write_client_hello_and_app_data() {
+        let (client_raw, mut server_mock) = tokio::io::duplex(4096);
+        let mut client = TlsObfsClientStream::new(client_raw, Some("test.example.com"));
+
+        // First write sends ClientHello
+        client.write_all(b"session-ticket-data").await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut hello_buf = vec![0u8; 1024];
+        let n = server_mock.read(&mut hello_buf).await.unwrap();
+        let hello = &hello_buf[..n];
+        assert_eq!(&hello[0..3], &[0x16, 0x03, 0x01]);
+        let record_len = u16::from_be_bytes([hello[3], hello[4]]) as usize;
+        assert_eq!(n, 5 + record_len);
+        // SNI hostname present in ClientHello
+        assert!(hello.windows(16).any(|w| w == b"test.example.com"));
+        // Payload present in session ticket extension
+        assert!(hello.windows(19).any(|w| w == b"session-ticket-data"));
+
+        // Second write sends standard TLS app data record
+        client.write_all(b"subsequent-tls-data").await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut app_buf = [0u8; 100];
+        let n2 = server_mock.read(&mut app_buf).await.unwrap();
+        assert_eq!(&app_buf[..5], &[0x17, 0x03, 0x03, 0x00, 19]);
+        assert_eq!(&app_buf[5..n2], b"subsequent-tls-data");
+    }
+
+    #[tokio::test]
+    async fn tls_obfs_client_read_server_hello_and_app_data() {
+        let (client_raw, mut server_mock) = tokio::io::duplex(4096);
+        let mut client = TlsObfsClientStream::new(client_raw, None);
+
+        // Server writes ServerHello with initial response payload
+        let server_hello = make_test_tls_server_hello(b"initial-server-reply");
+        server_mock.write_all(&server_hello).await.unwrap();
+        server_mock.flush().await.unwrap();
+
+        let mut read_buf = [0u8; 100];
+        let n = client.read(&mut read_buf).await.unwrap();
+        assert_eq!(&read_buf[..n], b"initial-server-reply");
+
+        // Server writes subsequent AppData
+        let app_data = make_test_tls_app_data(b"more-server-data");
+        server_mock.write_all(&app_data).await.unwrap();
+        server_mock.flush().await.unwrap();
+
+        let mut read_buf2 = [0u8; 100];
+        let n2 = client.read(&mut read_buf2).await.unwrap();
+        assert_eq!(&read_buf2[..n2], b"more-server-data");
+    }
+}
