@@ -1038,7 +1038,7 @@ fn wireguard_outer_chain_validation_and_roundtrip() {
 async fn wireguard_outer_chain_requires_udp_before_starting() {
     for protocol in [
         "{type: socks}",
-        "{type: trojan, password: test}",
+        "{type: trojan, password: test, udp_enabled: false}",
         "{type: vless, user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0, udp_enabled: false}",
     ] {
         let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
