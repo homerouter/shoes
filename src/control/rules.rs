@@ -164,6 +164,18 @@ impl Builder {
                     );
                 }
             }
+            ResolvedServerProxyConfig::Grpc { targets } => {
+                for (index, target) in targets.iter_mut().enumerate() {
+                    let scope = format!("{scope}/grpc/{index}");
+                    self.project_target(
+                        &mut target.override_rules,
+                        &mut target.protocol,
+                        inherited,
+                        inbound,
+                        &scope,
+                    );
+                }
+            }
             ResolvedServerProxyConfig::SudokuMask(config) => self.project_protocol(
                 &mut config.protocol,
                 inbound,
@@ -196,6 +208,7 @@ pub fn inbound_type(protocol: &ResolvedServerProxyConfig) -> &'static str {
         ResolvedServerProxyConfig::Tls { .. } => "TLS",
         ResolvedServerProxyConfig::Websocket { .. } => "WebSocket",
         ResolvedServerProxyConfig::HttpUpgrade { .. } => "HTTPUpgrade",
+        ResolvedServerProxyConfig::Grpc { .. } => "gRPC",
         ResolvedServerProxyConfig::SudokuMask(config) => inbound_type(&config.protocol),
         ResolvedServerProxyConfig::Xhttp(_) => "XHTTP",
         _ => "Shoes",

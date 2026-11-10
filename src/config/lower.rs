@@ -183,6 +183,14 @@ fn client_protocol(
                 protocol: Box::new(client_protocol(*config.protocol, None)),
             })
         }
+        ClientProxyConfig::Grpc(config) => {
+            ResolvedClientProxyConfig::Grpc(crate::config::resolved::ResolvedGrpcClientConfig {
+                service_name: config.service_name,
+                matching_headers: config.matching_headers,
+                host: config.host,
+                protocol: Box::new(client_protocol(*config.protocol, None)),
+            })
+        }
         ClientProxyConfig::Xhttp(config) => {
             ResolvedClientProxyConfig::Xhttp(ResolvedXhttpClientConfig {
                 path: config.path,

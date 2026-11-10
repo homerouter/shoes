@@ -527,6 +527,11 @@ fn visit_proxy(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -> i
                 visit_proxy(&mut target.protocol, visitor)?;
             }
         }
+        ServerProxyConfig::Grpc { targets } => {
+            for target in targets.iter_mut() {
+                visit_proxy(&mut target.protocol, visitor)?;
+            }
+        }
         ServerProxyConfig::SudokuMask(target) => visit_proxy(&mut target.protocol, visitor)?,
         ServerProxyConfig::Xhttp(target) => visit_proxy(&mut target.protocol, visitor)?,
         _ => {}
@@ -595,6 +600,11 @@ fn visit_resolved_proxy(
             }
         }
         crate::config::ResolvedServerProxyConfig::HttpUpgrade { targets } => {
+            for target in targets.iter_mut() {
+                visit_resolved_proxy(&mut target.protocol, visitor)?;
+            }
+        }
+        crate::config::ResolvedServerProxyConfig::Grpc { targets } => {
             for target in targets.iter_mut() {
                 visit_resolved_proxy(&mut target.protocol, visitor)?;
             }
