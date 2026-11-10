@@ -4,31 +4,25 @@ on:
   push:
     branches:
       - '**'
-    tags:
-      - 'v*'
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'examples/**'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.dockerignore'
-      - 'LICENSE*'
-      - 'licenses/**'
-      - 'THIRD_PARTY_NOTICES.md'
-      - 'about.toml'
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'benches/**'
+      - 'include/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
   pull_request:
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'examples/**'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.dockerignore'
-      - 'LICENSE*'
-      - 'licenses/**'
-      - 'THIRD_PARTY_NOTICES.md'
-      - 'about.toml'
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'benches/**'
+      - 'include/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
   workflow_dispatch:
 
 concurrency:
@@ -50,7 +44,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -63,7 +57,7 @@ jobs:
 
       - name: Cache sing-box binary
         id: cache-singbox
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /usr/local/bin/sing-box
           key: singbox-official-bin-1.14.4
@@ -91,9 +85,37 @@ jobs:
           sudo chmod +x /usr/local/bin/sing-box
           /usr/local/bin/sing-box version
 
-      - name: Run unit & process contract tests
+      - name: Cache sing-box Snell fork binary
+        id: cache-singbox-snell
+        uses: actions/cache@v6
+        with:
+          path: /usr/local/bin/sing-box-snell
+          key: singbox-snell-reF1nd-e7c5f20810451fb3b9756b6ecf8acef397ccc1f3
+
+      - name: Install Go for the sing-box Snell fork
+        if: steps.cache-singbox-snell.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.x'
+          cache: false
+
+      - name: Build sing-box Snell fork
+        if: steps.cache-singbox-snell.outputs.cache-hit != 'true'
         run: |
-          cargo test --lib --locked
+          git clone --filter=blob:none https://github.com/reF1nd/sing-box "$RUNNER_TEMP/sing-box-snell"
+          cd "$RUNNER_TEMP/sing-box-snell"
+          git checkout e7c5f20810451fb3b9756b6ecf8acef397ccc1f3
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/sing-box-snell-bin" ./cmd/sing-box
+          sudo mv "$RUNNER_TEMP/sing-box-snell-bin" /usr/local/bin/sing-box-snell
+          /usr/local/bin/sing-box-snell version
+
+      - name: Run Snell unit tests
+        run: |
+          .github/require-tests.sh cargo test --lib --locked snell
+
+      - name: Run remaining unit & process contract tests
+        run: |
+          cargo test --lib --locked -- --skip snell
           cargo test --test process_contract --locked
 
       - name: Run sing-box integration tests
@@ -107,55 +129,18 @@ jobs:
           SHOES_TEST_SING_BOX_BIN=/usr/local/bin/sing-box cargo test --test optional_peer --features optional-peer-tests wireguard::wireguard_singbox_both_roles -- --ignored
           SHOES_TEST_SING_BOX_BIN=/usr/local/bin/sing-box cargo test --test optional_peer --features optional-peer-tests wireguard::wireguard_singbox_lazy -- --ignored
 
+      - name: Run sing-box Snell interop tests
+        run: |
+          SHOES_TEST_SING_BOX_SNELL_BIN=/usr/local/bin/sing-box-snell .github/require-tests.sh cargo test --test optional_peer --features optional-peer-tests snell_singbox:: -- --ignored --test-threads=1
+
       - name: Run privileged tests
         run: |
           sudo -E env PATH="$PATH" cargo test --lib --locked root_config_check_accepts_service_owned_state -- --ignored
           sudo -E env PATH="$PATH" cargo test --lib --locked public_device_factory_preserves_unframed_packets -- --ignored
 
-  prepare-cross:
-    name: Prepare cross toolchain
-    needs: [test]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Cache cross binary
-        id: cache-cross
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/cross-bin
-          key: cross-bin-v${{ env.CROSS_VERSION }}
-
-      - name: Download cross binary
-        if: steps.cache-cross.outputs.cache-hit != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/cross-bin"
-          for attempt in 1 2 3 4 5; do
-            gh release download "v${CROSS_VERSION}" --repo cross-rs/cross \
-              --pattern cross-x86_64-unknown-linux-gnu.tar.gz \
-              --output "$RUNNER_TEMP/cross.tar.gz" && break || {
-              if [ "$attempt" -eq 5 ]; then
-                echo "Failed to download cross after 5 attempts"
-                exit 1
-              fi
-              echo "Download failed (attempt $attempt), retrying in 5s..."
-              sleep 5
-            }
-          done
-          echo "642375d1bcf3bd88272c32ba90e999f3d983050adf45e66bd2d3887e8e838bad  $RUNNER_TEMP/cross.tar.gz" | sha256sum --check --strict
-          tar -xzf "$RUNNER_TEMP/cross.tar.gz" -C "$RUNNER_TEMP/cross-bin" cross
-
-      - name: Upload cross binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: cross-bin
-          path: ${{ runner.temp }}/cross-bin/cross
-          retention-days: 1
-
   build:
     name: Build ${{ matrix.target }}
-    needs: [test, prepare-cross]
+    needs: [test]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -174,25 +159,27 @@ jobs:
       TARGET: ${{ matrix.target }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ !matrix.use_cross && matrix.target || '' }}
 
-      - name: Download cross binary
+      - name: Cache cross binary
         if: matrix.use_cross
-        uses: actions/download-artifact@v4
+        id: cache-cross
+        uses: actions/cache@v6
         with:
-          name: cross-bin
-          path: ${{ runner.temp }}/cross-bin
+          path: ~/.cargo/bin/cross
+          key: cross-bin-v${{ env.CROSS_VERSION }}
 
       - name: Install cross binary
-        if: matrix.use_cross
+        if: matrix.use_cross && steps.cache-cross.outputs.cache-hit != 'true'
         run: |
-          install -m 755 "$RUNNER_TEMP/cross-bin/cross" "$HOME/.cargo/bin/cross"
-          cross --version
+          mkdir -p "$HOME/.cargo/bin"
+          curl -sSL "https://github.com/cross-rs/cross/releases/download/v${CROSS_VERSION}/cross-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.cargo/bin" cross
+          chmod +x "$HOME/.cargo/bin/cross"
 
       - name: Setup cache
         uses: Swatinem/rust-cache@v2
@@ -207,22 +194,10 @@ jobs:
         if: matrix.use_cross
         run: cross build --release --locked --target "$TARGET" --bin shoes
 
-      - name: Verify and package binary
+      - name: Verify binary
         run: |
           test -x "target/$TARGET/release/shoes"
           file "target/$TARGET/release/shoes"
           case "$TARGET" in
             *musl*) file "target/$TARGET/release/shoes" | grep -E 'static.*linked' ;;
           esac
-          mkdir -p package artifacts
-          cp "target/$TARGET/release/shoes" LICENSE THIRD_PARTY_NOTICES.md package/
-          cp -R licenses package/
-          tar -czf "artifacts/shoes-$TARGET.tar.gz" -C package shoes LICENSE THIRD_PARTY_NOTICES.md licenses
-          python3 scripts/check-release-notices.py "artifacts/shoes-$TARGET.tar.gz"
-
-      - name: Upload binary archive
-        uses: actions/upload-artifact@v4
-        with:
-          name: shoes-${{ matrix.target }}
-          path: artifacts/shoes-${{ matrix.target }}.tar.gz
-          if-no-files-found: error

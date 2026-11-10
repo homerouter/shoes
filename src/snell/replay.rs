@@ -138,3 +138,69 @@ impl fmt::Debug for SaltReplayCache {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn counting_salt() -> Vec<u8> {
+        (0u8..16).collect()
+    }
+
+    /// Golden values from sing-snell@e056cb336137 `saltReplayBloom.MurmurHash`.
+    #[test]
+    fn murmur2_matches_go() {
+        let cases: [(&[u8], u32, u32); 8] = [
+            (b"", 0x106e08d9, 0x456d9087),
+            (b"a", 0xa2d0b27c, 0x2e36e8b4),
+            (b"ab", 0x12d8262a, 0x87ae788a),
+            (b"abc", 0x1c94221b, 0x08e2b515),
+            (b"abcd", 0xb11ab5f4, 0x7796ea9c),
+            (b"abcde", 0x1b897edd, 0x263bdc4f),
+            (&[0u8; 16], 0x94f76688, 0x325f87fc),
+            (&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], 0xc220d729, 0x1457aacb),
+        ];
+        for (input, first, step) in cases {
+            assert_eq!(murmur2(input, MURMUR_SEED), first, "{input:x?}");
+            assert_eq!(murmur2(input, first), step, "{input:x?}");
+        }
+    }
+
+    /// Golden values from sing-snell `saltReplayBloom.Initialize` and `Add`.
+    #[test]
+    fn bloom_matches_go() {
+        let bloom = Bloom::new();
+        assert_eq!(bloom.bit_count, 23_962_645);
+        assert_eq!(bloom.hash_count, 34);
+        assert_eq!(bloom.bits.len(), 2_995_331);
+        let positions: Vec<u32> = bloom.positions(&counting_salt()).collect();
+        assert_eq!(
+            positions,
+            [
+                21975062, 3825062, 9637707, 15450352, 15609156, 21421801, 3271801, 9084446,
+                14897091, 20709736, 2559736, 8372381, 14185026, 19997671, 1847671, 7660316,
+                7819120, 13631765, 19444410, 1294410, 7107055, 12919700, 18732345, 582345,
+                6394990, 12207635, 18020280, 23832925, 5682925, 5841729, 11654374, 17467019,
+                23279664, 5129664,
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_salt_is_a_replay() {
+        let cache = SaltReplayCache::new();
+        assert!(!cache.check_and_add(&counting_salt()));
+        assert!(cache.check_and_add(&counting_salt()));
+        assert!(!cache.check_and_add(&[7u8; 16]));
+    }
+
+    #[test]
+    fn full_generation_rotates_and_forgets_the_older_one() {
+        let cache = SaltReplayCache::with_generation_size(2);
+        for salt in [b"salt-a", b"salt-b", b"salt-c", b"salt-d"] {
+            assert!(!cache.check_and_add(salt));
+        }
+        // a and b filled generation 0, which was cleared when c and d filled 1.
+        assert!(!cache.check_and_add(b"salt-a"));
+        assert!(cache.check_and_add(b"salt-c"));
+    }
+}

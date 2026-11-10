@@ -112,6 +112,9 @@ version. Most fixtures accept `SHOES_TEST_SING_BOX_BIN`, `SHOES_TEST_MIHOMO_BIN`
 `SHOES_TEST_XRAY_BIN`, `SHOES_TEST_SSSERVER_BIN`, or `SHOES_TEST_NAIVE_CADDY_BIN`.
 The dedicated VLESS/REALITY fixtures additionally use `XRAY_BINARY` and
 `MIHOMO_BINARY`; their fixture guide and workflow specify the exact pins.
+The ignored `snell_singbox::` cases need `SHOES_TEST_SING_BOX_SNELL_BIN`: a sing-box
+built from `reF1nd/sing-box` at the commit pinned in `.github/workflows/ci.yml`
+(official builds have no Snell). Run them with `-- --ignored`.
 Requested but unavailable peers should fail, not silently skip.
 
 The WebSocket early-data suite requires sing-box 1.14.3 or newer because older
