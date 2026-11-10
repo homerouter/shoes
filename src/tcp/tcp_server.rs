@@ -19,13 +19,13 @@ use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
-use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult};
+use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult, TcpSession};
 #[cfg(unix)]
 use crate::tun::start_tun_server;
 use crate::util::write_all;
 
-async fn send_connect_failure(
-    stream: &mut Box<dyn AsyncStream>,
+async fn send_connect_failure<S: AsyncStream + ?Sized>(
+    stream: &mut S,
     response: Option<fn(std::io::ErrorKind) -> Vec<u8>>,
     kind: std::io::ErrorKind,
 ) {
@@ -187,128 +187,39 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
         }
     };
 
+    let mut setup_result = setup_result;
+    while let TcpServerSetupResult::ReusableTcpForward { mut stream, session } = setup_result {
+        if !forward_tcp(&mut *stream, session, source, resolver.clone(), setup_timeout, true)
+            .await?
+        {
+            return Ok(());
+        }
+        let Some(next) = stream.next_request().await? else {
+            return Ok(());
+        };
+        setup_result = next;
+    }
+
     match setup_result {
         TcpServerSetupResult::TcpForward {
             remote_location,
             stream: mut server_stream,
-            need_initial_flush: server_need_initial_flush,
+            need_initial_flush,
             proxy_selector,
-            mut connection_success_response,
-            mut connection_failure_response,
+            connection_success_response,
+            connection_failure_response,
             initial_remote_data,
         } => {
-            let setup_client_stream_future = async {
-                let route = timeout(setup_timeout, async {
-                    let prepared = super::ingress::PreparedTcp::new(
-                        &proxy_selector,
-                        remote_location.clone(),
-                        initial_remote_data.map_or_else(Vec::new, |data| data.into_vec()),
-                    )?
-                    .with_source(source);
-                    if prepared.needs_sniff_read() {
-                        crate::util::timeout_stream_setup(async {
-                            let response = connection_success_response.take();
-                            connection_failure_response = None;
-                            let flush = response.is_some() || server_need_initial_flush;
-                            if let Some(data) = response {
-                                write_all(&mut server_stream, &data).await?;
-                            }
-                            if flush {
-                                server_stream.flush().await?;
-                            }
-                            Ok(())
-                        })
-                        .await?;
-                    }
-                    prepared
-                        .route(&mut server_stream, &proxy_selector, &resolver)
-                        .await
-                })
+            let session = TcpSession {
+                remote_location,
+                need_initial_flush,
+                connection_success_response,
+                connection_failure_response,
+                initial_remote_data,
+                proxy_selector,
+            };
+            forward_tcp(&mut *server_stream, session, source, resolver, setup_timeout, false)
                 .await?;
-                match route {
-                    Ok(route) => timeout(setup_timeout, route.connect(&resolver)).await,
-                    Err(error) => Ok(Err(error)),
-                }
-            };
-
-            let routed = match setup_client_stream_future.await {
-                Ok(Ok(routed)) => routed,
-                Ok(Err(e)) => {
-                    send_connect_failure(&mut server_stream, connection_failure_response, e.kind())
-                        .await;
-                    return Err(std::io::Error::new(
-                        e.kind(),
-                        format!("failed to setup client stream to {remote_location}: {e}"),
-                    ));
-                }
-                Err(elapsed) => {
-                    send_connect_failure(
-                        &mut server_stream,
-                        connection_failure_response,
-                        std::io::ErrorKind::TimedOut,
-                    )
-                    .await;
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("client setup to {remote_location} timed out: {elapsed}"),
-                    ));
-                }
-            };
-            drop(proxy_selector);
-            drop(resolver);
-            let Some(TcpClientSetupResult {
-                mut client_stream,
-                early_data,
-            }) = routed.setup
-            else {
-                send_connect_failure(
-                    &mut server_stream,
-                    connection_failure_response,
-                    std::io::ErrorKind::PermissionDenied,
-                )
-                .await;
-                return Ok(());
-            };
-            log::debug!("TCP setup completed for {}", routed.wire_destination);
-
-            let flow = client_stream.flow().cloned();
-            crate::control::tracked_stream::during_flow(
-                flow.as_deref(),
-                crate::util::timeout_stream_setup(async {
-                    let flush_server = server_need_initial_flush || early_data.is_some();
-                    if let Some(data) = connection_success_response {
-                        write_all(&mut server_stream, &data).await?;
-                    }
-                    if let Some(data) = early_data {
-                        write_all(&mut server_stream, &data).await?;
-                    }
-                    if flush_server {
-                        server_stream.flush().await?;
-                    }
-                    if !routed.is_local_dns && !routed.prefix.is_empty() {
-                        write_all(&mut client_stream, &routed.prefix).await?;
-                        client_stream.flush().await?;
-                    }
-                    Ok(())
-                }),
-            )
-            .await?;
-            // Local DNS can produce replies before it consumes a pipelined prefix.
-            if routed.is_local_dns {
-                server_stream = Box::new(crate::prepend_stream::PrependStream::new(
-                    server_stream,
-                    Some(routed.prefix.into_boxed_slice()),
-                ));
-            } else {
-                drop(routed.prefix);
-            }
-
-            let copy_result =
-                copy_bidirectional(&mut server_stream, &mut client_stream, false, false).await;
-
-            crate::util::shutdown_stream_pair(&mut server_stream, &mut client_stream).await;
-
-            copy_result?;
             Ok(())
         }
         TcpServerSetupResult::BidirectionalUdp {
@@ -395,7 +306,159 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
             session.await;
             Ok(())
         }
+        TcpServerSetupResult::ReusableTcpForward { .. } => {
+            unreachable!("handled by the reuse loop")
+        }
     }
+}
+
+/// Forwards one TCP session from `server_stream` to its routed destination.
+/// Returns `Ok(false)` when routing blocked the session. With `reuse`, only
+/// the remote stream is shut down, so `server_stream` can carry the next
+/// request.
+async fn forward_tcp(
+    server_stream: &mut dyn AsyncStream,
+    session: TcpSession,
+    source: Option<SocketAddr>,
+    resolver: Arc<dyn Resolver>,
+    setup_timeout: Duration,
+    reuse: bool,
+) -> std::io::Result<bool> {
+    let TcpSession {
+        remote_location,
+        need_initial_flush: server_need_initial_flush,
+        proxy_selector,
+        mut connection_success_response,
+        mut connection_failure_response,
+        initial_remote_data,
+    } = session;
+    let mut server_stream = server_stream;
+    let setup_client_stream_future = async {
+        let route = timeout(setup_timeout, async {
+            let prepared = super::ingress::PreparedTcp::new(
+                &proxy_selector,
+                remote_location.clone(),
+                initial_remote_data.map_or_else(Vec::new, |data| data.into_vec()),
+            )?
+            .with_source(source);
+            if prepared.needs_sniff_read() {
+                crate::util::timeout_stream_setup(async {
+                    let response = connection_success_response.take();
+                    connection_failure_response = None;
+                    let flush = response.is_some() || server_need_initial_flush;
+                    if let Some(data) = response {
+                        write_all(&mut server_stream, &data).await?;
+                    }
+                    if flush {
+                        server_stream.flush().await?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            }
+            prepared
+                .route(&mut server_stream, &proxy_selector, &resolver)
+                .await
+        })
+        .await?;
+        match route {
+            Ok(route) => timeout(setup_timeout, route.connect(&resolver)).await,
+            Err(error) => Ok(Err(error)),
+        }
+    };
+
+    let routed = match setup_client_stream_future.await {
+        Ok(Ok(routed)) => routed,
+        Ok(Err(e)) => {
+            send_connect_failure(&mut server_stream, connection_failure_response, e.kind())
+                .await;
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("failed to setup client stream to {remote_location}: {e}"),
+            ));
+        }
+        Err(elapsed) => {
+            send_connect_failure(
+                &mut server_stream,
+                connection_failure_response,
+                std::io::ErrorKind::TimedOut,
+            )
+            .await;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("client setup to {remote_location} timed out: {elapsed}"),
+            ));
+        }
+    };
+    drop(proxy_selector);
+    drop(resolver);
+    let Some(TcpClientSetupResult {
+        mut client_stream,
+        early_data,
+    }) = routed.setup
+    else {
+        send_connect_failure(
+            &mut server_stream,
+            connection_failure_response,
+            std::io::ErrorKind::PermissionDenied,
+        )
+        .await;
+        return Ok(false);
+    };
+    log::debug!("TCP setup completed for {}", routed.wire_destination);
+
+    let flow = client_stream.flow().cloned();
+    crate::control::tracked_stream::during_flow(
+        flow.as_deref(),
+        crate::util::timeout_stream_setup(async {
+            let flush_server = server_need_initial_flush || early_data.is_some();
+            if let Some(data) = connection_success_response {
+                write_all(&mut server_stream, &data).await?;
+            }
+            if let Some(data) = early_data {
+                write_all(&mut server_stream, &data).await?;
+            }
+            if flush_server {
+                server_stream.flush().await?;
+            }
+            if !routed.is_local_dns && !routed.prefix.is_empty() {
+                write_all(&mut client_stream, &routed.prefix).await?;
+                client_stream.flush().await?;
+            }
+            Ok(())
+        }),
+    )
+    .await?;
+    // Local DNS can produce replies before it consumes a pipelined prefix.
+    let mut prepended;
+    let server_stream: &mut dyn AsyncStream = if routed.is_local_dns {
+        prepended = crate::prepend_stream::PrependStream::new(
+            server_stream,
+            Some(routed.prefix.into_boxed_slice()),
+        );
+        &mut prepended
+    } else {
+        drop(routed.prefix);
+        server_stream
+    };
+
+    let copy_result = copy_bidirectional(server_stream, &mut client_stream, false, false).await;
+
+    if reuse {
+        let server_flow = server_stream.flow().cloned();
+        let client_flow = client_stream.flow().cloned();
+        crate::control::tracked_stream::finish_shutdown(
+            server_flow.as_deref(),
+            client_flow.as_deref(),
+            crate::util::shutdown_stream(&mut client_stream),
+        )
+        .await;
+    } else {
+        crate::util::shutdown_stream_pair(server_stream, &mut client_stream).await;
+    }
+
+    copy_result?;
+    Ok(true)
 }
 
 /// Unified function to run the appropriate UDP copy based on the setup result.
@@ -696,6 +759,45 @@ async fn start_tcp_servers(
                 }));
             }
 
+            if let Some((psk, auth)) = snell_quic_proxy(&protocol) {
+                for (listener, _) in &listeners {
+                    if let Ok(udp_addr) = listener.local_addr() {
+                        let (psk, auth) = (psk.clone(), auth.clone());
+                        let selector = client_proxy_selector.clone();
+                        let resolver = resolver.clone();
+                        let admission = sockets.admission.clone();
+                        match crate::socket_util::new_udp_listener(udp_addr) {
+                            Ok(udp_socket) => {
+                                let udp_socket = Arc::new(udp_socket);
+                                log::info!("Starting Snell QUIC Proxy UDP listener at {udp_addr}");
+                                handles.push(tokio::spawn(async move {
+                                    if let Some(admission) = admission {
+                                        admission.cancelled().await;
+                                    }
+                                    if let Err(e) =
+                                        crate::snell::quic_proxy::run_snell_quic_proxy_listener(
+                                            udp_socket,
+                                            psk,
+                                            auth,
+                                            selector,
+                                            resolver,
+                                        )
+                                        .await
+                                    {
+                                        error!("Snell QUIC proxy UDP listener stopped: {e}");
+                                    }
+                                }));
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Failed to bind Snell QUIC proxy UDP listener at {udp_addr}: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             if let crate::config::ResolvedServerProxyConfig::Shadowsocks {
                 config,
                 udp_enabled: true,
@@ -778,3 +880,71 @@ async fn start_tcp_servers(
 
 #[cfg(test)]
 mod lifetime_tests;
+
+/// The shared PSK and users for a Snell server's QUIC proxy listener, which
+/// runs whenever `udp_enabled`. Inits always use the v5 format, so the users
+/// need no v6 codec.
+fn snell_quic_proxy(
+    protocol: &crate::config::ResolvedServerProxyConfig,
+) -> Option<(Arc<[u8]>, Arc<crate::snell::auth::SnellAuth>)> {
+    match protocol {
+        crate::config::ResolvedServerProxyConfig::Snell {
+            password,
+            udp_enabled: true,
+            users,
+            multi_user_authentication,
+            ..
+        } => Some((
+            Arc::from(password.as_bytes()),
+            Arc::new(crate::snell::auth::SnellAuth::new(
+                users,
+                multi_user_authentication.as_deref(),
+                None,
+            )),
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod snell_quic_proxy_tests {
+    use super::snell_quic_proxy;
+    use crate::config::{ResolvedServerProxyConfig, SnellUserConfig};
+    use crate::snell::auth::SnellAuth;
+
+    fn snell(users: &[(&str, &str)], authentication: Option<&str>) -> ResolvedServerProxyConfig {
+        ResolvedServerProxyConfig::Snell {
+            cipher: "aes-128-gcm".into(),
+            password: if authentication == Some("psk") { "" } else { "shared" }.into(),
+            udp_enabled: true,
+            version: Some("v5".into()),
+            mode: None,
+            users: users
+                .iter()
+                .map(|(key, psk)| SnellUserConfig {
+                    name: String::new(),
+                    userkey: (!key.is_empty()).then(|| key.to_string()),
+                    password: (!psk.is_empty()).then(|| psk.to_string()),
+                })
+                .collect(),
+            multi_user_authentication: authentication.map(Into::into),
+            obfs_mode: None,
+        }
+    }
+
+    #[test]
+    fn quic_proxy_runs_for_every_snell_server_with_udp() {
+        let (psk, auth) = snell_quic_proxy(&snell(&[], None)).unwrap();
+        assert_eq!(&*psk, b"shared");
+        assert!(matches!(*auth, SnellAuth::Single));
+        let (_, auth) = snell_quic_proxy(&snell(&[("alice-key", "")], Some("userkey"))).unwrap();
+        assert!(matches!(*auth, SnellAuth::UserKey(_)));
+        let (_, auth) = snell_quic_proxy(&snell(&[("", "alice-psk")], Some("psk"))).unwrap();
+        assert!(auth.is_psk());
+        let mut off = snell(&[], None);
+        if let ResolvedServerProxyConfig::Snell { udp_enabled, .. } = &mut off {
+            *udp_enabled = false;
+        }
+        assert!(snell_quic_proxy(&off).is_none());
+    }
+}

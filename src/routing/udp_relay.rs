@@ -36,9 +36,19 @@ impl UdpRelay {
         resolver: Arc<dyn Resolver>,
         peer: Option<std::net::SocketAddr>,
     ) -> io::Result<Self> {
+        Self::with_queue_size(selector, resolver, peer, QUEUE_SIZE)
+    }
+
+    /// Like `new`, with `queue_size` datagrams buffered each way.
+    pub fn with_queue_size(
+        selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
+        peer: Option<std::net::SocketAddr>,
+        queue_size: usize,
+    ) -> io::Result<Self> {
         let permit = crate::resources::try_stream().ok_or_else(crate::resources::exhausted)?;
-        let (tx, input) = mpsc::channel(QUEUE_SIZE);
-        let (output, rx) = mpsc::channel(QUEUE_SIZE);
+        let (tx, input) = mpsc::channel(queue_size);
+        let (output, rx) = mpsc::channel(queue_size);
         let stream = ChannelStream {
             input,
             output,

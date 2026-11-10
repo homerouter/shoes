@@ -225,15 +225,37 @@ fn create_handler(
             udp_enabled,
             version,
             mode,
-        } => Box::new(SnellServerHandler::new(
-            cipher.as_str().try_into().unwrap(),
-            &password,
-            udp_enabled,
-            client_proxy_selector.clone(),
-            resolver.clone(),
-            version.as_deref(),
-            mode.as_deref(),
-        )),
+            users,
+            multi_user_authentication,
+            obfs_mode,
+            ..
+        } => {
+            use crate::snell::snell_handler::SnellVersion;
+            use crate::snell::v6::SnellV6Mode;
+            let v6_mode = (version.as_deref().and_then(SnellVersion::parse)
+                == Some(SnellVersion::V6))
+            .then(|| mode.as_deref().and_then(SnellV6Mode::parse).unwrap_or_default());
+            let auth = crate::snell::auth::SnellAuth::new(
+                &users,
+                multi_user_authentication.as_deref(),
+                v6_mode,
+            );
+            let mut handler = SnellServerHandler::new(
+                cipher.as_str().try_into().unwrap(),
+                &password,
+                udp_enabled,
+                client_proxy_selector.clone(),
+                resolver.clone(),
+                version.as_deref(),
+                mode.as_deref(),
+            )
+            .with_auth(auth);
+            if let Some(obfs_str) = obfs_mode {
+                use crate::snell::obfs::SnellObfsMode;
+                handler = handler.with_obfs(SnellObfsMode::parse(&obfs_str));
+            }
+            Box::new(handler)
+        }
         ResolvedServerProxyConfig::Vless {
             user_id,
             udp_enabled,

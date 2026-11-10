@@ -44,6 +44,12 @@ pub enum TcpServerSetupResult {
     /// Long-lived work, polled outside the setup deadline and cancelled with its owner.
     /// The producer/session owns output flushing; `need_initial_flush` does not apply.
     Session(Pin<Box<dyn Future<Output = ()> + Send>>),
+    /// A TCP forward whose stream can carry further requests after a clean
+    /// session; see [`ReusableTcpStream`].
+    ReusableTcpForward {
+        stream: Box<dyn ReusableTcpStream>,
+        session: TcpSession,
+    },
 }
 
 impl TcpServerSetupResult {
@@ -67,9 +73,32 @@ impl TcpServerSetupResult {
             } => {
                 *flush = need_initial_flush;
             }
+            TcpServerSetupResult::ReusableTcpForward { session, .. } => {
+                session.need_initial_flush = need_initial_flush;
+            }
             TcpServerSetupResult::Session(_) => {}
         }
     }
+}
+
+/// Per-session forward parameters: the `TcpForward` fields minus the stream.
+pub struct TcpSession {
+    pub remote_location: NetLocation,
+    pub need_initial_flush: bool,
+    /// Response to write to the server stream after connection to remote location succeeds
+    pub connection_success_response: Option<Box<[u8]>>,
+    pub connection_failure_response: Option<fn(std::io::ErrorKind) -> Vec<u8>>,
+    /// Initial data to send to the remote location
+    pub initial_remote_data: Option<Box<[u8]>>,
+    /// The proxy selector to use for routing this session
+    pub proxy_selector: Arc<ClientProxySelector>,
+}
+
+/// A server stream that can carry another request after a clean session.
+#[async_trait]
+pub trait ReusableTcpStream: AsyncStream {
+    /// Reads the next request on this stream. `None` closes the connection.
+    async fn next_request(self: Box<Self>) -> std::io::Result<Option<TcpServerSetupResult>>;
 }
 
 #[async_trait]

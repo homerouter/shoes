@@ -51,8 +51,8 @@ pub use rules::{ClientChain, ClientChainHop, RuleActionConfig, RuleConfig};
 pub use selection::ConfigSelection;
 pub use server::{
     GrpcServerConfig, HttpUpgradeServerConfig, RealityServerConfig, ServerConfig, ServerProxyConfig,
-    ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, TlsServerConfig, WebsocketPingType,
-    WebsocketServerConfig, direct_allow_rule,
+    ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, SnellUserConfig, TlsServerConfig,
+    WebsocketPingType, WebsocketServerConfig, direct_allow_rule,
 };
 pub use shadowsocks::ShadowsocksConfig;
 pub use tls::TlsKeyExchangeGroups;
