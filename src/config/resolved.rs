@@ -74,6 +74,7 @@ pub use server::ResolvedServerProxyConfig;
 pub type ResolvedClientConfig = client::ClientRecord<ResolvedClientProxyConfig>;
 pub type ResolvedTlsClientConfig = client::TlsClientRecord<ResolvedClientProxyConfig>;
 pub type ResolvedWebsocketClientConfig = client::WebsocketClientRecord<ResolvedClientProxyConfig>;
+pub type ResolvedHttpUpgradeClientConfig = client::HttpUpgradeClientRecord<ResolvedClientProxyConfig>;
 pub type ResolvedXhttpClientConfig = xhttp::XhttpClientRecord<ResolvedClientProxyConfig>;
 pub type ResolvedXhttpServerConfig = xhttp::XhttpServerRecord<ResolvedServerProxyConfig>;
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +110,8 @@ pub type ResolvedTlsServerConfig =
     server::TlsServerRecord<ResolvedServerProxyConfig, ResolvedRuleConfig>;
 pub type ResolvedWebsocketServerConfig =
     server::WebsocketServerRecord<ResolvedServerProxyConfig, ResolvedRuleConfig>;
+pub type ResolvedHttpUpgradeServerConfig =
+    server::HttpUpgradeServerRecord<ResolvedServerProxyConfig, ResolvedRuleConfig>;
 pub type ResolvedRealityServerConfig =
     server::RealityServerRecord<ResolvedServerProxyConfig, ResolvedRuleConfig, ResolvedClientHop>;
 pub type ResolvedShadowTlsServerConfig = server::ShadowTlsServerRecord<

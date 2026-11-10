@@ -590,6 +590,7 @@ pub fn protocol_type(protocol: &ResolvedClientProxyConfig) -> &str {
         ResolvedClientProxyConfig::Reality { protocol, .. }
         | ResolvedClientProxyConfig::ShadowTls { protocol, .. } => protocol_type(protocol),
         ResolvedClientProxyConfig::Websocket(config) => protocol_type(&config.protocol),
+        ResolvedClientProxyConfig::HttpUpgrade(config) => protocol_type(&config.protocol),
         ResolvedClientProxyConfig::SudokuMask(config) => protocol_type(&config.protocol),
         ResolvedClientProxyConfig::Xhttp(config) => protocol_type(&config.protocol),
         ResolvedClientProxyConfig::Socks { .. } => "Socks5",
