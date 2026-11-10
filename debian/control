@@ -1,0 +1,14 @@
+Source: shoes
+Section: net
+Priority: optional
+Maintainer: debiansid <9624961+debiansid@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), rustc, cargo
+Standards-Version: 4.6.2
+Homepage: https://github.com/homerouter/shoes
+
+Package: shoes
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: A multi-protocol proxy server
+ shoes is a fast, memory-safe, multi-protocol proxy server supporting
+ Snell, Shadowsocks, Trojan, VLESS, VMess, Hysteria2, TUIC, and more.

@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure|reconfigure)
+        if command -v setcap >/dev/null 2>&1; then
+            setcap cap_net_admin,cap_net_raw,cap_net_bind_service+ep /usr/bin/shoes 2>/dev/null || true
+        fi
+        if [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+exit 0
