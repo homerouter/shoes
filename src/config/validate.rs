@@ -1402,6 +1402,7 @@ pub(super) fn source_contains_xhttp(protocol: &ClientProxyConfig) -> bool {
         | ClientProxyConfig::ShadowTls { protocol, .. } => source_contains_xhttp(protocol),
         ClientProxyConfig::Websocket(config) => source_contains_xhttp(&config.protocol),
         ClientProxyConfig::HttpUpgrade(config) => source_contains_xhttp(&config.protocol),
+        ClientProxyConfig::Grpc(config) => source_contains_xhttp(&config.protocol),
         ClientProxyConfig::SudokuMask(config) => source_contains_xhttp(&config.protocol),
         _ => false,
     }
@@ -1600,6 +1601,7 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
         ClientProxyConfig::ShadowTls { protocol, .. } => Some(protocol.as_ref()),
         ClientProxyConfig::Websocket(ws_config) => Some(ws_config.protocol.as_ref()),
         ClientProxyConfig::HttpUpgrade(config) => Some(config.protocol.as_ref()),
+        ClientProxyConfig::Grpc(config) => Some(config.protocol.as_ref()),
         ClientProxyConfig::Xhttp(config) => {
             config.validate()?;
             Some(config.protocol.as_ref())
@@ -1863,6 +1865,10 @@ fn validate_client_proxy_config(
                 config.matching_path.as_deref(),
                 config.matching_headers.as_ref(),
             )?;
+            validate_client_proxy_config(&mut config.protocol, named_pems, None)?;
+        }
+
+        ClientProxyConfig::Grpc(config) => {
             validate_client_proxy_config(&mut config.protocol, named_pems, None)?;
         }
 
@@ -2271,6 +2277,30 @@ fn resolve_server_proxy_config(
                 })
             })?;
             ResolvedServerProxyConfig::HttpUpgrade {
+                targets: Box::new(targets),
+            }
+        }
+        ServerProxyConfig::Grpc { targets } => {
+            let targets = plan_ops::map_one(*targets, &mut |config| {
+                let protocol = resolve_server_proxy_config(
+                    config.protocol,
+                    groups,
+                    rules,
+                    pems,
+                    limits,
+                    ServerProtocolContext::Stream,
+                )?;
+                let override_rules =
+                    resolve_rules(config.override_rules, groups, rules, pems, limits)?;
+                Ok::<_, std::io::Error>(crate::config::resolved::ResolvedGrpcServerConfig {
+                    service_name: config.service_name,
+                    matching_headers: config.matching_headers,
+                    host: config.host,
+                    protocol,
+                    override_rules,
+                })
+            })?;
+            ResolvedServerProxyConfig::Grpc {
                 targets: Box::new(targets),
             }
         }

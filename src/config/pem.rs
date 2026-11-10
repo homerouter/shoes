@@ -414,6 +414,14 @@ fn gather_pem_file_paths_from_server_proxy(
                 }
             }
         }
+        ServerProxyConfig::Grpc { targets } => {
+            for target in targets.iter_mut() {
+                gather_pem_file_paths_from_server_proxy(&mut target.protocol, visitor)?;
+                for rule in target.override_rules.iter_mut() {
+                    gather_pem_file_paths_from_rule(rule, visitor);
+                }
+            }
+        }
         ServerProxyConfig::SudokuMask(config) => {
             gather_pem_file_paths_from_server_proxy(&mut config.protocol, visitor)?;
         }
@@ -524,6 +532,9 @@ fn gather_pem_file_paths_from_client_proxy(
         }
         ClientProxyConfig::HttpUpgrade(hu_config) => {
             gather_pem_file_paths_from_client_proxy(&mut hu_config.protocol, visitor);
+        }
+        ClientProxyConfig::Grpc(grpc_config) => {
+            gather_pem_file_paths_from_client_proxy(&mut grpc_config.protocol, visitor);
         }
         ClientProxyConfig::SudokuMask(config) => {
             gather_pem_file_paths_from_client_proxy(&mut config.protocol, visitor);
