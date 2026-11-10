@@ -725,3 +725,83 @@ impl TcpServerHandler for GrpcTcpServerHandler {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn test_varint_round_trip() {
+        for val in [0, 1, 127, 128, 255, 300, 16384, 65535, 1048576] {
+            let mut buf = BytesMut::new();
+            encode_varint(val, &mut buf);
+            assert_eq!(buf.len(), varint_len(val));
+            let (decoded, consumed) = decode_varint(&buf).unwrap();
+            assert_eq!(decoded, val);
+            assert_eq!(consumed, buf.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gun_stream_duplex_e2e() -> io::Result<()> {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let (stream_tx, stream_rx) = tokio::sync::oneshot::channel();
+        let server_driver = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (req, mut respond) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(req.method(), Method::POST);
+            assert_eq!(req.uri().path(), "/TunService/Tun");
+
+            let mut res = Response::new(());
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut()
+                .insert("content-type", HeaderValue::from_static("application/grpc"));
+            let send = respond.send_response(res, false).unwrap();
+            let server_gun = GunStream::new_server(send, req.into_body(), None, None);
+            let _ = stream_tx.send(server_gun);
+
+            while let Some(stream) = connection.accept().await {
+                let _ = stream;
+            }
+        });
+
+        let (mut send_request, connection) = h2::client::handshake(client_io).await.unwrap();
+        let client_driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        std::future::poll_fn(|cx| send_request.poll_ready(cx))
+            .await
+            .unwrap();
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/TunService/Tun")
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
+        let (fut, send) = send_request.send_request(req, false).unwrap();
+        let mut client_gun = GunStream::new_client(send, fut, None, None);
+
+        let mut server_gun = stream_rx.await.unwrap();
+
+        client_gun.write_all(b"ping request").await.unwrap();
+
+        let mut buf = [0u8; 12];
+        server_gun.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping request");
+
+        server_gun.write_all(b"pong response").await.unwrap();
+
+        let mut reply = [0u8; 13];
+        client_gun.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"pong response");
+
+        drop(client_gun);
+        drop(server_gun);
+        server_driver.abort();
+        client_driver.abort();
+        Ok(())
+    }
+}
