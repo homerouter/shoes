@@ -559,6 +559,8 @@ pub enum ClientProxyConfig {
     },
     #[serde(alias = "ws")]
     Websocket(WebsocketClientConfig),
+    #[serde(alias = "http-upgrade", alias = "http_upgrade")]
+    HttpUpgrade(HttpUpgradeClientConfig),
     #[serde(alias = "splithttp")]
     Xhttp(super::xhttp::XhttpClientConfig),
     #[serde(alias = "noop")]
@@ -634,6 +636,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::ShadowTls { .. } => "ShadowTLS",
             ClientProxyConfig::Vmess { .. } => "VMess",
             ClientProxyConfig::Websocket(..) => "WebSocket",
+            ClientProxyConfig::HttpUpgrade(..) => "HTTPUpgrade",
             ClientProxyConfig::Xhttp(..) => "XHTTP",
             ClientProxyConfig::PortForward => "PortForward",
             ClientProxyConfig::Anytls { .. } => "AnyTLS",
@@ -699,6 +702,19 @@ pub struct WebsocketClientRecord<P> {
 }
 
 pub type WebsocketClientConfig = WebsocketClientRecord<ClientProxyConfig>;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HttpUpgradeClientRecord<P> {
+    #[serde(alias = "path", default, skip_serializing_if = "Option::is_none")]
+    pub matching_path: Option<String>,
+    #[serde(alias = "headers", default, skip_serializing_if = "Option::is_none")]
+    pub matching_headers: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub protocol: Box<P>,
+}
+
+pub type HttpUpgradeClientConfig = HttpUpgradeClientRecord<ClientProxyConfig>;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -790,6 +806,8 @@ pub enum ResolvedClientProxyConfig {
         h2mux: Option<H2MuxConfig>,
     },
     Websocket(crate::config::resolved::ResolvedWebsocketClientConfig),
+    #[serde(alias = "http-upgrade", alias = "http_upgrade")]
+    HttpUpgrade(crate::config::resolved::ResolvedHttpUpgradeClientConfig),
     Xhttp(crate::config::resolved::ResolvedXhttpClientConfig),
     PortForward,
     Anytls {
@@ -844,6 +862,7 @@ impl ResolvedClientProxyConfig {
             ResolvedClientProxyConfig::ShadowTls { .. } => "ShadowTLS",
             ResolvedClientProxyConfig::Vmess { .. } => "VMess",
             ResolvedClientProxyConfig::Websocket(..) => "WebSocket",
+            ResolvedClientProxyConfig::HttpUpgrade(..) => "HTTPUpgrade",
             ResolvedClientProxyConfig::Xhttp(..) => "XHTTP",
             ResolvedClientProxyConfig::PortForward => "PortForward",
             ResolvedClientProxyConfig::Anytls { .. } => "AnyTLS",
@@ -984,5 +1003,20 @@ protocol:
         let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), ClientProxyConfig::Websocket(_)));
+    }
+
+    #[test]
+    fn test_httpupgrade_client_config() {
+        let yaml = r#"
+type: httpupgrade
+path: "/tunnel"
+headers:
+  Host: example.com
+protocol:
+  type: direct
+"#;
+        let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), ClientProxyConfig::HttpUpgrade(_)));
     }
 }

@@ -1401,6 +1401,7 @@ pub(super) fn source_contains_xhttp(protocol: &ClientProxyConfig) -> bool {
         ClientProxyConfig::Reality { protocol, .. }
         | ClientProxyConfig::ShadowTls { protocol, .. } => source_contains_xhttp(protocol),
         ClientProxyConfig::Websocket(config) => source_contains_xhttp(&config.protocol),
+        ClientProxyConfig::HttpUpgrade(config) => source_contains_xhttp(&config.protocol),
         ClientProxyConfig::SudokuMask(config) => source_contains_xhttp(&config.protocol),
         _ => false,
     }
@@ -1598,6 +1599,7 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
         }
         ClientProxyConfig::ShadowTls { protocol, .. } => Some(protocol.as_ref()),
         ClientProxyConfig::Websocket(ws_config) => Some(ws_config.protocol.as_ref()),
+        ClientProxyConfig::HttpUpgrade(config) => Some(config.protocol.as_ref()),
         ClientProxyConfig::Xhttp(config) => {
             config.validate()?;
             Some(config.protocol.as_ref())
@@ -1854,6 +1856,14 @@ fn validate_client_proxy_config(
                 false,
             )?;
             validate_client_proxy_config(&mut ws_config.protocol, named_pems, None)?;
+        }
+
+        ClientProxyConfig::HttpUpgrade(config) => {
+            crate::httpupgrade::validate_client_config(
+                config.matching_path.as_deref(),
+                config.matching_headers.as_ref(),
+            )?;
+            validate_client_proxy_config(&mut config.protocol, named_pems, None)?;
         }
 
         ClientProxyConfig::Xhttp(config) => {
@@ -2226,6 +2236,41 @@ fn resolve_server_proxy_config(
                 })
             })?;
             ResolvedServerProxyConfig::Websocket {
+                targets: Box::new(targets),
+            }
+        }
+        ServerProxyConfig::HttpUpgrade { targets } => {
+            let targets = plan_ops::map_one(*targets, &mut |config| {
+                crate::httpupgrade::validate_server_config(
+                    config.matching_path.as_deref(),
+                    config.matching_headers.as_ref(),
+                )?;
+                let protocol = resolve_server_proxy_config(
+                    config.protocol,
+                    groups,
+                    rules,
+                    pems,
+                    limits,
+                    ServerProtocolContext::Stream,
+                )?;
+                let override_rules =
+                    resolve_rules(config.override_rules, groups, rules, pems, limits)?;
+                let mut matching_headers = config.matching_headers;
+                if let Some(host) = config.host {
+                    matching_headers
+                        .get_or_insert_with(std::collections::HashMap::new)
+                        .entry("Host".to_string())
+                        .or_insert(host);
+                }
+                Ok::<_, std::io::Error>(ResolvedHttpUpgradeServerConfig {
+                    matching_path: config.matching_path,
+                    matching_headers,
+                    host: None,
+                    protocol,
+                    override_rules,
+                })
+            })?;
+            ResolvedServerProxyConfig::HttpUpgrade {
                 targets: Box::new(targets),
             }
         }
