@@ -167,6 +167,12 @@ fn protocol(ranges: &[IpNetwork], config: &ResolvedServerProxyConfig) -> io::Res
                 protocol(ranges, &target.protocol)?;
             }
         }
+        ResolvedServerProxyConfig::Grpc { targets } => {
+            for target in targets.iter() {
+                rules(ranges, &target.override_rules)?;
+                protocol(ranges, &target.protocol)?;
+            }
+        }
         ResolvedServerProxyConfig::SudokuMask(config) => protocol(ranges, &config.protocol)?,
         ResolvedServerProxyConfig::Xhttp(config) => protocol(ranges, &config.protocol)?,
         _ => {}

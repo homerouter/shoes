@@ -79,6 +79,7 @@ pub fn contains(config: &ResolvedClientProxyConfig) -> bool {
         | ResolvedClientProxyConfig::ShadowTls { protocol, .. } => contains(protocol),
         ResolvedClientProxyConfig::Websocket(ws) => contains(&ws.protocol),
         ResolvedClientProxyConfig::HttpUpgrade(hu) => contains(&hu.protocol),
+        ResolvedClientProxyConfig::Grpc(grpc) => contains(&grpc.protocol),
         _ => false,
     }
 }

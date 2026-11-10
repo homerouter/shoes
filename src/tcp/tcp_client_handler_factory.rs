@@ -8,7 +8,7 @@ use crate::address::NetLocation;
 use crate::anytls::{AnyTlsClientHandler, PaddingFactory};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
 use crate::config::{
-    ResolvedClientProxyConfig, ResolvedHttpUpgradeClientConfig, ResolvedRuleActionConfig,
+    ResolvedClientProxyConfig, ResolvedGrpcClientConfig, ResolvedHttpUpgradeClientConfig, ResolvedRuleActionConfig,
     ResolvedRuleConfig, ResolvedTlsClientConfig, ResolvedWebsocketClientConfig, ShadowsocksConfig,
 };
 use crate::h2mux::H2MuxClientHandler;
@@ -471,6 +471,21 @@ pub(crate) fn create_with_hop_context(
                 matching_path,
                 matching_headers,
                 handler,
+            ))
+        }
+        ResolvedClientProxyConfig::Grpc(grpc_config) => {
+            let ResolvedGrpcClientConfig {
+                service_name,
+                matching_headers,
+                host,
+                protocol,
+            } = grpc_config;
+            let handler = create_with_hop_context(*protocol, hop_location, None, resolver.clone())?;
+            Box::new(crate::grpc::GrpcTcpClientHandler::new(
+                handler.into(),
+                service_name,
+                matching_headers,
+                host,
             ))
         }
         ResolvedClientProxyConfig::PortForward => Box::new(PortForwardClientHandler),
