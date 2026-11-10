@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (leave empty for current git tag or package version)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CROSS_VERSION: 0.2.5
+  SHOES_BUILD_REVISION: ${{ github.sha }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.resolve-tag.outputs.tag }}
+      version: ${{ steps.resolve-tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate manifest, lockfile, and tag
+        id: resolve-tag
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          manifest = tomllib.loads(Path("Cargo.toml").read_text())["package"]
+          packages = tomllib.loads(Path("Cargo.lock").read_text())["package"]
+          locked = [p["version"] for p in packages if p["name"] == manifest["name"] and "source" not in p]
+          assert locked == [manifest["version"]], f"Manifest ({manifest['version']}) and lockfile ({locked}) versions differ"
+
+          input_tag = os.environ.get("INPUT_TAG", "").strip()
+          ref_type = os.environ.get("GITHUB_REF_TYPE", "")
+          ref_name = os.environ.get("GITHUB_REF_NAME", "")
+
+          if input_tag:
+              tag = input_tag
+          elif ref_type == "tag":
+              tag = ref_name
+          else:
+              tag = f"v{manifest['version']}"
+
+          expected = f"v{manifest['version']}"
+          assert tag == expected, f"Tag {tag} does not match package version {expected}"
+
+          version = manifest["version"]
+          print(f"Validated release tag: {tag}, version: {version}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"tag={tag}\n")
+              f.write(f"version={version}\n")
+          PY
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+
+      - name: Test deb packaging script
+        run: python3 scripts/test-package-deb.py
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [version]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            deb_arch: amd64
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            deb_arch: arm64
+            use_cross: true
+          - target: x86_64-unknown-linux-gnu
+            deb_arch: ""
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            deb_arch: ""
+            use_cross: true
+    env:
+      TARGET: ${{ matrix.target }}
+      SHOES_RELEASE_TAG: ${{ needs.version.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ !matrix.use_cross && matrix.target || '' }}
+
+      - name: Cache cross binary
+        if: matrix.use_cross
+        id: cache-cross
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/cross
+          key: cross-bin-v${{ env.CROSS_VERSION }}
+
+      - name: Install cross binary
+        if: matrix.use_cross && steps.cache-cross.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -sSL "https://github.com/cross-rs/cross/releases/download/v${CROSS_VERSION}/cross-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.cargo/bin" cross
+          chmod +x "$HOME/.cargo/bin/cross"
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary (native)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --locked --target "$TARGET" --bin shoes
+
+      - name: Build release binary (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --target "$TARGET" --bin shoes
+
+      - name: Verify and package tarball
+        run: |
+          test -x "target/$TARGET/release/shoes"
+          file "target/$TARGET/release/shoes"
+          case "$TARGET" in
+            *musl*) file "target/$TARGET/release/shoes" | grep -E 'static.*linked' ;;
+          esac
+          mkdir -p package artifacts
+          cp "target/$TARGET/release/shoes" LICENSE THIRD_PARTY_NOTICES.md package/
+          cp -R licenses package/
+          tar -czf "artifacts/shoes-$TARGET.tar.gz" -C package shoes LICENSE THIRD_PARTY_NOTICES.md licenses
+          python3 scripts/check-release-notices.py "artifacts/shoes-$TARGET.tar.gz"
+
+      - name: Package debian package
+        if: matrix.deb_arch != ''
+        run: |
+          ./scripts/package-deb.sh "target/$TARGET/release/shoes" "${{ matrix.deb_arch }}" "${{ needs.version.outputs.version }}" artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd release-artifacts
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          cd release-artifacts
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Updating existing release $TAG..."
+            gh release upload "$TAG" * --clobber
+          else
+            echo "Creating new release $TAG..."
+            gh release create "$TAG" * --title "$TAG" --generate-notes
+          fi
