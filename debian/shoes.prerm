@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            systemctl --system stop shoes.service >/dev/null 2>&1 || true
+            systemctl --system stop shoes-desktop.service >/dev/null 2>&1 || true
+        fi
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+exit 0
