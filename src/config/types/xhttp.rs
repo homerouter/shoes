@@ -555,6 +555,9 @@ pub(crate) fn contains_resolved_server(
         crate::config::ResolvedServerProxyConfig::Websocket { targets } => targets
             .iter()
             .any(|t| contains_resolved_server(&t.protocol)),
+        crate::config::ResolvedServerProxyConfig::HttpUpgrade { targets } => targets
+            .iter()
+            .any(|t| contains_resolved_server(&t.protocol)),
         _ => false,
     }
 }
@@ -582,6 +585,9 @@ pub(crate) fn contains_server(protocol: &ServerProxyConfig) -> bool {
                     .any(|t| contains_server(&t.protocol))
         }
         ServerProxyConfig::Websocket { targets } => {
+            targets.iter().any(|t| contains_server(&t.protocol))
+        }
+        ServerProxyConfig::HttpUpgrade { targets } => {
             targets.iter().any(|t| contains_server(&t.protocol))
         }
         _ => false,

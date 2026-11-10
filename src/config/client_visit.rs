@@ -190,6 +190,12 @@ fn visit_protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -
                 visit_protocol(&mut target.protocol, visitor)?;
             }
         }
+        ServerProxyConfig::HttpUpgrade { targets } => {
+            for target in targets.iter_mut() {
+                visit_rules(&mut target.override_rules, visitor)?;
+                visit_protocol(&mut target.protocol, visitor)?;
+            }
+        }
         ServerProxyConfig::SudokuMask(config) => {
             visit_protocol(&mut config.protocol, visitor)?;
         }
