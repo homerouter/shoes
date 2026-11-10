@@ -174,6 +174,9 @@ impl Inline for ResolvedServerProxyConfig {
             ServerProxyConfig::HttpUpgrade { targets } => Self::HttpUpgrade {
                 targets: Box::new(one(*targets, ResolvedHttpUpgradeServerConfig::inline)),
             },
+            ServerProxyConfig::Grpc { targets } => Self::Grpc {
+                targets: Box::new(one(*targets, crate::config::resolved::ResolvedGrpcServerConfig::inline)),
+            },
             ServerProxyConfig::Http { username, password } => Self::Http { username, password },
             ServerProxyConfig::Socks {
                 username,
@@ -380,6 +383,19 @@ impl Inline for ResolvedHttpUpgradeServerConfig {
     fn inline(source: Self::Source) -> Self {
         Self {
             matching_path: source.matching_path,
+            matching_headers: source.matching_headers,
+            host: source.host,
+            protocol: ResolvedServerProxyConfig::inline(source.protocol),
+            override_rules: rules(source.override_rules),
+        }
+    }
+}
+
+impl Inline for crate::config::resolved::ResolvedGrpcServerConfig {
+    type Source = super::GrpcServerConfig;
+    fn inline(source: Self::Source) -> Self {
+        Self {
+            service_name: source.service_name,
             matching_headers: source.matching_headers,
             host: source.host,
             protocol: ResolvedServerProxyConfig::inline(source.protocol),
