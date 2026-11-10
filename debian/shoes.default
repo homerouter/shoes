@@ -1,0 +1,6 @@
+# Defaults for shoes proxy server
+# Sourced by systemd / maintainer scripts
+# Installed at /etc/default/shoes
+
+CONFFILE="/etc/shoes/config.yaml"
+DAEMON_ARGS=""

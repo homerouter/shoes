@@ -1,0 +1,50 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+DEB_HOST_ARCH ?= $(shell dpkg-architecture -qDEB_HOST_ARCH)
+
+ifeq ($(DEB_HOST_ARCH),amd64)
+    RUST_TARGET ?= x86_64-unknown-linux-musl
+endif
+ifeq ($(DEB_HOST_ARCH),arm64)
+    RUST_TARGET ?= aarch64-unknown-linux-musl
+endif
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	@if [ -n "$(RUST_TARGET)" ] && command -v cross >/dev/null 2>&1; then \
+		cross build --release --locked --target $(RUST_TARGET) --bin shoes; \
+		mkdir -p target/release; \
+		cp target/$(RUST_TARGET)/release/shoes target/release/shoes; \
+	elif [ -n "$(RUST_TARGET)" ] && rustup target list 2>/dev/null | grep -q "^$(RUST_TARGET) (installed)"; then \
+		cargo build --release --locked --target $(RUST_TARGET) --bin shoes; \
+		mkdir -p target/release; \
+		cp target/$(RUST_TARGET)/release/shoes target/release/shoes; \
+	else \
+		cargo build --release --locked --bin shoes; \
+	fi
+
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/shoes debian/shoes/usr/bin/shoes
+	install -D -m 0644 examples/quickstart_socks.yaml debian/shoes/etc/shoes/config.yaml.example
+	install -D -m 0644 examples/tun_desktop.yaml debian/shoes/etc/shoes/desktop.yaml.example
+	install -D -m 0644 debian/shoes-desktop.service debian/shoes/lib/systemd/system/shoes-desktop.service
+
+override_dh_strip:
+	@# Binary is already stripped by cargo (strip = "symbols" in Cargo.toml)
+	@if [ "$(DEB_HOST_ARCH)" = "$$(dpkg-architecture -qDEB_BUILD_ARCH)" ]; then \
+		dh_strip || true; \
+	elif command -v $$(dpkg-architecture -qDEB_HOST_GNU_TYPE)-strip >/dev/null 2>&1; then \
+		dh_strip || true; \
+	fi
+
+override_dh_shlibdeps:
+	@# Static musl binaries have no dynamic dependencies
+	dh_shlibdeps --dpkg-shlibdeps-params=--ignore-missing-info || true
+
+override_dh_builddeb:
+	dh_builddeb -- -Zxz

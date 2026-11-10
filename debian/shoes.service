@@ -1,0 +1,18 @@
+[Unit]
+Description=shoes multi-protocol proxy server
+Documentation=https://github.com/homerouter/shoes
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=/usr/bin/shoes /etc/shoes/config.yaml
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

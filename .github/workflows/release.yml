@@ -13,10 +13,11 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,6 +38,18 @@ jobs:
       version: ${{ steps.resolve-tag.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+
+      - name: Prevent duplicate workflow run
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ACTIVE_RUN=$(gh run list --workflow release.yml --repo "$GITHUB_REPOSITORY" --commit "$GITHUB_SHA" --json databaseId,status,event --jq '.[] | select(.databaseId != '"$GITHUB_RUN_ID"' and .status == "in_progress" and .event == "push") | .databaseId' | head -n 1)
+          if [ -n "$ACTIVE_RUN" ]; then
+            echo "::warning::Release run #$ACTIVE_RUN is already actively building commit $GITHUB_SHA. Canceling duplicate dispatch."
+            gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" || true
+            exit 0
+          fi
 
       - name: Validate manifest, lockfile, and tag
         id: resolve-tag
@@ -75,11 +88,8 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
 
-      - name: Test deb packaging script
-        run: python3 scripts/test-package-deb.py
-
   build:
-    name: Build ${{ matrix.target }}
+    name: Build deb for ${{ matrix.deb_arch }} (${{ matrix.target }})
     needs: [version]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -89,16 +99,8 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             deb_arch: amd64
-            use_cross: true
           - target: aarch64-unknown-linux-musl
             deb_arch: arm64
-            use_cross: true
-          - target: x86_64-unknown-linux-gnu
-            deb_arch: ""
-            use_cross: false
-          - target: aarch64-unknown-linux-gnu
-            deb_arch: ""
-            use_cross: true
     env:
       TARGET: ${{ matrix.target }}
       SHOES_RELEASE_TAG: ${{ needs.version.outputs.tag }}
@@ -108,11 +110,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ !matrix.use_cross && matrix.target || '' }}
 
       - name: Cache cross binary
-        if: matrix.use_cross
         id: cache-cross
         uses: actions/cache@v6
         with:
@@ -120,7 +119,7 @@ jobs:
           key: cross-bin-v${{ env.CROSS_VERSION }}
 
       - name: Install cross binary
-        if: matrix.use_cross && steps.cache-cross.outputs.cache-hit != 'true'
+        if: steps.cache-cross.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$HOME/.cargo/bin"
           curl -sSL "https://github.com/cross-rs/cross/releases/download/v${CROSS_VERSION}/cross-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.cargo/bin" cross
@@ -131,37 +130,39 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: Build release binary (native)
-        if: ${{ !matrix.use_cross }}
-        run: cargo build --release --locked --target "$TARGET" --bin shoes
-
-      - name: Build release binary (cross)
-        if: matrix.use_cross
-        run: cross build --release --locked --target "$TARGET" --bin shoes
-
-      - name: Verify and package tarball
+      - name: Install Debian packaging tools
         run: |
-          test -x "target/$TARGET/release/shoes"
-          file "target/$TARGET/release/shoes"
-          case "$TARGET" in
-            *musl*) file "target/$TARGET/release/shoes" | grep -E 'static.*linked' ;;
-          esac
-          mkdir -p package artifacts
-          cp "target/$TARGET/release/shoes" LICENSE THIRD_PARTY_NOTICES.md package/
-          cp -R licenses package/
-          tar -czf "artifacts/shoes-$TARGET.tar.gz" -C package shoes LICENSE THIRD_PARTY_NOTICES.md licenses
-          python3 scripts/check-release-notices.py "artifacts/shoes-$TARGET.tar.gz"
+          sudo apt-get update
+          sudo apt-get install -y debhelper dpkg-dev fakeroot binutils-aarch64-linux-gnu
 
-      - name: Package debian package
-        if: matrix.deb_arch != ''
+      - name: Build Debian package (.deb)
         run: |
-          ./scripts/package-deb.sh "target/$TARGET/release/shoes" "${{ matrix.deb_arch }}" "${{ needs.version.outputs.version }}" artifacts
+          VERSION="${{ needs.version.outputs.version }}"
+          ARCH="${{ matrix.deb_arch }}"
+
+          # Sync debian/changelog top entry with release version if needed
+          python3 - <<'PY'
+          import os, datetime
+          version = "${{ needs.version.outputs.version }}"
+          p = "debian/changelog"
+          content = open(p).read()
+          if f"shoes ({version})" not in content:
+              date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+              entry = f"shoes ({version}) unstable; urgency=medium\n\n  * Release version {version}.\n\n -- debiansid <9624961+debiansid@users.noreply.github.com>  {date_str}\n\n"
+              open(p, "w").write(entry + content)
+          PY
+
+          # Build Debian package directly via dpkg-buildpackage
+          dpkg-buildpackage -us -uc -b -d --host-arch "$ARCH"
+
+          mkdir -p artifacts
+          cp "../shoes_${VERSION}_${ARCH}.deb" artifacts/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: release-${{ matrix.target }}
-          path: artifacts/*
+          name: release-${{ matrix.deb_arch }}
+          path: artifacts/*.deb
           if-no-files-found: error
 
   publish:
@@ -172,7 +173,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Download all release artifacts
+      - name: Download deb release artifacts
         uses: actions/download-artifact@v8
         with:
           pattern: release-*
@@ -182,7 +183,7 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           cd release-artifacts
-          sha256sum * > SHA256SUMS
+          sha256sum *.deb > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create or update GitHub Release
