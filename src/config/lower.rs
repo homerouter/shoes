@@ -101,10 +101,12 @@ fn client_protocol(
         ClientProxyConfig::Trojan {
             password,
             shadowsocks,
+            udp_enabled,
             h2mux,
         } => ResolvedClientProxyConfig::Trojan {
             password,
             shadowsocks,
+            udp_enabled,
             h2mux,
         },
         ClientProxyConfig::Reality {
