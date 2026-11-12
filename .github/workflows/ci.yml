@@ -201,3 +201,18 @@ jobs:
           case "$TARGET" in
             *musl*) file "target/$TARGET/release/shoes" | grep -E 'static.*linked' ;;
           esac
+
+      - name: Verify allocator and THP settings
+        if: startsWith(matrix.target, 'x86_64-')
+        run: |
+          bin="target/$TARGET/release/shoes"
+          _RJEM_MALLOC_CONF=stats_print:true "$bin" generate-vless-user-id > jemalloc-stats.txt 2>&1
+          grep 'opt.thp: "never"' jemalloc-stats.txt
+          grep 'opt.background_thread: true' jemalloc-stats.txt
+          grep 'opt.narenas: 2' jemalloc-stats.txt
+          printf -- '- address: 127.0.0.1:18089\n  protocol:\n    type: socks\n' > thp.yaml
+          "$bin" thp.yaml &
+          pid=$!
+          sleep 2
+          grep -E 'THP_enabled:\s+0' "/proc/$pid/status"
+          kill "$pid"
