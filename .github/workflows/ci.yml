@@ -3,7 +3,8 @@ name: CI
 on:
   push:
     branches:
-      - '**'
+      - dev
+      - main
     paths:
       - 'src/**'
       - 'tests/**'
@@ -13,6 +14,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.cargo/**'
+      - '.github/workflows/ci.yml'
   pull_request:
     paths:
       - 'src/**'
@@ -23,6 +25,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.cargo/**'
+      - '.github/workflows/ci.yml'
   workflow_dispatch:
 
 concurrency:
@@ -39,8 +42,85 @@ defaults:
     shell: bash
 
 jobs:
+  detect:
+    name: Detect code changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.filter.outputs.run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check whether code or dependencies changed
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import tomllib
+
+          def write_out(val: bool) -> None:
+              s = "true" if val else "false"
+              print(f"ci_should_run={s}")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"run={s}\n")
+
+          event = os.environ["EVENT_NAME"]
+          if event == "workflow_dispatch":
+              write_out(True)
+              raise SystemExit(0)
+
+          zero = "0" * 40
+          base = os.environ.get("PR_BASE") if event == "pull_request" else os.environ.get("PUSH_BEFORE", "")
+          if not base or base == zero or subprocess.run(["git", "cat-file", "-e", f"{base}^{{commit}}"], capture_output=True).returncode != 0:
+              base = "HEAD^"
+
+          if subprocess.run(["git", "cat-file", "-e", f"{base}^{{commit}}"], capture_output=True).returncode != 0:
+              write_out(True)
+              raise SystemExit(0)
+
+          changed = subprocess.check_output(["git", "diff", "--name-only", base, "HEAD"], text=True).splitlines()
+          print("Changed files:", changed)
+          code_prefixes = ("src/", "tests/", "benches/", "include/", ".cargo/")
+          code_files = {"build.rs", ".github/workflows/ci.yml"}
+          if any(f in code_files or f.startswith(code_prefixes) for f in changed):
+              write_out(True)
+              raise SystemExit(0)
+
+          cargo_changed = [f for f in changed if f in ("Cargo.toml", "Cargo.lock")]
+          if not cargo_changed:
+              write_out(False)
+              raise SystemExit(0)
+
+          def strip_own_version(rev: str, path: str):
+              raw = subprocess.check_output(["git", "show", f"{rev}:{path}"], text=True)
+              data = tomllib.loads(raw)
+              if path == "Cargo.toml":
+                  data["package"].pop("version", None)
+              else:
+                  for pkg in data.get("package", []):
+                      if pkg.get("name") == "shoes" and "source" not in pkg:
+                          pkg.pop("version", None)
+              return data
+
+          for path in cargo_changed:
+              if strip_own_version(base, path) != strip_own_version("HEAD", path):
+                  write_out(True)
+                  raise SystemExit(0)
+
+          write_out(False)
+          PY
+
   test:
     name: Test
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -140,7 +220,8 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
-    needs: [test]
+    needs: [detect, test]
+    if: needs.detect.outputs.run == 'true' && needs.test.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
