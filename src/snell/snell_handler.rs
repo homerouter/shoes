@@ -670,6 +670,9 @@ const END_OF_FILE_REPLY: &[u8] = b"\x02\xff\x0bend of file";
 /// Client bytes discarded after the server's zero chunk before giving up
 /// (sing-snell `reuse.WaitingDiscardLimit`).
 const DRAIN_LIMIT: usize = 0x80001;
+/// How long a reusable connection may wait between requests; slightly above
+/// `client_pool::POOL_MAX_AGE` so pooled clients retire it first.
+const REUSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(190);
 
 /// Write side of one tunnel session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -884,17 +887,27 @@ impl ReusableTcpStream for SnellTunnelStream {
             return Ok(None);
         }
         let mut stream_reader = StreamReader::new_with_buffer_size(400);
-        let mut header = HeaderReader(&mut self.inner);
-        match stream_reader.peek_u8(&mut header).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => return Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                debug!("Snell connection closed mid-record between requests: {e}");
-                return Ok(None);
+        let read = async {
+            let mut header = HeaderReader(&mut self.inner);
+            match stream_reader.peek_u8(&mut header).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => return Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    debug!("Snell connection closed mid-record between requests: {e}");
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
-        }
-        let request = read_request(&mut stream_reader, &mut header).await?;
+            read_request(&mut stream_reader, &mut header).await.map(Some)
+        };
+        // Idle pooled connections otherwise hold their socket, buffers and stream permit forever.
+        let Ok(request) = tokio::time::timeout(REUSE_IDLE_TIMEOUT, read).await else {
+            debug!("Snell reused connection idle for {REUSE_IDLE_TIMEOUT:?}; closing");
+            return Ok(None);
+        };
+        let Some(request) = request? else {
+            return Ok(None);
+        };
         if request.command != CMD_PING {
             self.auth.check_client_id(&request.client_id)?;
         }
@@ -2924,6 +2937,20 @@ mod tests {
         end_session(&mut server, &mut peer).await;
         drop(peer);
         assert!(Box::new(server).next_request().await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_request_idle_connection_times_out() {
+        assert!(REUSE_IDLE_TIMEOUT > crate::snell::client_pool::POOL_MAX_AGE);
+        for partial in [&[][..], &[1u8][..]] {
+            let (mut server, mut peer) = tunnel_pair(false, true);
+            end_session(&mut server, &mut peer).await;
+            write_all(&mut peer, partial).await.unwrap();
+            peer.flush().await.unwrap();
+            let started = tokio::time::Instant::now();
+            assert!(Box::new(server).next_request().await.unwrap().is_none());
+            assert_eq!(started.elapsed(), REUSE_IDLE_TIMEOUT);
+        }
     }
 
     #[tokio::test]
