@@ -3,7 +3,7 @@ title: "Snell"
 description: "shoes snell v3–v6 配置。"
 ---
 
-**完整示例：** [snell.yaml](/zh-cn/examples/snell/)。在部署之前调整地址和机密。
+**完整示例：** [snell.yaml](/zh-cn/examples/snell/) 和 [small_vps_snell.yaml](/zh-cn/examples/small_vps_snell/)。在部署之前调整地址和密钥。
 
 下面的字段草图包含占位符，而不是可运行的值。配置部署时使用完整的示例。
 
@@ -25,7 +25,7 @@ protocol:
       password: string         # psk 模式：该用户的 PSK
 ```
 
-v4、v5 和 v6 始终使用 `aes-128-gcm`；只有当 `cipher` 为 `aes-128-gcm` 时自动检测才会考虑它们。支持 Connect v2（连接复用）：一个连接可承载多个请求，与 sing-snell 一致。
+v4、v5 和 v6 始终使用 `aes-128-gcm`；只有当 `cipher` 为 `aes-128-gcm` 时自动检测才会考虑它们。支持 Connect v2（连接复用）：一个连接可承载多个请求（与 sing-snell 一致），在两次请求之间空闲超过 190 秒后关闭。
 
 启用 `udp_enabled` 时，服务端还会在同一 UDP 端口上为设置了 `block-quic=off` 的 Surge 客户端开启 QUIC 代理监听。它始终使用 `aes-128-gcm`。设置 `udp_enabled: false` 可将其关闭。
 

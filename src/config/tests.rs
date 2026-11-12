@@ -181,6 +181,7 @@ async fn representative_examples_pass_native_validation() {
         "socks_basic.yaml",
         "snell.yaml",
         "snell_forward_rules.yaml",
+        "small_vps_snell.yaml",
         "http_through_socks.yaml",
         "multi_hop_chain.yaml",
         "chain_groups.yaml",
