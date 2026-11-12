@@ -350,6 +350,16 @@ Set `SHOES_TEST_WG_BIN` to an absolute path to override `wg`.
 CARGO_BUILD_JOBS=1 cargo test --locked --features privileged-tests --test privileged wireguard_kernel:: -- --test-threads=1
 ```
 
+## Linux Runtime Defaults
+
+Linux builds configure conservative memory and socket defaults at startup without changing host sysctl or sysfs settings:
+
+- **Process THP disabled:** A startup constructor calls `prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)` (`THP_enabled: 0` in `/proc/<pid>/status`) so hosts with `transparent_hugepage/enabled=always` do not back sparse allocator extents or thread stacks with 2 MiB huge pages.
+- **Small-VPS jemalloc defaults:** Exports `_rjem_malloc_conf` as `background_thread:true,narenas:2,dirty_decay_ms:1000,thp:never`. Override at runtime via `_RJEM_MALLOC_CONF` (`MALLOC_CONF` is ignored), for example `_RJEM_MALLOC_CONF=narenas:0` on high-core servers.
+- **TCP user timeout:** Inbound and outbound TCP sockets set `TCP_USER_TIMEOUT` to 120 seconds on Linux and Android so half-open sockets with unacknowledged data close promptly.
+
+For low-memory deployments, see the [small-VPS Snell example](examples/small_vps_snell.yaml) and [Linux memory and connection tuning](https://shoes-rs.github.io/operations/tips/#linux-memory-and-connection-tuning).
+
 ## Similar Projects
 
 - [apernet/hysteria](https://github.com/apernet/hysteria)
