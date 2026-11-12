@@ -3,7 +3,7 @@ title: "Snell"
 description: shoes snell v3–v6 configuration.
 ---
 
-**Complete example:** [snell.yaml](/examples/snell/). Adapt addresses and secrets before deployment.
+**Complete examples:** [snell.yaml](/examples/snell/) and [small_vps_snell.yaml](/examples/small_vps_snell/). Adapt addresses and secrets before deployment.
 
 The field sketches below contain placeholders, not runnable values. Use a complete example when configuring a deployment.
 
@@ -24,7 +24,7 @@ protocol:
       password: string         # psk mode: this user's PSK
 ```
 
-v4, v5, and v6 always use `aes-128-gcm`; auto-detection only considers them when `cipher` is `aes-128-gcm`. Connect v2 (reuse) is supported: one connection can carry many requests, as with sing-snell.
+v4, v5, and v6 always use `aes-128-gcm`; auto-detection only considers them when `cipher` is `aes-128-gcm`. Connect v2 (reuse) is supported: one connection can carry many requests, as with sing-snell, and closes if left idle between requests for more than 190 seconds.
 
 With `udp_enabled`, the server also opens a QUIC proxy listener on the same UDP port for Surge clients with `block-quic=off`. It always uses `aes-128-gcm`. Set `udp_enabled: false` to turn it off.
 
