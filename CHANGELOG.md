@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v0.4.1
+
+- Bounded memory and stale sockets on small Linux VPS deployments:
+  - Disabled process-level Transparent Huge Pages in `.init_array` via `prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)` on Linux.
+  - Exported small-VPS jemalloc defaults (`background_thread:true,narenas:2,dirty_decay_ms:1000,thp:never`), overridable via `_RJEM_MALLOC_CONF`.
+  - Enabled `TCP_USER_TIMEOUT` (`120` seconds) on keepalive-enabled inbound and outbound TCP sockets on Linux and Android.
+  - Added Linux CI verification for `_rjem_malloc_conf` options and `THP_enabled: 0`.
+- Set Snell Connect v2 idle reuse timeout (`REUSE_IDLE_TIMEOUT`) to `190` seconds so servers retire idle pooled connections only after `SnellClientPool::POOL_MAX_AGE`.
+- Added `examples/small_vps_snell.yaml` and documented Linux runtime defaults and tuning in `README.md` and the documentation site.
+
+## v0.4.0
+
 - Added Snell obfuscation (`simple-obfs`) matching Surge 6.4.4 and sing-snell:
   - Server-side HTTP simple-obfs on Snell v5 server (`obfs_mode: "http"`, default `"none"`).
     TLS obfs is rejected during configuration validation with a suggestion to use ShadowTLS.
