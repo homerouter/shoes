@@ -240,6 +240,10 @@ pub fn set_tcp_keepalive(
                 .with_interval(send_interval);
             socket2_socket.set_keepalive(true)?;
             socket2_socket.set_tcp_keepalive(&keepalive)?;
+            // Keepalive is idle while data is unacked; without this a vanished peer
+            // holds the socket for tcp_retries2 (~15 minutes) of retransmission.
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            socket2_socket.set_tcp_user_timeout(Some(std::time::Duration::from_secs(120)))?;
         }
         Ok(())
     }
