@@ -1,0 +1,24 @@
+# Small-VPS Snell baseline (512 MiB - 1 GiB RAM).
+# Pair with `shoes -t 2` (or `_RJEM_MALLOC_CONF=narenas:0` on multi-core hosts).
+# `password` is shared PSK unless `multi_user_authentication: psk` is used.
+- global_settings:
+    max_connections: 1024
+    max_connections_per_ip: 256
+    max_streams: 4096
+    max_udp_destinations: 512
+    reload_grace_secs: 60
+
+- address: "0.0.0.0:55555"
+  transport: tcp
+  protocol:
+    type: snell
+    cipher: aes-128-gcm
+    # Must be 12-255 bytes for Snell v6 (auto-detect also serves v3-v5).
+    password: "replace-with-a-strong-psk"
+    udp_enabled: true
+  rules:
+    - masks: ["127.0.0.0/8", "::1/128", "169.254.0.0/16", "fe80::/10"]
+      action: block
+    - conditions: {any_destination: true}
+      action: allow
+      client_chain: direct
