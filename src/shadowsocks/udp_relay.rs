@@ -121,23 +121,18 @@ pub async fn run_shadowsocks_udp_listener(
                         let client_addr_holder_clone = client_addr_holder.clone();
 
                         let return_task = tokio::spawn(async move {
-                            loop {
-                                match relay_clone.recv().await {
-                                    Ok((data, origin_target)) => {
-                                        match encrypt_server_udp_packet_legacy(&origin_target, &data, &key_clone, cipher) {
-                                            Ok(resp_packet) => {
-                                                let addr = *client_addr_holder_clone.lock();
-                                                if socket_clone.send_to(&resp_packet, addr).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                            Err(e) => {
-                                                log::debug!("Failed to encrypt legacy server UDP packet: {e}");
-                                                break;
-                                            }
+                            while let Ok((data, origin_target)) = relay_clone.recv().await {
+                                match encrypt_server_udp_packet_legacy(&origin_target, &data, &key_clone, cipher) {
+                                    Ok(resp_packet) => {
+                                        let addr = *client_addr_holder_clone.lock();
+                                        if socket_clone.send_to(&resp_packet, addr).await.is_err() {
+                                            break;
                                         }
                                     }
-                                    Err(_) => break,
+                                    Err(e) => {
+                                        log::debug!("Failed to encrypt legacy server UDP packet: {e}");
+                                        break;
+                                    }
                                 }
                             }
                         }).abort_handle();
@@ -161,11 +156,11 @@ pub async fn run_shadowsocks_udp_listener(
                     let session_key = SessionKey::Aead2022(dec.session_id);
                     if let Some(session) = sessions.get_mut(&session_key) {
                         // Check anti-replay on packet_id
-                        if let Some(ref mut filter) = session.filter {
-                            if !filter.validate_and_update(dec.packet_id) {
-                                log::debug!("Shadowsocks 2022 UDP replayed packet_id={} from {client_addr}", dec.packet_id);
-                                continue;
-                            }
+                        if let Some(ref mut filter) = session.filter
+                            && !filter.validate_and_update(dec.packet_id)
+                        {
+                            log::debug!("Shadowsocks 2022 UDP replayed packet_id={} from {client_addr}", dec.packet_id);
+                            continue;
                         }
                         *session.client_addr.lock() = client_addr;
                         let _ = session.relay.send_to(Bytes::copy_from_slice(&dec.payload), dec.target);
@@ -201,32 +196,27 @@ pub async fn run_shadowsocks_udp_listener(
 
                         let return_task = tokio::spawn(async move {
                             let mut server_packet_id: u64 = 1;
-                            loop {
-                                match relay_clone.recv().await {
-                                    Ok((data, origin_target)) => {
-                                        match encrypt_server_udp_packet_2022(
-                                            server_session_id,
-                                            server_packet_id,
-                                            client_session_id,
-                                            &origin_target,
-                                            &data,
-                                            &key_bytes_clone,
-                                            cipher,
-                                        ) {
-                                            Ok(resp_packet) => {
-                                                server_packet_id = server_packet_id.wrapping_add(1);
-                                                let addr = *client_addr_holder_clone.lock();
-                                                if socket_clone.send_to(&resp_packet, addr).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                            Err(e) => {
-                                                log::debug!("Failed to encrypt 2022 server UDP packet: {e}");
-                                                break;
-                                            }
+                            while let Ok((data, origin_target)) = relay_clone.recv().await {
+                                match encrypt_server_udp_packet_2022(
+                                    server_session_id,
+                                    server_packet_id,
+                                    client_session_id,
+                                    &origin_target,
+                                    &data,
+                                    &key_bytes_clone,
+                                    cipher,
+                                ) {
+                                    Ok(resp_packet) => {
+                                        server_packet_id = server_packet_id.wrapping_add(1);
+                                        let addr = *client_addr_holder_clone.lock();
+                                        if socket_clone.send_to(&resp_packet, addr).await.is_err() {
+                                            break;
                                         }
                                     }
-                                    Err(_) => break,
+                                    Err(e) => {
+                                        log::debug!("Failed to encrypt 2022 server UDP packet: {e}");
+                                        break;
+                                    }
                                 }
                             }
                         }).abort_handle();

@@ -782,7 +782,7 @@ mod tests {
         let buf: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
 
         let waker = std::task::Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(waker);
         let poll_res = Pin::new(&mut writer).poll_write(&mut cx, &buf);
         assert!(poll_res.is_pending());
 
@@ -819,7 +819,7 @@ mod tests {
         let packet: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
 
         let waker = std::task::Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(waker);
         assert!(Pin::new(&mut writer)
             .poll_write_message(&mut cx, &packet)
             .is_pending());

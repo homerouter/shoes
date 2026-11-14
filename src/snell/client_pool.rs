@@ -41,6 +41,8 @@ impl Debug for SnellClientPool {
     }
 }
 
+pub type PooledSnellStream = (SnellFramedStream<Box<dyn AsyncStream>>, Arc<dyn CarrierDialer>);
+
 impl SnellClientPool {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -48,10 +50,7 @@ impl SnellClientPool {
         })
     }
 
-    pub fn take(
-        &self,
-        route_key: &RouteKey,
-    ) -> Option<(SnellFramedStream<Box<dyn AsyncStream>>, Arc<dyn CarrierDialer>)> {
+    pub fn take(&self, route_key: &RouteKey) -> Option<PooledSnellStream> {
         let mut state = self.inner.lock();
         if state.closed {
             return None;
@@ -92,31 +91,31 @@ impl SnellClientPool {
             idle_since: now,
             route,
         });
-        if state.reaper.is_none() {
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                let pool_weak = Arc::downgrade(&self.inner);
-                let handle = rt.spawn(async move {
-                    let mut interval = tokio::time::interval(POOL_SWEEP_INTERVAL);
-                    loop {
-                        interval.tick().await;
-                        let Some(pool_inner) = pool_weak.upgrade() else {
-                            break;
-                        };
-                        let mut st = pool_inner.lock();
-                        if st.closed {
-                            break;
-                        }
-                        let now = Instant::now();
-                        st.entries
-                            .retain(|e| now.duration_since(e.idle_since) <= POOL_MAX_AGE);
-                        if st.entries.is_empty() {
-                            st.reaper = None;
-                            break;
-                        }
+        if state.reaper.is_none()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            let pool_weak = Arc::downgrade(&self.inner);
+            let handle = rt.spawn(async move {
+                let mut interval = tokio::time::interval(POOL_SWEEP_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    let Some(pool_inner) = pool_weak.upgrade() else {
+                        break;
+                    };
+                    let mut st = pool_inner.lock();
+                    if st.closed {
+                        break;
                     }
-                });
-                state.reaper = Some(handle.abort_handle());
-            }
+                    let now = Instant::now();
+                    st.entries
+                        .retain(|e| now.duration_since(e.idle_since) <= POOL_MAX_AGE);
+                    if st.entries.is_empty() {
+                        st.reaper = None;
+                        break;
+                    }
+                }
+            });
+            state.reaper = Some(handle.abort_handle());
         }
     }
 

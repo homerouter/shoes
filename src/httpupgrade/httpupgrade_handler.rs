@@ -37,18 +37,17 @@ pub(crate) fn validate_server_config(
 }
 
 fn validate_path(path: Option<&str>) -> io::Result<()> {
-    if let Some(path) = path {
-        if !path.starts_with('/')
+    if let Some(path) = path
+        && (!path.starts_with('/')
             || !path.is_ascii()
             || path.bytes().any(|b| b.is_ascii_control() || b == b' ')
             || path.contains('#')
-            || path.len() >= MAX_LINE
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid HTTPUpgrade matching_path",
-            ));
-        }
+            || path.len() >= MAX_LINE)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid HTTPUpgrade matching_path",
+        ));
     }
     Ok(())
 }
