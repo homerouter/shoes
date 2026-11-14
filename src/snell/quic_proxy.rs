@@ -486,6 +486,9 @@ pub type FallbackUdp = Box<
         + Send,
 >;
 
+type FallbackConnectFuture =
+    Pin<Box<dyn Future<Output = std::io::Result<Box<dyn AsyncMessageStream>>> + Send>>;
+
 pub struct SnellQuicProxyStream {
     state: QuicProxyStreamState,
 }
@@ -499,9 +502,7 @@ enum QuicProxyStreamState {
         userkey: Vec<u8>,
         fallback: FallbackUdp,
     },
-    ConnectingTcp(
-        Pin<Box<dyn Future<Output = std::io::Result<Box<dyn AsyncMessageStream>>> + Send>>,
-    ),
+    ConnectingTcp(FallbackConnectFuture),
     Quic(QuicUdpStream),
     TcpRelay(Box<dyn AsyncMessageStream>),
     Failed(std::io::ErrorKind, String),
@@ -615,19 +616,18 @@ impl AsyncWriteMessage for SnellQuicProxyStream {
                     if buf.is_empty() {
                         return Poll::Ready(Ok(()));
                     }
-                    if is_quic_looking(buf[0]) || is_quic_initial(buf) {
-                        if let Some(s_addr) = *server_addr {
-                            if let Ok(mut quic) = Self::try_start_quic(
-                                s_addr,
-                                psk.clone(),
-                                userkey.clone(),
-                                target.clone(),
-                            ) {
-                                let res = Pin::new(&mut quic).poll_write_message(cx, buf);
-                                this.state = QuicProxyStreamState::Quic(quic);
-                                return res;
-                            }
-                        }
+                    if (is_quic_looking(buf[0]) || is_quic_initial(buf))
+                        && let Some(s_addr) = *server_addr
+                        && let Ok(mut quic) = Self::try_start_quic(
+                            s_addr,
+                            psk.clone(),
+                            userkey.clone(),
+                            target.clone(),
+                        )
+                    {
+                        let res = Pin::new(&mut quic).poll_write_message(cx, buf);
+                        this.state = QuicProxyStreamState::Quic(quic);
+                        return res;
                     }
                     let stream = client_stream.take().expect("client stream present");
                     let target_loc = target.clone();

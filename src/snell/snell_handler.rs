@@ -1193,11 +1193,11 @@ impl AsyncRead for SnellReplyStream {
         if this.read_eof {
             return Poll::Ready(Ok(()));
         }
-        if !matches!(this.request, ClientRequestState::Sent) {
-            if let Err(e) = ready!(this.poll_flush_request(cx)) {
-                this.broken = true;
-                return Poll::Ready(Err(e));
-            }
+        if !matches!(this.request, ClientRequestState::Sent)
+            && let Err(e) = ready!(this.poll_flush_request(cx))
+        {
+            this.broken = true;
+            return Poll::Ready(Err(e));
         }
         if let Err(e) = ready!(this.poll_reply(cx)) {
             this.broken = true;
@@ -1288,11 +1288,11 @@ impl AsyncWrite for SnellReplyStream {
         if this.broken {
             return Poll::Ready(Ok(()));
         }
-        if !matches!(this.request, ClientRequestState::Sent) {
-            if let Err(e) = ready!(this.poll_flush_request(cx)) {
-                this.broken = true;
-                return Poll::Ready(Err(e));
-            }
+        if !matches!(this.request, ClientRequestState::Sent)
+            && let Err(e) = ready!(this.poll_flush_request(cx))
+        {
+            this.broken = true;
+            return Poll::Ready(Err(e));
         }
         let inner = this.inner.as_mut().expect("stream active");
         let res = Pin::new(inner).poll_flush(cx);
@@ -1307,11 +1307,11 @@ impl AsyncWrite for SnellReplyStream {
         if this.broken || this.write_closed {
             return Poll::Ready(Ok(()));
         }
-        if !matches!(this.request, ClientRequestState::Sent) {
-            if let Err(e) = ready!(this.poll_flush_request(cx)) {
-                this.broken = true;
-                return Poll::Ready(Err(e));
-            }
+        if !matches!(this.request, ClientRequestState::Sent)
+            && let Err(e) = ready!(this.poll_flush_request(cx))
+        {
+            this.broken = true;
+            return Poll::Ready(Err(e));
         }
         let inner = this.inner.as_mut().expect("stream active");
         if this.pool.is_some() {
