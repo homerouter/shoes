@@ -1537,13 +1537,13 @@ fn validate_snell_client(
         ));
     }
 
-    if let Some(key) = userkey {
-        if key.len() > 255 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "snell: userkey too long",
-            ));
-        }
+    if let Some(key) = userkey
+        && key.len() > 255
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "snell: userkey too long",
+        ));
     }
 
     if mode.is_some() && ver != crate::snell::snell_handler::SnellVersion::V6 {
@@ -1553,13 +1553,13 @@ fn validate_snell_client(
         ));
     }
 
-    if let Some(m) = mode {
-        if crate::snell::v6::SnellV6Mode::parse(m).is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("snell: unknown mode: {m}"),
-            ));
-        }
+    if let Some(m) = mode
+        && crate::snell::v6::SnellV6Mode::parse(m).is_none()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("snell: unknown mode: {m}"),
+        ));
     }
 
     if quic_proxy_mode && ver < crate::snell::snell_handler::SnellVersion::V5 {
