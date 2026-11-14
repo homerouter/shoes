@@ -577,10 +577,10 @@ mod tests {
                     break;
                 }
                 received.extend_from_slice(&buf[..n]);
-                if let Ok(Some((_, start, len))) = parse_trojan_packet_frame(&received) {
-                    if received.len() >= start + len {
-                        break;
-                    }
+                if let Ok(Some((_, start, len))) = parse_trojan_packet_frame(&received)
+                    && received.len() >= start + len
+                {
+                    break;
                 }
             }
             received

@@ -14,16 +14,15 @@ const MURMUR_SEED: u32 = 0x9747_b28c;
 fn murmur2(data: &[u8], seed: u32) -> u32 {
     const M: u32 = 0x5bd1_e995;
     let mut hash = seed ^ data.len() as u32;
-    let mut chunks = data.chunks_exact(4);
-    for chunk in &mut chunks {
-        let mut k = u32::from_le_bytes(chunk.try_into().unwrap());
+    let (chunks, tail) = data.as_chunks::<4>();
+    for chunk in chunks {
+        let mut k = u32::from_le_bytes(*chunk);
         k = k.wrapping_mul(M);
         k ^= k >> 24;
         k = k.wrapping_mul(M);
         hash = hash.wrapping_mul(M);
         hash ^= k;
     }
-    let tail = chunks.remainder();
     if tail.len() >= 3 {
         hash ^= u32::from(tail[2]) << 16;
     }
