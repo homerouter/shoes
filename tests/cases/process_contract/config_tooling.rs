@@ -452,7 +452,10 @@ async fn config_pipe_writer(path: &Path) -> std::fs::File {
 #[cfg(unix)]
 #[tokio::test]
 async fn check_dry_run_keeps_default_signal_actions() {
-    use std::os::unix::{ffi::OsStrExt, process::ExitStatusExt};
+    use std::os::unix::{
+        ffi::OsStrExt,
+        process::{CommandExt, ExitStatusExt},
+    };
 
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("blocked.yaml");
@@ -460,13 +463,31 @@ async fn check_dry_run_keeps_default_signal_actions() {
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
     for mode in ["check", "--dry-run"] {
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            let child = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            let mut command = Command::new(env!("CARGO_BIN_EXE_shoes"));
+            command
                 .args([mode, "-t", "1"])
                 .arg(&path)
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
+                .stderr(std::process::Stdio::piped());
+            // Non-interactive shells and runners (e.g., nohup) may ignore SIGHUP/SIGINT;
+            // reset inherited dispositions and masks so the test observes shoes' own behavior.
+            unsafe {
+                command.pre_exec(|| {
+                    let mut empty: libc::sigset_t = std::mem::zeroed();
+                    if libc::sigemptyset(&mut empty) != 0
+                        || libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                        if libc::signal(sig, libc::SIG_DFL) == libc::SIG_ERR {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            let child = command.spawn().unwrap();
             let mut process = super::Process::from_child(child);
             process.wait_for("Starting dry run.").await;
             // Opening the writer proves validation reached the blocking configuration read.
