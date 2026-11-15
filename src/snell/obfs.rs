@@ -196,13 +196,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for HttpObfsStream<S> {
                         let payload_start = pos + 4;
                         let remaining = staging[payload_start..].to_vec();
                         this.read_state = HttpReadState::Passthrough;
-                        if !remaining.is_empty() {
-                            let to_read = remaining.len().min(buf.remaining());
-                            buf.put_slice(&remaining[..to_read]);
-                            if to_read < remaining.len() {
-                                this.read_buffer = remaining;
-                                this.read_buffer_offset = to_read;
-                            }
+                        // Header-only read: an empty return would read as EOF.
+                        if remaining.is_empty() {
+                            continue;
+                        }
+                        let to_read = remaining.len().min(buf.remaining());
+                        buf.put_slice(&remaining[..to_read]);
+                        if to_read < remaining.len() {
+                            this.read_buffer = remaining;
+                            this.read_buffer_offset = to_read;
                         }
                         return Poll::Ready(Ok(()));
                     }
@@ -787,6 +789,26 @@ mod tests {
             collected.extend_from_slice(&chunk[..n]);
         }
         assert_eq!(collected, b"abcdefghij");
+    }
+
+    /// sing-box writes the 101 header and the first payload separately.
+    #[tokio::test]
+    async fn http_obfs_header_without_payload_is_not_eof() {
+        let (client_raw, mut server_mock) = tokio::io::duplex(2048);
+        let mut client = HttpObfsStream::new_client(client_raw, None, None);
+        server_mock
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n")
+            .await
+            .unwrap();
+        let late = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            server_mock.write_all(b"salt").await.unwrap();
+            server_mock
+        });
+        let mut buf = [0u8; 16];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"salt");
+        drop(late.await.unwrap());
     }
 
     fn make_test_tls_server_hello(payload: &[u8]) -> Vec<u8> {
