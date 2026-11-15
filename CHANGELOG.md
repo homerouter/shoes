@@ -2,7 +2,25 @@
 
 ## Unreleased
 
+## v0.4.2
+
+- Fixed Snell HTTP obfs connections occasionally failing at startup with `snell v4 EOF before salt` when the server sent the `101 Switching Protocols` header and the first payload in separate writes (as sing-box does); a header-only read is no longer reported as EOF.
+- Recovered managed Linux TUN forwarding and DNS transports after network changes without releasing capture ownership or losing fake-IP mappings and explicit proxy selections (upstream #276).
 - Refreshed the BLAKE3 fork to current upstream hexadecimal-formatting hardening while preserving arbitrary-byte VLESS Encryption derivation, hash/KDF/XOF output and wire compatibility. The package version remains 1.8.7; the new upstream change is unreleased.
+- Fixed Rust 1.100 Clippy and isolated privileged WireGuard test binary lookup (upstream #292).
+
+## v0.4.1
+
+- Bounded memory and stale sockets on small Linux VPS deployments:
+  - Disabled process-level Transparent Huge Pages in `.init_array` via `prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)` on Linux.
+  - Exported small-VPS jemalloc defaults (`background_thread:true,narenas:2,dirty_decay_ms:1000,thp:never`), overridable via `_RJEM_MALLOC_CONF`.
+  - Enabled `TCP_USER_TIMEOUT` (`120` seconds) on keepalive-enabled inbound and outbound TCP sockets on Linux and Android.
+  - Added Linux CI verification for `_rjem_malloc_conf` options and `THP_enabled: 0`.
+- Set Snell Connect v2 idle reuse timeout (`REUSE_IDLE_TIMEOUT`) to `190` seconds so servers retire idle pooled connections only after `SnellClientPool::POOL_MAX_AGE`.
+- Added `examples/small_vps_snell.yaml` and documented Linux runtime defaults and tuning in `README.md` and the documentation site.
+
+## v0.4.0
+
 - Added Snell obfuscation (`simple-obfs`) matching Surge 6.4.4 and sing-snell:
   - Server-side HTTP simple-obfs on Snell v5 server (`obfs_mode: "http"`, default `"none"`).
     TLS obfs is rejected during configuration validation with a suggestion to use ShadowTLS.
