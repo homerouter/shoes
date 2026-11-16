@@ -78,7 +78,11 @@ jobs:
 
           zero = "0" * 40
           base = os.environ.get("PR_BASE") if event == "pull_request" else os.environ.get("PUSH_BEFORE", "")
-          if not base or base == zero or subprocess.run(["git", "cat-file", "-e", f"{base}^{{commit}}"], capture_output=True).returncode != 0:
+          if base and base != zero and subprocess.run(["git", "cat-file", "-e", f"{base}^{{commit}}"], capture_output=True).returncode != 0:
+              # Force-push: the old tip is gone, so HEAD^ (often the version bump) would hide every rewritten change.
+              write_out(True)
+              raise SystemExit(0)
+          if not base or base == zero:
               base = "HEAD^"
 
           if subprocess.run(["git", "cat-file", "-e", f"{base}^{{commit}}"], capture_output=True).returncode != 0:
