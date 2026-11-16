@@ -88,6 +88,45 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
 
+      - name: Require passing CI for the release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+
+          sha = os.environ["GITHUB_SHA"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          version_files = {"CHANGELOG.md", "Cargo.toml", "Cargo.lock", "debian/changelog"}
+
+          def git(*args):
+              return subprocess.run(["git", *args], capture_output=True, text=True)
+
+          def api(path):
+              return json.loads(subprocess.check_output(["gh", "api", path], text=True))
+
+          # CI skips a bump-only push, so its tests ran on the commit before it.
+          candidates = [sha]
+          git("fetch", "--quiet", "--depth=2", "origin", sha)
+          changed = git("diff", "--name-only", f"{sha}^", sha)
+          if changed.returncode == 0:
+              files = set(changed.stdout.split())
+              hunks = git("diff", "-U0", f"{sha}^", sha, "--", "Cargo.toml", "Cargo.lock").stdout.splitlines()
+              edits = [l for l in hunks if l[:1] in "+-" and not l.startswith(("+++", "---"))]
+              if files and files <= version_files and all(re.match(r'^[+-]version = "', l) for l in edits):
+                  candidates.append(git("rev-parse", f"{sha}^").stdout.strip())
+
+          for commit in candidates:
+              runs = api(f"repos/{repo}/actions/workflows/ci.yml/runs?head_sha={commit}&status=completed&per_page=20")
+              for run in runs["workflow_runs"]:
+                  jobs = api(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")["jobs"]
+                  tested = [j for j in jobs if j["name"] != "Detect code changes"]
+                  if tested and all(j["conclusion"] == "success" for j in tested):
+                      print(f"CI passed for {commit}: {run['html_url']} ({len(tested)} jobs)")
+                      raise SystemExit(0)
+          raise SystemExit(f"::error::No CI run with every job passing for {' or '.join(candidates)}; run CI before releasing.")
+          PY
+
   build:
     name: Build deb for ${{ matrix.deb_arch }} (${{ matrix.target }})
     needs: [version]
