@@ -218,6 +218,89 @@ jobs:
           sudo -E env PATH="$PATH" cargo test --lib --locked root_config_check_accepts_service_owned_state -- --ignored
           sudo -E env PATH="$PATH" cargo test --lib --locked public_device_factory_preserves_unframed_packets -- --ignored
 
+  xhttp:
+    name: XHTTP interop
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # Same pins as upstream cfal/shoes test.yml; Xray a4a3dff is v26.10.31.
+      XRAY_COMMIT: a4a3dff5b20c2faae567b742c172c7b95e75c083
+      MIHOMO_ALPHA_COMMIT: 94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: xhttp
+          cache-targets: "true"
+
+      - name: Restore pinned XHTTP peers
+        id: xhttp-peers
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cache/shoes-xray/xray
+            ~/.cache/shoes-mihomo/mihomo
+          key: ${{ runner.os }}-xhttp-peers-go1.27.4-${{ env.XRAY_COMMIT }}-${{ env.MIHOMO_ALPHA_COMMIT }}
+
+      - name: Install Go for XHTTP peers
+        if: steps.xhttp-peers.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+          cache: false
+
+      - name: Build pinned Xray test peer
+        if: steps.xhttp-peers.outputs.cache-hit != 'true'
+        run: |
+          source="$HOME/.cache/shoes-xray"
+          git clone --filter=blob:none --no-checkout https://github.com/XTLS/Xray-core.git "$source"
+          git -C "$source" checkout --detach "$XRAY_COMMIT"
+          test "$(git -C "$source" rev-parse HEAD)" = "$XRAY_COMMIT"
+          cd "$source"
+          go build -o "$source/xray" ./main
+
+      - name: Build pinned Mihomo Alpha test peer
+        if: steps.xhttp-peers.outputs.cache-hit != 'true'
+        run: |
+          source="$HOME/.cache/shoes-mihomo"
+          git clone --filter=blob:none --no-checkout https://github.com/MetaCubeX/mihomo.git "$source"
+          git -C "$source" checkout --detach "$MIHOMO_ALPHA_COMMIT"
+          test "$(git -C "$source" rev-parse HEAD)" = "$MIHOMO_ALPHA_COMMIT"
+          cd "$source"
+          CGO_ENABLED=0 go build \
+            -ldflags "-X github.com/metacubex/mihomo/constant.Version=alpha-${MIHOMO_ALPHA_COMMIT:0:8}" \
+            -o "$source/mihomo" .
+
+      - name: Save pinned XHTTP peers
+        if: steps.xhttp-peers.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cache/shoes-xray/xray
+            ~/.cache/shoes-mihomo/mihomo
+          key: ${{ steps.xhttp-peers.outputs.cache-primary-key }}
+
+      - name: Select XHTTP peers
+        run: |
+          echo "SHOES_TEST_XRAY_BIN=$HOME/.cache/shoes-xray/xray" >> "$GITHUB_ENV"
+          echo "SHOES_TEST_MIHOMO_BIN=$HOME/.cache/shoes-mihomo/mihomo" >> "$GITHUB_ENV"
+          "$HOME/.cache/shoes-xray/xray" version
+          "$HOME/.cache/shoes-mihomo/mihomo" -v
+
+      - name: Run XHTTP interop tests
+        env:
+          RUST_LOG: warn
+        run: |
+          .github/require-tests.sh cargo test --locked --features integration-tests \
+            --test xhttp_interop -- --test-threads=1
+
   build:
     name: Build ${{ matrix.target }}
     needs: [detect, test]
