@@ -120,7 +120,8 @@ jobs:
               runs = api(f"repos/{repo}/actions/workflows/ci.yml/runs?head_sha={commit}&status=completed&per_page=20")
               for run in runs["workflow_runs"]:
                   jobs = api(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")["jobs"]
-                  tested = [j for j in jobs if j["name"] != "Detect code changes"]
+                  # Release builds its own packages; CI skips binaries for test-only changes.
+                  tested = [j for j in jobs if j["name"] != "Detect code changes" and not j["name"].startswith("Build ")]
                   if tested and all(j["conclusion"] == "success" for j in tested):
                       print(f"CI passed for {commit}: {run['html_url']} ({len(tested)} jobs)")
                       raise SystemExit(0)
