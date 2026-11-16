@@ -976,6 +976,61 @@ async fn client_matching_headers(peer: Peer) -> fixture::Result {
     Ok(())
 }
 
+/// Xray `downloadSettings` sends the download over its own connection; the shoes
+/// listener pairs the halves by session ID, as an Xray inbound does.
+#[tokio::test]
+async fn xray_client_download_settings_split() -> fixture::Result {
+    let echo = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
+    let target: SocketAddr = ([127, 0, 0, 1], echo.local_addr().port()).into();
+    let mut fixture = Fixture::new(Peer::Xray).await?;
+    fixture.server_auto_version = true;
+    // A different download ALPN forces a separate carrier and HTTP version.
+    for (version, mode, download_alpn) in [
+        ("h2", "packet-up", Some("http/1.1")),
+        ("h2", "stream-up", Some("http/1.1")),
+        ("h2", "auto", Some("http/1.1")),
+        ("h1", "packet-up", Some("h2")),
+        ("h1", "stream-up", Some("h2")),
+        ("h3", "packet-up", None),
+        ("h3", "stream-up", None),
+        ("reality", "auto", None),
+    ] {
+        eprintln!("XHTTP downloadSettings: {version} {mode} download={download_alpn:?}");
+        let pair = fixture
+            .start_with_client_patch(
+                fixture::Case {
+                    peer: Peer::Xray,
+                    shoes_client: false,
+                    protocol: "vless",
+                    version,
+                    mode,
+                },
+                move |client| {
+                    let outbound = &mut client["outbounds"][0];
+                    let mut download = outbound["streamSettings"].clone();
+                    download["address"] = json!("127.0.0.1");
+                    download["port"] = outbound["settings"]["vnext"][0]["port"].clone();
+                    if let Some(alpn) = download_alpn {
+                        download["tlsSettings"]["alpn"] = json!([alpn]);
+                    }
+                    outbound["streamSettings"]["xhttpSettings"]["extra"]["downloadSettings"] =
+                        download;
+                },
+            )
+            .await?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::try_join!(
+                exchange(pair.socks, target, 0),
+                exchange(pair.socks, target, 1),
+            )
+        })
+        .await
+        .map_err(|_| format!("{version} {mode}: timed out"))?
+        .map_err(|error| format!("{version} {mode}: {error}"))?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn shoes_client_xray_server_all_modes_and_versions() -> Result<(), Box<dyn std::error::Error>>
 {
