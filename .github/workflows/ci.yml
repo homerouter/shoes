@@ -117,8 +117,8 @@ jobs:
           write_out(False)
           PY
 
-  test:
-    name: Test
+  unit:
+    name: Unit tests
     needs: [detect]
     if: needs.detect.outputs.run == 'true'
     runs-on: ubuntu-24.04
@@ -132,7 +132,34 @@ jobs:
       - name: Setup cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: test
+          key: unit
+          cache-targets: "true"
+
+      - name: Run Snell unit tests
+        run: |
+          .github/require-tests.sh cargo test --lib --locked snell
+
+      - name: Run remaining unit & process contract tests
+        run: |
+          cargo test --lib --locked -- --skip snell
+          cargo test --test process_contract --locked
+
+  singbox:
+    name: sing-box interop
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: singbox
           cache-targets: "true"
 
       - name: Cache sing-box binary
@@ -165,6 +192,35 @@ jobs:
           sudo chmod +x /usr/local/bin/sing-box
           /usr/local/bin/sing-box version
 
+      - name: Run sing-box integration tests
+        run: |
+          cargo test --test integration --features="integration-tests" httpupgrade_singbox
+          cargo test --test integration --features="integration-tests" grpc_singbox
+          cargo test --test integration --features="integration-tests" h2mux_singbox
+
+      - name: Run sing-box WireGuard interop tests
+        run: |
+          SHOES_TEST_SING_BOX_BIN=/usr/local/bin/sing-box cargo test --test optional_peer --features optional-peer-tests wireguard::wireguard_singbox_both_roles -- --ignored
+          SHOES_TEST_SING_BOX_BIN=/usr/local/bin/sing-box cargo test --test optional_peer --features optional-peer-tests wireguard::wireguard_singbox_lazy -- --ignored
+
+  snell:
+    name: Snell interop
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: snell
+          cache-targets: "true"
+
       - name: Cache sing-box Snell fork binary
         id: cache-singbox-snell
         uses: actions/cache@v6
@@ -189,29 +245,27 @@ jobs:
           sudo mv "$RUNNER_TEMP/sing-box-snell-bin" /usr/local/bin/sing-box-snell
           /usr/local/bin/sing-box-snell version
 
-      - name: Run Snell unit tests
-        run: |
-          .github/require-tests.sh cargo test --lib --locked snell
-
-      - name: Run remaining unit & process contract tests
-        run: |
-          cargo test --lib --locked -- --skip snell
-          cargo test --test process_contract --locked
-
-      - name: Run sing-box integration tests
-        run: |
-          cargo test --test integration --features="integration-tests" httpupgrade_singbox
-          cargo test --test integration --features="integration-tests" grpc_singbox
-          cargo test --test integration --features="integration-tests" h2mux_singbox
-
-      - name: Run sing-box WireGuard interop tests
-        run: |
-          SHOES_TEST_SING_BOX_BIN=/usr/local/bin/sing-box cargo test --test optional_peer --features optional-peer-tests wireguard::wireguard_singbox_both_roles -- --ignored
-          SHOES_TEST_SING_BOX_BIN=/usr/local/bin/sing-box cargo test --test optional_peer --features optional-peer-tests wireguard::wireguard_singbox_lazy -- --ignored
-
       - name: Run sing-box Snell interop tests
         run: |
           SHOES_TEST_SING_BOX_SNELL_BIN=/usr/local/bin/sing-box-snell .github/require-tests.sh cargo test --test optional_peer --features optional-peer-tests snell_singbox:: -- --ignored --test-threads=1
+
+  privileged:
+    name: Privileged tests
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: privileged
+          cache-targets: "true"
 
       - name: Run privileged tests
         run: |
@@ -303,8 +357,9 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
-    needs: [detect, test]
-    if: needs.detect.outputs.run == 'true' && needs.test.result == 'success'
+    # Build only after every test job passes.
+    needs: [detect, unit, singbox, snell, xhttp, privileged]
+    if: needs.detect.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
