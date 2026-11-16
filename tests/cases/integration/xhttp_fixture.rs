@@ -114,6 +114,8 @@ pub struct Fixture {
     pub server_packet_timeout_secs: Option<u64>,
     pub h2_window_bytes: Option<usize>,
     pub matching_headers: Option<Value>,
+    /// Leave the server on `http_version: auto`, as a real deployment would.
+    pub server_auto_version: bool,
     pub pressure: bool,
     cert: PathBuf,
     key: PathBuf,
@@ -269,6 +271,7 @@ impl Fixture {
             server_packet_timeout_secs: None,
             h2_window_bytes: None,
             matching_headers: None,
+            server_auto_version: false,
             pressure: false,
             cert,
             key,
@@ -300,6 +303,9 @@ impl Fixture {
         }
         if !client && let Some(timeout) = self.server_packet_timeout_secs {
             xhttp["limits"]["packet_timeout_secs"] = json!(timeout);
+        }
+        if !client && self.server_auto_version {
+            xhttp["http_version"] = json!("auto");
         }
         if !client && let Some(headers) = &self.matching_headers {
             xhttp["matching_headers"] = headers.clone();
