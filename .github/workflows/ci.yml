@@ -36,6 +36,20 @@ env:
   CARGO_TERM_COLOR: always
   CROSS_VERSION: 0.2.5
   SHOES_BUILD_REVISION: ${{ github.sha }}
+  RUST_BACKTRACE: 1
+  # Test peer pins, kept in step with upstream cfal/shoes test.yml.
+  SING_BOX_VERSION: 1.14.1
+  SING_BOX_SHA256: 12cb2816b52febb356f6a885b740cc8758c3f30b8ae0ca8edba80f0d2d35343f
+  ANYTLS_SING_BOX_VERSION: 1.15.0-alpha.13
+  ANYTLS_SING_BOX_SHA256: bfc39f643a5ecc1b702c5723ff662e61dde813f12b3af0d0cfce4f629ff74047
+  MIHOMO_VERSION: 1.19.31
+  MIHOMO_SHA256: 04cf9f09671704f839ddbee2e93069dc831a4123a75281e725d1d96ab9ac1afc
+  XRAY_VERSION: 26.10.31
+  XRAY_SHA256: e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214
+  SSSERVER_VERSION: 1.25.0
+  SSSERVER_SHA256: 874f817fcf3e6d7681ec715a1c13c686c6eaae936524d102639b38364f3966ae
+  NAIVE_CADDY_VERSION: 2.11.7-naive
+  NAIVE_CADDY_SHA256: ac97057c925bb098eb575e7b0cb8bd547d4c5f845b09a3dedfbe34444aa7ae88
 
 defaults:
   run:
@@ -126,7 +140,7 @@ jobs:
     needs: [detect]
     if: needs.detect.outputs.run == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -143,13 +157,50 @@ jobs:
         run: |
           .github/require-tests.sh cargo test --lib --locked snell
 
-      - name: Run remaining unit & process contract tests
+      - name: Run local tests
+        run: cargo test --workspace --locked --lib --bins
+
+      - name: Check resolved configuration type contracts
+        run: .github/require-tests.sh cargo test -p shoes --locked --doc config::resolved
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+          cache: false
+
+      - name: Build pinned AnyTLS reference peer
+        working-directory: tests/fixtures/anytls-peer
+        run: GOMAXPROCS=1 go build -mod=readonly -p 1 -o "$RUNNER_TEMP/shoes-anytls-peer" .
+
+      - name: Test AnyTLS pooling against the reference peer
+        env:
+          ANYTLS_REFERENCE_PEER: ${{ runner.temp }}/shoes-anytls-peer
+          CARGO_BUILD_JOBS: 1
+        run: >-
+          .github/require-tests.sh cargo test -p shoes --locked --lib
+          reference_peer_tcp_uot_and_concurrent_session_reuse -- --ignored
+
+      - name: Run process contract tests
+        run: cargo test -p shoes --locked --test process_contract -- --test-threads=1
+
+      - name: Run rule allocation, retention and matcher tests
         run: |
-          cargo test --lib --locked -- --skip snell
-          cargo test --test process_contract --locked
+          cargo test -p shoes --locked --test rule_allocation
+          cargo test -p shoes --locked --test retention_allocation --test matcher_invariants -- --nocapture
+
+      - name: Run bounded rule property corpus
+        env:
+          CARGO_BUILD_JOBS: 1
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: timeout --kill-after=5s 30s
+        run: >-
+          .github/require-tests.sh timeout --kill-after=10s 10m cargo test -p shoes --locked
+          --test rule_properties -- --test-threads=1
+
+      - name: Run host FFI tests
+        run: cargo test -p shoes --locked --lib --features ffi -- --test-threads=1
 
   singbox:
-    name: sing-box interop
+    name: sing-box WireGuard interop
     needs: [detect]
     if: needs.detect.outputs.run == 'true'
     runs-on: ubuntu-24.04
@@ -195,12 +246,6 @@ jobs:
           sudo mv "$RUNNER_TEMP/singbox/sing-box" /usr/local/bin/sing-box
           sudo chmod +x /usr/local/bin/sing-box
           /usr/local/bin/sing-box version
-
-      - name: Run sing-box integration tests
-        run: |
-          cargo test --test integration --features="integration-tests" httpupgrade_singbox
-          cargo test --test integration --features="integration-tests" grpc_singbox
-          cargo test --test integration --features="integration-tests" h2mux_singbox
 
       - name: Run sing-box WireGuard interop tests
         run: |
@@ -359,10 +404,468 @@ jobs:
           .github/require-tests.sh cargo test --locked --features integration-tests \
             --test xhttp_interop -- --test-threads=1
 
+  clippy:
+    name: Clippy
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  msrv:
+    name: Minimum Rust (Cargo.toml rust-version)
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read rust-version
+        id: msrv
+        run: echo "version=$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))["package"]["rust-version"])')" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+
+      - name: Check minimum supported Rust
+        run: cargo check --workspace --all-targets --all-features --locked
+
+  integration:
+    name: Integration (local protocols)
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: integration
+          cache-targets: "true"
+
+      - name: Install sing-box test peer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="$RUNNER_TEMP/sing-box.tar.gz"
+          gh release download "v${SING_BOX_VERSION}" --repo SagerNet/sing-box \
+            --pattern "sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz" --output "$archive"
+          echo "${SING_BOX_SHA256}  ${archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          binary="$RUNNER_TEMP/sing-box-${SING_BOX_VERSION}-linux-amd64/sing-box"
+          chmod +x "$binary"
+          echo "SHOES_TEST_SING_BOX_BIN=$binary" >> "$GITHUB_ENV"
+
+      - name: Run sing-box mux lifecycle tests
+        run: >-
+          .github/require-tests.sh cargo test -p shoes --locked --lib --features integration-tests
+          h2mux::h2mux_server_session::singbox_interop_tests:: -- --test-threads=1
+
+      - name: Run bounded XUDP payload integrity regression
+        run: >-
+          .github/require-tests.sh cargo test -p shoes --locked --features stress-tests
+          --test stress vless_xudp_long_lived::test_content_integrity_varying_sizes
+          -- --exact --test-threads=1
+
+      - name: Run integration tests
+        env:
+          RUST_LOG: warn
+        run: >-
+          .github/require-tests.sh cargo test -p shoes --locked --features integration-tests
+          --test integration -- --test-threads=1
+
+  optional-peers:
+    name: Optional peer interop
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: optional-peers
+          cache-targets: "true"
+
+      - name: Install sing-box test peer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="$RUNNER_TEMP/sing-box.tar.gz"
+          gh release download "v${SING_BOX_VERSION}" --repo SagerNet/sing-box \
+            --pattern "sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz" --output "$archive"
+          echo "${SING_BOX_SHA256}  ${archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          binary="$RUNNER_TEMP/sing-box-${SING_BOX_VERSION}-linux-amd64/sing-box"
+          chmod +x "$binary"
+          echo "SHOES_TEST_SING_BOX_BIN=$binary" >> "$GITHUB_ENV"
+
+      - name: Install sing-box AnyTLS padding test peer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="$RUNNER_TEMP/sing-box-anytls.tar.gz"
+          gh release download "v${ANYTLS_SING_BOX_VERSION}" --repo SagerNet/sing-box \
+            --pattern "sing-box-${ANYTLS_SING_BOX_VERSION}-linux-amd64.tar.gz" --output "$archive"
+          echo "${ANYTLS_SING_BOX_SHA256}  ${archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          binary="$RUNNER_TEMP/sing-box-${ANYTLS_SING_BOX_VERSION}-linux-amd64/sing-box"
+          chmod +x "$binary"
+          echo "SHOES_TEST_ANYTLS_SING_BOX_BIN=$binary" >> "$GITHUB_ENV"
+
+      - name: Install Mihomo test peer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="$RUNNER_TEMP/mihomo.gz"
+          binary="$RUNNER_TEMP/mihomo"
+          gh release download "v${MIHOMO_VERSION}" --repo MetaCubeX/mihomo \
+            --pattern "mihomo-linux-amd64-compatible-v${MIHOMO_VERSION}.gz" --output "$archive"
+          echo "${MIHOMO_SHA256}  ${archive}" | sha256sum --check --strict
+          gzip --decompress --stdout "$archive" > "$binary"
+          chmod +x "$binary"
+          echo "SHOES_TEST_MIHOMO_BIN=$binary" >> "$GITHUB_ENV"
+
+      - name: Install Xray test peer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="$RUNNER_TEMP/xray.zip"
+          gh release download "v${XRAY_VERSION}" --repo XTLS/Xray-core \
+            --pattern Xray-linux-64.zip --output "$archive"
+          echo "${XRAY_SHA256}  ${archive}" | sha256sum --check --strict
+          unzip "$archive" xray -d "$RUNNER_TEMP/xray-peer"
+          binary="$RUNNER_TEMP/xray-peer/xray"
+          chmod +x "$binary"
+          echo "SHOES_TEST_XRAY_BIN=$binary" >> "$GITHUB_ENV"
+
+      - name: Install shadowsocks-rust test peer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="$RUNNER_TEMP/shadowsocks-rust.tar.xz"
+          gh release download "v${SSSERVER_VERSION}" --repo shadowsocks/shadowsocks-rust \
+            --pattern "shadowsocks-v${SSSERVER_VERSION}.x86_64-unknown-linux-gnu.tar.xz" --output "$archive"
+          echo "${SSSERVER_SHA256}  ${archive}" | sha256sum --check --strict
+          tar --extract --xz --file "$archive" --directory "$RUNNER_TEMP" ssserver
+          binary="$RUNNER_TEMP/ssserver"
+          chmod +x "$binary"
+          echo "SHOES_TEST_SSSERVER_BIN=$binary" >> "$GITHUB_ENV"
+
+      - name: Install native Naive Caddy test peer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="$RUNNER_TEMP/caddy-forwardproxy-naive.tar.xz"
+          gh release download "v${NAIVE_CADDY_VERSION}" --repo klzgrad/forwardproxy \
+            --pattern caddy-forwardproxy-naive.tar.xz --output "$archive"
+          echo "${NAIVE_CADDY_SHA256}  ${archive}" | sha256sum --check --strict
+          tar --extract --xz --file "$archive" --directory "$RUNNER_TEMP"
+          binary="$RUNNER_TEMP/caddy-forwardproxy-naive/caddy"
+          chmod +x "$binary"
+          echo "SHOES_TEST_NAIVE_CADDY_BIN=$binary" >> "$GITHUB_ENV"
+
+      - name: Run native QUIC client interoperability tests
+        run: >-
+          .github/require-tests.sh cargo test -p shoes --locked --lib --features optional-peer-tests
+          quic_client::interop:: -- --test-threads=1
+
+      - name: Install WebSocket early-data test peer
+        id: ws_peer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WS_SING_BOX_VERSION: 1.14.3
+          WS_SING_BOX_SHA256: e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee
+        run: |
+          # Older sing-box clients discard response bytes read ahead during the upgrade.
+          archive="$RUNNER_TEMP/ws-sing-box.tar.gz"
+          gh release download "v${WS_SING_BOX_VERSION}" --repo SagerNet/sing-box \
+            --pattern "sing-box-${WS_SING_BOX_VERSION}-linux-amd64.tar.gz" --output "$archive"
+          echo "${WS_SING_BOX_SHA256}  ${archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          echo "binary=$RUNNER_TEMP/sing-box-${WS_SING_BOX_VERSION}-linux-amd64/sing-box" >> "$GITHUB_OUTPUT"
+
+      - name: Run WebSocket early-data interoperability tests
+        env:
+          CARGO_BUILD_JOBS: 1
+          RUST_LOG: warn
+          SHOES_TEST_SING_BOX_BIN: ${{ steps.ws_peer.outputs.binary }}
+        run: |
+          "$SHOES_TEST_SING_BOX_BIN" version
+          .github/require-tests.sh cargo test -p shoes --locked --features ffi,optional-peer-tests \
+            --test ws_early_data -- --test-threads=1
+
+      - name: Run optional peer interoperability tests
+        env:
+          RUST_LOG: warn
+        run: >-
+          .github/require-tests.sh cargo test -p shoes --locked --features optional-peer-tests
+          --test optional_peer -- --test-threads=1
+
+  reality:
+    name: REALITY interop (Xray)
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 1
+      GOMAXPROCS: 1
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: reality
+          cache-targets: "true"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+          cache: false
+
+      - uses: actions/checkout@v7
+        with:
+          repository: XTLS/Xray-core
+          ref: a4a3dff5b20c2faae567b742c172c7b95e75c083
+          path: reality-peer
+
+      - name: Build pinned Xray
+        working-directory: reality-peer
+        run: go build -p 1 -o "$RUNNER_TEMP/xray" ./main
+
+      - name: Run local REALITY peer matrix
+        env:
+          XRAY_BINARY: ${{ runner.temp }}/xray
+        run: >-
+          .github/require-tests.sh cargo test --locked --features optional-peer-tests
+          --test reality_interop -- --test-threads=1
+
+  vless-encryption:
+    name: VLESS encryption interop
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      GOMAXPROCS: 1
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: vless-encryption
+          cache-targets: "true"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+          cache: false
+
+      - uses: actions/checkout@v7
+        with:
+          repository: XTLS/Xray-core
+          ref: a4a3dff5b20c2faae567b742c172c7b95e75c083
+          path: peers/xray
+
+      - uses: actions/checkout@v7
+        with:
+          repository: MetaCubeX/mihomo
+          ref: 94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f
+          path: peers/mihomo
+
+      - uses: actions/checkout@v7
+        with:
+          repository: SagerNet/sing-box
+          ref: dfb80349bf5779ec0a3f834c9ec2794345bff8f0
+          path: peers/sing-box
+
+      - uses: actions/checkout@v7
+        with:
+          repository: cfal/shoes
+          ref: 001495285ac16e2121a539682d1a1f6a7c07c5ed
+          path: peers/shoes-baseline
+
+      - name: Build frozen Shoes baseline
+        working-directory: peers/shoes-baseline
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo build --locked --bin shoes
+          cp "$CARGO_TARGET_DIR/debug/shoes" "$RUNNER_TEMP/shoes-baseline"
+
+      - name: Build pinned Xray
+        working-directory: peers/xray
+        run: go build -p 1 -o "$RUNNER_TEMP/xray" ./main
+
+      - name: Build pinned Mihomo
+        working-directory: peers/mihomo
+        run: go build -p 1 -ldflags '-X github.com/metacubex/mihomo/constant.Version=alpha-94b13aed' -o "$RUNNER_TEMP/mihomo" .
+
+      - name: Build legacy sing-box peer
+        working-directory: peers/sing-box
+        run: go build -p 1 -tags with_utls,with_quic -o "$RUNNER_TEMP/sing-box" ./cmd/sing-box
+
+      - name: Native VLESS and Sudoku TCP peer matrix
+        env:
+          XRAY_BINARY: ${{ runner.temp }}/xray
+          MIHOMO_BINARY: ${{ runner.temp }}/mihomo
+          SHOES_TEST_SING_BOX_BIN: ${{ runner.temp }}/sing-box
+        run: .github/require-tests.sh cargo test --locked --features optional-peer-tests --test vless_encryption_interop -- --test-threads=1
+
+      - name: Sudoku cross-language wire vectors
+        run: |
+          .github/require-tests.sh cargo test --locked --lib sudoku_mask:: -- --test-threads=1
+          SUDOKU_RUST_VECTORS="$RUNNER_TEMP/sudoku-rust.json" .github/require-tests.sh cargo test --locked --lib export_rust_wire_samples -- --ignored
+          cd peers/xray
+          go run -p 1 ../../tests/fixtures/sudoku/xray.go -verify "$RUNNER_TEMP/sudoku-rust.json"
+
+      - name: Cross-language cryptography vectors
+        run: |
+          .github/require-tests.sh cargo test --locked --lib vless::encryption:: -- --test-threads=1
+          VLESS_RUST_VECTORS="$RUNNER_TEMP/vless-rust.json" .github/require-tests.sh cargo test --locked --lib export_rust_encapsulations -- --ignored
+          cd peers/xray
+          go run -p 1 ../../tests/fixtures/vless_encryption/generate.go --verify-rust "$RUNNER_TEMP/vless-rust.json"
+
+      - name: Bounded native VLESS stress
+        run: .github/require-tests.sh cargo test --locked --features stress-tests --test stress vless_encryption -- --test-threads=1
+
+      - name: Legacy baseline comparison
+        env:
+          XRAY_BINARY: ${{ runner.temp }}/xray
+          SHOES_BASELINE_BINARY: ${{ runner.temp }}/shoes-baseline
+        run: .github/require-tests.sh cargo test --locked --features optional-peer-tests --test vless_encryption_interop legacy_baseline_matches_backpressure_and_half_close -- --ignored --test-threads=1
+
+      - name: Legacy VLESS regression
+        env:
+          SHOES_TEST_SING_BOX_BIN: ${{ runner.temp }}/sing-box
+        run: .github/require-tests.sh cargo test --locked --features integration-tests --test integration vless -- --test-threads=1
+
+  kernel-tun:
+    name: Linux kernel TUN
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: kernel-tun
+          cache-targets: "true"
+
+      - name: Check kernel test prerequisites
+        run: |
+          sudo -n true
+          sudo apt-get update
+          sudo apt-get install -y nftables
+          test -c /dev/net/tun
+          command -v ip
+          ip -j -6 address show dev lo | jq --exit-status 'any(.[].addr_info[]; .local == "::1")'
+
+      - name: Run kernel TUN tests
+        run: >-
+          .github/require-tests.sh cargo test -p shoes --locked --features privileged-tests
+          --test privileged tun_kernel:: -- --test-threads=1
+
+      - name: Run managed capture and recovery tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/resolved"
+          (cd "$RUNNER_TEMP/resolved" && apt-get download systemd-resolved)
+          dpkg-deb --extract "$RUNNER_TEMP"/resolved/*.deb "$RUNNER_TEMP/resolved/root"
+          SHOES_RESOLVED_ROOT="$RUNNER_TEMP/resolved/root/usr" .github/require-tests.sh cargo test -p shoes --locked --lib \
+            desktop::linux::tests::managed_kernel_capture_and_cleanup \
+            -- --ignored --nocapture --test-threads=1
+          .github/require-tests.sh cargo test -p shoes --locked --test process_contract \
+            config_tooling::check_dry_run_does_not_dispatch_cleanup -- --ignored --nocapture
+
+  kernel-wireguard:
+    name: Kernel WireGuard
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: kernel-wireguard
+          cache-targets: "true"
+
+      - name: Install kernel WireGuard test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends wireguard-tools iproute2
+          uname -r
+          wg --version
+
+      - name: Run kernel WireGuard tests
+        env:
+          RUST_LOG: warn
+        run: >-
+          .github/require-tests.sh cargo test -p shoes --locked --features privileged-tests
+          --test privileged wireguard_kernel:: -- --test-threads=1
+
   build:
     name: Build ${{ matrix.target }}
     # Build only after every test job passes.
-    needs: [detect, unit, singbox, snell, xhttp, privileged]
+    needs: [detect, unit, clippy, msrv, integration, optional-peers, singbox, snell, xhttp, reality, vless-encryption, kernel-tun, kernel-wireguard, privileged]
     if: needs.detect.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
