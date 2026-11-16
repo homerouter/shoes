@@ -62,6 +62,15 @@ while its download waits for the old reader to consume or release those bytes.
   In stream-up/auto server mode, normal download EOF allows an unclaimed streaming
   upload 30 seconds to attach; an absent upload is then reaped. Packet uploads do
   not receive this grace period.
+- Upload/download split: Xray clients may set `extra.downloadSettings` to send the
+  download over its own connection, for example through a different address, CDN,
+  TLS/REALITY settings, or HTTP version. As with an Xray inbound, the server pairs
+  the two halves by session ID, so both must reach the same shoes listener with the
+  same `path`; a TCP listener and a QUIC listener do not share sessions, even on one
+  port. Keep the server's `http_version: auto` so one TLS listener accepts both H2
+  and H1. Split needs packet-up or stream-up; Xray rejects `downloadSettings` with
+  stream-one, and `auto` becomes stream-up. The shoes client does not send split
+  downloads.
 - H1/H2 preserve selected upstream proxy chains. H3 must be the first proxy hop;
   it reuses the existing QUIC/H3 dependencies, not Hysteria2 framing.
 - Server `matching_headers` requires every configured header on every request,
@@ -231,8 +240,8 @@ while its download waits for the old reader to consume or release those bytes.
   when Go GC discards pooled connections with unread responses. Sustained uploads
   to slow destinations can therefore fail despite bounded server backpressure.
   Prefer H2/H3 or a streaming mode for these clients; disabling GC is not a production fix.
-- Advanced placement/padding obfuscation, custom session IDs, separate downloads,
-  full XMUX policy, and legacy Vision over XHTTP are not supported. Unsupported
+- Advanced placement/padding obfuscation, custom session IDs, client-side split
+  downloads, full XMUX policy, and legacy Vision over XHTTP are not supported. Unsupported
   options are rejected rather than silently ignored. Public CDN compatibility is not implied.
 - REALITY XHTTP interoperates with Xray 26.10.29 in both directions over H2,
   including all three modes and `auto`. REALITY prefers X25519MLKEM768 with
