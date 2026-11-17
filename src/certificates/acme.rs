@@ -277,22 +277,20 @@ pub(super) async fn update_acme_dns(
     subdomain: &str,
     txt: &str,
 ) -> io::Result<()> {
-    let trimmed = server_url.trim_end_matches('/');
-    let endpoint = if trimmed.ends_with("/update") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/update")
-    };
-    let url = validate_url(&endpoint)?;
-    let uri: http::Uri = endpoint
-        .parse()
-        .map_err(|_| invalid("invalid ACME-DNS endpoint URI"))?;
-    let authority = uri
-        .authority()
-        .ok_or_else(|| invalid("invalid ACME-DNS authority"))?
-        .as_str()
-        .to_owned();
-    let path_and_query = uri.path_and_query().map_or("/update", |pq| pq.as_str());
+    let mut url = validate_url(server_url)?;
+    if url.query().is_some() {
+        return Err(invalid("ACME-DNS server_url must not contain a query string"));
+    }
+    url.path_segments_mut()
+        .map_err(|()| invalid("invalid ACME-DNS server_url"))?
+        .pop_if_empty();
+    if url.path_segments().and_then(|mut s| s.next_back()) != Some("update") {
+        url.path_segments_mut()
+            .map_err(|()| invalid("invalid ACME-DNS server_url"))?
+            .push("update");
+    }
+    let authority = url[url::Position::BeforeHost..url::Position::AfterPort].to_owned();
+    let path_and_query = url.path().to_owned();
 
     let payload = serde_json::to_vec(&AcmeDnsPayload { subdomain, txt })
         .map_err(|e| io::Error::other(format!("failed to serialize ACME-DNS payload: {e}")))?;
@@ -321,17 +319,15 @@ pub(super) async fn update_acme_dns(
                 .await
                 .map_err(io::Error::other)?;
             let (parts, body) = response.into_parts();
-            let bytes = Limited::new(body, MAX_RESPONSE)
+            Limited::new(body, MAX_RESPONSE)
                 .collect()
                 .await
-                .map_err(|_| io::Error::other("ACME-DNS response failed or exceeded limit"))?
-                .to_bytes();
+                .map_err(|_| io::Error::other("ACME-DNS response failed or exceeded limit"))?;
+            // Never log the remote body; the status is enough to diagnose.
             if !parts.status.is_success() {
-                let msg = String::from_utf8_lossy(&bytes);
                 return Err(io::Error::other(format!(
-                    "ACME-DNS update returned HTTP {}: {}",
-                    parts.status,
-                    msg.trim()
+                    "ACME-DNS update returned HTTP {}",
+                    parts.status
                 )));
             }
             Ok::<_, io::Error>(())
@@ -1163,6 +1159,7 @@ impl Scheduler {
         deadline: tokio::time::Instant,
     ) -> Result<(), Failure> {
         let client = self.client(config)?;
+        let mut dns_published = false;
         let mut authorizations = order.authorizations();
         loop {
             let (authorization, response) = client
@@ -1237,28 +1234,22 @@ impl Scheduler {
                 username,
                 password,
                 subdomain,
-                propagation_delay,
+                ..
             } = &config.challenge
             {
+                // Publish every TXT value now; challenges are marked ready after one shared wait below.
                 if challenge.status == ChallengeStatus::Pending {
-                    let txt = authorization.dns_value();
                     update_acme_dns(
-                        client.tls.clone(),
+                        client_tls(None).map_err(|error| instant_acme::Error::Other(Box::new(error)))?,
                         server_url,
                         username,
-                        password,
+                        &password.0,
                         subdomain,
-                        &txt,
+                        &authorization.dns_value(),
                     )
                     .await
                     .map_err(|error| instant_acme::Error::Other(Box::new(error)))?;
-                    if let Some(delay) = *propagation_delay {
-                        if delay > 0 {
-                            tokio::time::sleep(Duration::from_secs(delay)).await;
-                        }
-                    }
-                    let ((), response) = client.perform(deadline, challenge.set_ready()).await?;
-                    Self::defer_hint(config, state, response)?;
+                    dns_published = true;
                 }
                 continue;
             }
@@ -1284,6 +1275,35 @@ impl Scheduler {
             if challenge.status == ChallengeStatus::Pending {
                 let ((), response) = client.perform(deadline, challenge.set_ready()).await?;
                 Self::defer_hint(config, state, response)?;
+            }
+        }
+        if dns_published {
+            if let ChallengeConfig::AcmeDns {
+                propagation_delay: Some(delay),
+                ..
+            } = &config.challenge
+            {
+                let wake = tokio::time::Instant::now() + Duration::from_secs(*delay);
+                tokio::time::sleep_until(wake.min(deadline)).await;
+            }
+            let mut authorizations = order.authorizations();
+            loop {
+                let (authorization, response) = client
+                    .perform(deadline, async { authorizations.next().await.transpose() })
+                    .await?;
+                let Some(mut authorization) = authorization else {
+                    break;
+                };
+                if authorization.status != AuthorizationStatus::Pending {
+                    continue;
+                }
+                Self::defer_hint(config, state, response)?;
+                if let Some(mut challenge) = authorization.challenge(ChallengeType::Dns01)
+                    && challenge.status == ChallengeStatus::Pending
+                {
+                    let ((), response) = client.perform(deadline, challenge.set_ready()).await?;
+                    Self::defer_hint(config, state, response)?;
+                }
             }
         }
         Ok(())

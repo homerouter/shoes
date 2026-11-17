@@ -2561,7 +2561,7 @@ async fn acme_dns_issuance_roundtrip() {
     config.challenge = ChallengeConfig::AcmeDns {
         server_url: mock_dns.url(),
         username: "dns_user".into(),
-        password: "dns_secret".into(),
+        password: crate::config::quic_client::Secret("dns_secret".into()),
         subdomain: "subdomain-acme-dns-test".into(),
         propagation_delay: Some(0),
     };
