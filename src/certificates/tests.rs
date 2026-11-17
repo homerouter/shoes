@@ -134,6 +134,34 @@ fn acme_dns_rejects_more_than_two_domains_and_redacts_password() {
 }
 
 #[test]
+fn wildcard_domains_require_acme_dns_and_cover_one_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let dns = "type: acme_dns, server_url: 'https://auth.example.com', username: 'user1', password: 'secret', subdomain: 'uuid-subdomain'";
+    let wildcard = |challenge: &str| {
+        managed_yaml(&state, challenge, "certificate_source: public")
+            .replace("domains: [proxy.test]", "domains: [proxy.test, '*.proxy.test']")
+    };
+    assert!(compile(&wildcard(dns)).is_ok());
+    assert!(compile(&wildcard("type: http01, listen: ['127.0.0.1:18080']")).is_err());
+    assert!(compile(&wildcard("type: tls_alpn01")).is_err());
+    for bad in ["'*.test'", "'*.*.proxy.test'", "'a.*.proxy.test'"] {
+        let yaml = managed_yaml(&state, dns, "certificate_source: public")
+            .replace("domains: [proxy.test]", &format!("domains: [{bad}]"));
+        assert!(compile(&yaml).is_err(), "unexpectedly accepted {bad}");
+    }
+    // A wildcard-only source serves one-label subdomains, not the apex.
+    let only = |sni: &str| {
+        managed_yaml(&state, dns, "certificate_source: public")
+            .replace("domains: [proxy.test]", "domains: ['*.proxy.test']")
+            .replace("      proxy.test:", &format!("      {sni}:"))
+    };
+    assert!(compile(&only("a.proxy.test")).is_ok());
+    assert!(compile(&only("proxy.test")).is_err());
+    assert!(compile(&only("a.b.proxy.test")).is_err());
+}
+
+#[test]
 fn managed_validation_rejects_invalid_acme_dns_configs() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("not-created");
