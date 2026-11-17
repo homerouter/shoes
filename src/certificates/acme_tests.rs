@@ -198,6 +198,7 @@ struct CaState {
     nonce_failure: bool,
     bad_nonces: usize,
     fail_state_sync_on: Option<&'static str>,
+    dns_records: Option<Arc<Mutex<std::collections::HashMap<String, String>>>>,
 }
 
 struct Fixture {
@@ -267,6 +268,7 @@ impl Fixture {
             nonce_failure: false,
             bad_nonces: 0,
             fail_state_sync_on: None,
+            dns_records: None,
         }));
         let fail = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
@@ -643,7 +645,7 @@ async fn handle(
 }
 
 async fn validate_challenge(state: &Arc<Mutex<CaState>>, id: usize) -> io::Result<()> {
-    let (address, kind, token, authorization) = {
+    let (address, kind, token, authorization, dns_records) = {
         let state = state.lock();
         let token = state.orders[id].token.clone();
         (
@@ -651,6 +653,7 @@ async fn validate_challenge(state: &Arc<Mutex<CaState>>, id: usize) -> io::Resul
             state.kind,
             token.clone(),
             format!("{token}.{}", thumbprint(state.jwk.as_ref().unwrap())),
+            state.dns_records.clone(),
         )
     };
     if kind == "http-01" {
@@ -668,6 +671,17 @@ async fn validate_challenge(state: &Arc<Mutex<CaState>>, id: usize) -> io::Resul
         let bytes = String::from_utf8(bytes).unwrap();
         assert!(bytes.starts_with("HTTP/1.1 200 "));
         assert_eq!(bytes.split_once("\r\n\r\n").unwrap().1, authorization);
+    } else if kind == "dns-01" {
+        let records = dns_records.expect("dns_records required for dns-01");
+        let expected_digest = B64.encode(aws_lc_rs::digest::digest(
+            &aws_lc_rs::digest::SHA256,
+            authorization.as_bytes(),
+        ));
+        let found = records.lock().values().any(|val| val == &expected_digest);
+        assert!(
+            found,
+            "expected dns-01 TXT record with digest {expected_digest} was not found in acme-dns records"
+        );
     } else {
         validate_tls_challenge(address, &authorization).await;
     }
@@ -2332,4 +2346,243 @@ fn acme_diagnostics_omit_remote_details_and_json_values() {
     assert!(!message.contains(secret));
     let error = serde_json::from_str::<u64>(&format!("\"{secret}\"")).unwrap_err();
     assert!(!failure_message(&instant_acme::Error::Json(error)).contains(secret));
+}
+
+struct MockAcmeDns {
+    address: SocketAddr,
+    records: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    auth: Arc<Mutex<Option<(String, String)>>>,
+    status_code: Arc<std::sync::atomic::AtomicU16>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MockAcmeDns {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let records = Arc::new(Mutex::new(std::collections::HashMap::<String, String>::new()));
+        let auth = Arc::new(Mutex::new(None));
+        let status_code = Arc::new(std::sync::atomic::AtomicU16::new(200));
+
+        let server_records = records.clone();
+        let server_auth = auth.clone();
+        let server_status = status_code.clone();
+
+        let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { break; };
+                        let records = server_records.clone();
+                        let auth = server_auth.clone();
+                        let status_code = server_status.clone();
+                        connections.spawn(async move {
+                            let service = hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
+                                let records = records.clone();
+                                let auth = auth.clone();
+                                let status_code = status_code.clone();
+                                async move {
+                                    let status = status_code.load(Ordering::SeqCst);
+                                    if status != 200 {
+                                        let response = http::Response::builder()
+                                            .status(status)
+                                            .body(Full::new(Bytes::from(format!("error status {status}"))))
+                                            .unwrap();
+                                        return Ok::<_, io::Error>(response);
+                                    }
+                                    if request.method() != http::Method::POST || request.uri().path() != "/update" {
+                                        let response = http::Response::builder()
+                                            .status(404)
+                                            .body(Full::new(Bytes::from("not found")))
+                                            .unwrap();
+                                        return Ok(response);
+                                    }
+                                    let user = request.headers().get("x-api-user").and_then(|v| v.to_str().ok()).unwrap_or_default();
+                                    let pass = request.headers().get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or_default();
+                                    if let Some((expected_user, expected_pass)) = auth.lock().as_ref() {
+                                        if user != expected_user || pass != expected_pass {
+                                            let response = http::Response::builder()
+                                                .status(401)
+                                                .body(Full::new(Bytes::from("unauthorized")))
+                                                .unwrap();
+                                            return Ok(response);
+                                        }
+                                    }
+                                    let body_bytes = request.into_body().collect().await.map_err(io::Error::other)?.to_bytes();
+                                    let parsed: Value = serde_json::from_slice(&body_bytes).map_err(io::Error::other)?;
+                                    let Some(subdomain) = parsed["subdomain"].as_str() else {
+                                        let response = http::Response::builder()
+                                            .status(400)
+                                            .body(Full::new(Bytes::from("missing subdomain")))
+                                            .unwrap();
+                                        return Ok(response);
+                                    };
+                                    let Some(txt) = parsed["txt"].as_str() else {
+                                        let response = http::Response::builder()
+                                            .status(400)
+                                            .body(Full::new(Bytes::from("missing txt")))
+                                            .unwrap();
+                                        return Ok(response);
+                                    };
+                                    records.lock().insert(subdomain.to_string(), txt.to_string());
+                                    let response = http::Response::builder()
+                                        .status(200)
+                                        .header("content-type", "application/json")
+                                        .body(Full::new(Bytes::from(format!(r#"{{"txt":"{txt}"}}"#))))
+                                        .unwrap();
+                                    Ok(response)
+                                }
+                            });
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                                .await;
+                        });
+                    }
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                }
+            }
+        });
+
+        Self {
+            address,
+            records,
+            auth,
+            status_code,
+            task,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+}
+
+impl Drop for MockAcmeDns {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn acme_dns_client_update_and_error_handling() {
+    let mock = MockAcmeDns::start().await;
+    *mock.auth.lock() = Some(("test-user".into(), "test-pass".into()));
+    let tls = client_tls(None).unwrap();
+
+    // 1. Success
+    update_acme_dns(
+        tls.clone(),
+        &mock.url(),
+        "test-user",
+        "test-pass",
+        "sub-uuid-1",
+        "txt-digest-abc",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mock.records.lock().get("sub-uuid-1").map(|s| s.as_str()),
+        Some("txt-digest-abc")
+    );
+
+    // 2. Auth failure
+    let err = update_acme_dns(
+        tls.clone(),
+        &mock.url(),
+        "wrong-user",
+        "test-pass",
+        "sub-uuid-1",
+        "txt-digest-abc",
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("HTTP 401"), "{err}");
+
+    // 3. Server 500 error
+    mock.status_code.store(500, Ordering::SeqCst);
+    let err = update_acme_dns(
+        tls.clone(),
+        &mock.url(),
+        "test-user",
+        "test-pass",
+        "sub-uuid-1",
+        "txt-digest-abc",
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("HTTP 500"), "{err}");
+
+    // 4. URL path variants: server_url with trailing slash or with /update
+    mock.status_code.store(200, Ordering::SeqCst);
+    update_acme_dns(
+        tls.clone(),
+        &format!("{}/", mock.url()),
+        "test-user",
+        "test-pass",
+        "sub-uuid-2",
+        "txt-digest-2",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mock.records.lock().get("sub-uuid-2").map(|s| s.as_str()),
+        Some("txt-digest-2")
+    );
+
+    update_acme_dns(
+        tls.clone(),
+        &format!("{}/update", mock.url()),
+        "test-user",
+        "test-pass",
+        "sub-uuid-3",
+        "txt-digest-3",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mock.records.lock().get("sub-uuid-3").map(|s| s.as_str()),
+        Some("txt-digest-3")
+    );
+}
+
+#[tokio::test]
+async fn acme_dns_issuance_roundtrip() {
+    let directory = tempfile::tempdir().unwrap();
+    let mock_dns = MockAcmeDns::start().await;
+    *mock_dns.auth.lock() = Some(("dns_user".into(), "dns_secret".into()));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture = Fixture::new(listener.local_addr().unwrap(), false).await;
+    fixture.state.lock().kind = "dns-01";
+    fixture.state.lock().dns_records = Some(mock_dns.records.clone());
+
+    let mut config = fixture.config(directory.path(), false);
+    config.challenge = ChallengeConfig::AcmeDns {
+        server_url: mock_dns.url(),
+        username: "dns_user".into(),
+        password: "dns_secret".into(),
+        subdomain: "subdomain-acme-dns-test".into(),
+        propagation_delay: Some(0),
+    };
+    let _lock = lock_state(&config).unwrap();
+
+    let source = Source::new("fixture".into(), super::super::Spec::Acme(config.clone())).unwrap();
+    assert!(source.current().is_none());
+
+    let client = HttpClient::new(client_tls(config.ca_cert.as_deref()).unwrap(), &config);
+    drive(&source, &config, client.clone()).await.unwrap();
+
+    let cert = source.current().unwrap().cert[0].clone();
+    assert!(!cert.is_empty());
+    assert_eq!(fixture.state.lock().accounts, 1);
+    assert_eq!(fixture.state.lock().orders.len(), 1);
+
+    // Verify mock_dns received the txt record for the subdomain
+    assert!(mock_dns.records.lock().contains_key("subdomain-acme-dns-test"));
+
+    // Verify resumption / loading cached cert
+    let resumed = Source::new("fixture".into(), super::super::Spec::Acme(config.clone())).unwrap();
+    load_cached(&resumed, &config).unwrap();
+    assert_eq!(resumed.current().unwrap().cert[0], cert);
 }

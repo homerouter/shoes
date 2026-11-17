@@ -82,8 +82,19 @@ pub struct AcmeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChallengeConfig {
-    Http01 { listen: Vec<std::net::SocketAddr> },
+    Http01 {
+        listen: Vec<std::net::SocketAddr>,
+    },
     TlsAlpn01,
+    #[serde(rename = "acme_dns", alias = "acmedns")]
+    AcmeDns {
+        server_url: String,
+        username: String,
+        password: String,
+        subdomain: String,
+        #[serde(default)]
+        propagation_delay: Option<u64>,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -472,6 +483,30 @@ fn validate_acme(config: &AcmeConfig) -> io::Result<()> {
         return Err(invalid(
             "HTTP-01 requires explicit listen addresses with nonzero ports",
         ));
+    }
+    if let ChallengeConfig::AcmeDns {
+        server_url,
+        username,
+        password,
+        subdomain,
+        propagation_delay,
+    } = &config.challenge
+    {
+        acme::validate_url(server_url)?;
+        if username.trim().is_empty() || username.contains(['\r', '\n']) {
+            return Err(invalid("ACME-DNS username cannot be empty or contain newlines"));
+        }
+        if password.trim().is_empty() || password.contains(['\r', '\n']) {
+            return Err(invalid("ACME-DNS password cannot be empty or contain newlines"));
+        }
+        if subdomain.trim().is_empty() || subdomain.contains(['\r', '\n']) {
+            return Err(invalid("ACME-DNS subdomain cannot be empty or contain newlines"));
+        }
+        if let Some(delay) = propagation_delay
+            && *delay > 3600
+        {
+            return Err(invalid("ACME-DNS propagation_delay cannot exceed 3600 seconds"));
+        }
     }
     if let Some(path) = &config.ca_cert {
         acme::client_tls(Some(path))?;
