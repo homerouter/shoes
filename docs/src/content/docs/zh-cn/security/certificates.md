@@ -60,7 +60,7 @@ ACME 使用 `instant-acme` 和显式配置的域。从 CA 的暂存目录开始�
     listen: ["0.0.0.0:8080"]
 ```
 
-如文件源示例中所示，从 TLS 或 QUIC 引用 `public`。域必须是唯一的小写 ASCII DNS 名称（使用 punycode 作为国际化名称）。每个使用 ACME 源的命名 TLS 目标都必须被其域覆盖。没有根据传入的SNI进行发行。
+如文件源示例中所示，从 TLS 或 QUIC 引用 `public`。域必须是唯一的小写 ASCII DNS 名称（使用 punycode 作为国际化名称）。只有 `acme_dns` 质询接受通配符（`*.example.com`）。每个使用 ACME 源的命名 TLS 目标都必须被其域覆盖；通配符只覆盖一级标签，因此 `*.example.com` 覆盖 `a.example.com`，但不覆盖 `example.com` 或 `a.b.example.com`。没有根据传入的SNI进行发行。
 
 `terms_of_service` 明确接受该确切 URL，而不是全面接受未来条款。 shoes 在帐户操作之前检查目录的 `meta.termsOfService` 并拒绝更改的 URL。查看新条款并更新配置以接受它们。如果私有 CA 未发布任何条款，则省略此字段；随后公布的条款 URL 仍需要明确接受。该版本不支持需要外部账号绑定的账号。
 
@@ -79,6 +79,25 @@ HTTP-01要求：
 
 CA 必须到达公共 TCP 端口 443，转发到覆盖每个配置域的现有最外层 shoes TLS 监听器。这不是 QUIC、ShadowTLS 或 REALITY 验证。中间的TLS终结器必须让握手通过，包括SNI和ALPN。 shoes 仅为待配置的 SNI 应答唯一提供的协议 `acme-tls/1`。短暂的质询响应使用 RFC 8737 关键 `acmeIdentifier` 扩展，并且永远不会进入代理处理程序或替换普通证书。普通 ALPN、客户端身份验证、回退路由和 QUIC 策略保持不变。
 
+要通过 [acme-dns](https://github.com/joohoi/acme-dns) 服务器完成 DNS-01，将 `challenge` 映射替换为：
+
+```yaml
+  challenge:
+    type: acme_dns
+    server_url: https://auth.acme-dns.io
+    username: 00000000-0000-0000-0000-000000000000
+    password: replace-with-acme-dns-password
+    subdomain: 00000000-0000-0000-0000-000000000000
+    propagation_delay: 10  # 可选，单位秒，最多 300
+```
+
+先在 acme-dns 注册账户，然后为每个配置的域名把 `_acme-challenge.<域名>` 用 CNAME 指向 `<subdomain>.<acme-dns 区域>`（`example.com` 与 `*.example.com` 共用一条记录）。不需要任何入站端口。
+
+- shoes 先为每个待验证的域名发布 TXT 值，统一等待一次 `propagation_delay`，再请求 CA 验证。请保持较短的等待：整个订单必须在 10 分钟内完成。
+- acme-dns 每个子域只保留最新的两个 TXT 值，因此一个源最多列出两个域名，例如 `[example.com, "*.example.com"]`。更多域名请每两个使用一个源。
+- acme-dns 服务器使用默认公共 CA 根证书验证，而不是 `ca_cert`。`server_url` 必须是 HTTPS（仅数字回环测试服务器可用 HTTP），不得包含凭据、查询串或片段；除非路径已以 `/update` 结尾，否则会自动追加。
+- `password` 在调试输出中会被隐藏，失败时只报告 HTTP 状态码，绝不输出服务器响应正文。
+
 首次启动时，代理和质询监听器在发布开始之前绑定。没有证书的源的正常握手会失败，直到颁发成功为止； `Servers ready` 表示监听器已绑定，而不是 ACME 已完成。有效的缓存证书允许在 CA 中断期间立即启动。
 
 shoes 将注册前的帐户密钥、帐户凭据、进行中的订单和 CSR 密钥以及证书/密钥对保留在一个自动替换的同步状态文件中。请勿编辑它或在来源之间共享它。在 Unix 上，状态目录必须由模式 0700 的运行用户拥有，文件使用 0600。其他平台使用其继承的文件系统访问控制；将目录放置在私有应用程序存储中。独占操作系统文件锁可防止多个进程或嵌入式生命周期拥有同一目录。安全地备份整个目录。更改 CA 或域列表需要不同的状态目录；舞台和制作绝不能共用一个。
@@ -91,6 +110,6 @@ CA 流量直接通过操作系统解析器和 shoes 受保护的 TCP 套接字�
 
 `--dry-run` 验证配置、引用、域覆盖、质询兼容性、证书材料和声明的地址冲突，而无需联系 CA、绑定端口或创建 ACME 状态。未发布的 ACME 源是有效配置，而不是自签名占位符。检查现有的可读状态是否存在 CA/域身份不匹配的情况，而无需锁定或修改它；该检查不需要以服务用户身份运行。在运行时准备期间检查实际操作系统端口冲突、存储所有权和权限。
 
-没有内置的 DNS-01、通配符 ACME 发行、DNS 供应商 API、shell hook、Tailscale 提供商或 Cloudflare Origin CA 提供商。对于通配符证书或 DNS-01，请运行外部客户端（例如 acme.sh、lego 或 Certbot）并使用文件源。仍然支持手动提供的通配符证书。
+内置 DNS-01 仅支持 acme-dns。没有 DNS 供应商 API、shell hook、Tailscale 提供商或 Cloudflare Origin CA 提供商。对于其他 DNS 提供商，请运行外部客户端（例如 acme.sh、lego 或 Certbot）并使用文件源。仍然支持手动提供的通配符证书。
 
 示例：[文件轮换和重用](/zh-cn/examples/certificates_files/) 和 [具有共享 TCP/QUIC 使用者的 ACME](/zh-cn/examples/certificates_acme/)。

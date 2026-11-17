@@ -99,7 +99,10 @@ staging directory. No certificate is issued during `--dry-run`.
 
 Reference `public` from TLS or QUIC as in the file-source example. Domains must
 be unique lowercase ASCII DNS names (use punycode for internationalized names).
-Every named TLS target using an ACME source must be covered by its domains.
+Wildcards (`*.example.com`) are accepted only with the `acme_dns` challenge.
+Every named TLS target using an ACME source must be covered by its domains; a
+wildcard covers exactly one label, so `*.example.com` covers `a.example.com`
+but not `example.com` or `a.b.example.com`.
 There is no issuance based on incoming SNI.
 
 `terms_of_service` is explicit acceptance of that exact URL, not blanket
@@ -139,6 +142,36 @@ through, including SNI and ALPN. shoes only answers the sole offered protocol
 uses the RFC 8737 critical `acmeIdentifier` extension and never enters the proxy
 handler or replaces the ordinary certificate. Normal ALPN, client authentication,
 fallback routing and QUIC policy are unchanged.
+
+For DNS-01 through an [acme-dns](https://github.com/joohoi/acme-dns) server,
+replace the `challenge` mapping with:
+
+```yaml
+  challenge:
+    type: acme_dns
+    server_url: https://auth.acme-dns.io
+    username: 00000000-0000-0000-0000-000000000000
+    password: replace-with-acme-dns-password
+    subdomain: 00000000-0000-0000-0000-000000000000
+    propagation_delay: 10  # optional, seconds, at most 300
+```
+
+Register an account with acme-dns, then point `_acme-challenge.<domain>` at
+`<subdomain>.<acme-dns zone>` with a CNAME for every configured domain
+(`example.com` and `*.example.com` share one record). No inbound port is needed.
+
+- shoes publishes the TXT value for every pending domain, waits
+  `propagation_delay` once, then asks the CA to validate. Keep the delay short:
+  the whole order must finish within 10 minutes.
+- acme-dns keeps only the two newest TXT values per subdomain, so a source may
+  list at most two domains, e.g. `[example.com, "*.example.com"]`. Use one
+  source per pair for more names.
+- The acme-dns server is verified against the default public CA roots, not
+  `ca_cert`. `server_url` must be HTTPS (HTTP only for a numeric loopback test
+  server) without credentials, query or fragment; `/update` is appended unless
+  the path already ends with it.
+- `password` is redacted from debug output, and failures report only the HTTP
+  status, never the server's response body.
 
 At first start, proxy and challenge listeners bind before issuance begins.
 Normal handshakes for a source without a certificate fail until issuance
@@ -210,10 +243,10 @@ the check need not run as the service user.
 Actual OS port conflicts,
 storage ownership and permissions are checked during runtime preparation.
 
-There is no built-in DNS-01, wildcard ACME issuance, DNS vendor API, shell hook,
-Tailscale provider, or Cloudflare Origin CA provider. For wildcard certificates
-or DNS-01, run an external client such as acme.sh, lego or Certbot and use a file
-source. Manually supplied wildcard certificates remain supported.
+Built-in DNS-01 only talks to acme-dns. There is no DNS vendor API, shell hook,
+Tailscale provider, or Cloudflare Origin CA provider. For other DNS providers,
+run an external client such as acme.sh, lego or Certbot and use a file source.
+Manually supplied wildcard certificates remain supported.
 
 Examples: [file rotation and reuse](/examples/certificates_files/) and
 [ACME with shared TCP/QUIC consumers](/examples/certificates_acme/).
