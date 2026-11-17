@@ -2400,14 +2400,14 @@ impl MockAcmeDns {
                                     }
                                     let user = request.headers().get("x-api-user").and_then(|v| v.to_str().ok()).unwrap_or_default();
                                     let pass = request.headers().get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or_default();
-                                    if let Some((expected_user, expected_pass)) = auth.lock().as_ref() {
-                                        if user != expected_user || pass != expected_pass {
-                                            let response = http::Response::builder()
-                                                .status(401)
-                                                .body(Full::new(Bytes::from("unauthorized")))
-                                                .unwrap();
-                                            return Ok(response);
-                                        }
+                                    if let Some((expected_user, expected_pass)) = auth.lock().as_ref()
+                                        && (user != expected_user || pass != expected_pass)
+                                    {
+                                        let response = http::Response::builder()
+                                            .status(401)
+                                            .body(Full::new(Bytes::from("unauthorized")))
+                                            .unwrap();
+                                        return Ok(response);
                                     }
                                     let body_bytes = request.into_body().collect().await.map_err(io::Error::other)?.to_bytes();
                                     let parsed: Value = serde_json::from_slice(&body_bytes).map_err(io::Error::other)?;
@@ -2512,6 +2512,7 @@ async fn acme_dns_client_update_and_error_handling() {
     .await
     .unwrap_err();
     assert!(err.to_string().contains("HTTP 500"), "{err}");
+    assert!(!err.to_string().contains("error status"), "remote body leaked: {err}");
 
     // 4. URL path variants: server_url with trailing slash or with /update
     mock.status_code.store(200, Ordering::SeqCst);
@@ -2532,7 +2533,7 @@ async fn acme_dns_client_update_and_error_handling() {
 
     update_acme_dns(
         tls.clone(),
-        &format!("{}/update", mock.url()),
+        &format!("{}/update/", mock.url()),
         "test-user",
         "test-pass",
         "sub-uuid-3",
