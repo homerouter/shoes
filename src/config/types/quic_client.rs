@@ -2,7 +2,7 @@ use std::{fmt, io};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct Secret(pub String);
 

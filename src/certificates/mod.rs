@@ -32,6 +32,8 @@ pub struct NamedSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+// Parsed once at startup; the size gap between variants does not matter.
+#[allow(clippy::large_enum_variant)]
 pub enum SourceConfig {
     Files { cert: PathBuf, key: PathBuf },
     Acme(AcmeConfig),
@@ -90,7 +92,7 @@ pub enum ChallengeConfig {
     AcmeDns {
         server_url: String,
         username: String,
-        password: String,
+        password: crate::config::quic_client::Secret,
         subdomain: String,
         #[serde(default)]
         propagation_delay: Option<u64>,
@@ -492,20 +494,30 @@ fn validate_acme(config: &AcmeConfig) -> io::Result<()> {
         propagation_delay,
     } = &config.challenge
     {
-        acme::validate_url(server_url)?;
-        if username.trim().is_empty() || username.contains(['\r', '\n']) {
-            return Err(invalid("ACME-DNS username cannot be empty or contain newlines"));
+        let url = acme::validate_url(server_url)?;
+        if url.query().is_some() {
+            return Err(invalid("ACME-DNS server_url must not contain a query string"));
         }
-        if password.trim().is_empty() || password.contains(['\r', '\n']) {
-            return Err(invalid("ACME-DNS password cannot be empty or contain newlines"));
+        if username.trim().is_empty() || http::HeaderValue::from_str(username).is_err() {
+            return Err(invalid("ACME-DNS username must be a non-empty HTTP header value"));
         }
-        if subdomain.trim().is_empty() || subdomain.contains(['\r', '\n']) {
-            return Err(invalid("ACME-DNS subdomain cannot be empty or contain newlines"));
+        if password.0.trim().is_empty() || http::HeaderValue::from_str(&password.0).is_err() {
+            return Err(invalid("ACME-DNS password must be a non-empty HTTP header value"));
         }
-        if let Some(delay) = propagation_delay
-            && *delay > 3600
+        if subdomain.is_empty()
+            || !subdomain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         {
-            return Err(invalid("ACME-DNS propagation_delay cannot exceed 3600 seconds"));
+            return Err(invalid("ACME-DNS subdomain must contain only letters, digits and '-'"));
+        }
+        // acme-dns keeps only the 2 newest TXT values per subdomain, and all are published before validation.
+        if config.domains.len() > 2 {
+            return Err(invalid(
+                "ACME-DNS supports at most 2 domains per certificate source; split larger sets across sources",
+            ));
+        }
+        // One wait per order; keep it well inside the 600 s order deadline.
+        if propagation_delay.is_some_and(|delay| delay > 300) {
+            return Err(invalid("ACME-DNS propagation_delay cannot exceed 300 seconds"));
         }
     }
     if let Some(path) = &config.ca_cert {
