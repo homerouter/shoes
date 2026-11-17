@@ -111,12 +111,34 @@ fn managed_validation_has_no_state_or_network_side_effects() {
     for challenge in [
         "type: http01, listen: ['127.0.0.1:18080']",
         "type: tls_alpn01",
+        "type: acme_dns, server_url: 'https://auth.example.com', username: 'user1', password: 'secret', subdomain: 'uuid-subdomain'",
+        "type: acmedns, server_url: 'https://auth.example.com', username: 'user1', password: 'secret', subdomain: 'uuid-subdomain', propagation_delay: 10",
     ] {
         let yaml = managed_yaml(&state, challenge, "certificate_source: public");
         let validated = compile(&yaml).unwrap();
         assert_eq!(validated.certificates.len(), 1);
         assert!(validated.certificates[0].current().is_none());
         assert!(!state.exists());
+    }
+}
+
+#[test]
+fn managed_validation_rejects_invalid_acme_dns_configs() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("not-created");
+    for bad_challenge in [
+        "type: acme_dns, server_url: 'https://auth.example.com', username: '', password: 'secret', subdomain: 'uuid-subdomain'",
+        "type: acme_dns, server_url: 'https://auth.example.com', username: '   ', password: 'secret', subdomain: 'uuid-subdomain'",
+        "type: acme_dns, server_url: 'https://auth.example.com', username: \"user\\nname\", password: 'secret', subdomain: 'uuid-subdomain'",
+        "type: acme_dns, server_url: 'https://auth.example.com', username: 'user1', password: '', subdomain: 'uuid-subdomain'",
+        "type: acme_dns, server_url: 'https://auth.example.com', username: 'user1', password: 'secret', subdomain: ''",
+        "type: acme_dns, server_url: 'https://auth.example.com', username: 'user1', password: 'secret', subdomain: '   '",
+        "type: acme_dns, server_url: 'ftp://auth.example.com', username: 'user1', password: 'secret', subdomain: 'uuid-subdomain'",
+        "type: acme_dns, server_url: 'https://auth.example.com#fragment', username: 'user1', password: 'secret', subdomain: 'uuid-subdomain'",
+        "type: acme_dns, server_url: 'https://auth.example.com', username: 'user1', password: 'secret', subdomain: 'uuid-subdomain', propagation_delay: 3601",
+    ] {
+        let yaml = managed_yaml(&state, bad_challenge, "certificate_source: public");
+        assert!(compile(&yaml).is_err(), "unexpectedly accepted: {bad_challenge}");
     }
 }
 

@@ -216,6 +216,139 @@ impl HttpClient {
     }
 }
 
+async fn connect_stream(
+    url: &url::Url,
+    tls: &Arc<rustls::ClientConfig>,
+) -> io::Result<Box<dyn crate::async_stream::AsyncStream>> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| invalid("ACME URL has no host"))?
+        .trim_matches(['[', ']']);
+    let location = crate::address::NetLocation::new(
+        crate::address::Address::from(host)?,
+        url.port_or_known_default().unwrap(),
+    );
+    let addresses = crate::resolver::Resolver::resolve_location(
+        &crate::resolver::NativeResolver::new(),
+        &location,
+    )
+    .await?;
+    let mut stream = None;
+    for address in addresses.into_iter().take(8) {
+        let socket = crate::socket_util::new_tcp_socket(None, address.is_ipv6())?;
+        if let Ok(Ok(connected)) =
+            tokio::time::timeout(Duration::from_secs(5), socket.connect(address)).await
+        {
+            stream = Some(connected);
+            break;
+        }
+    }
+    let stream = stream.ok_or_else(|| io::Error::other("ACME connection failed"))?;
+    if url.scheme() == "https" {
+        let name = rustls::pki_types::ServerName::try_from(host.to_owned())
+            .map_err(|_| invalid("invalid ACME TLS hostname"))?;
+        let connection = rustls::ClientConnection::new(tls.clone(), name)
+            .map_err(io::Error::other)?;
+        Ok(Box::new(
+            crate::crypto::CryptoTlsStream::handshake(
+                stream,
+                crate::crypto::TlsConnection::new(connection),
+                crate::crypto::TlsReadMode::Stream,
+                &[],
+            )
+            .await?,
+        ))
+    } else {
+        Ok(Box::new(stream))
+    }
+}
+
+#[derive(Serialize)]
+struct AcmeDnsPayload<'a> {
+    subdomain: &'a str,
+    txt: &'a str,
+}
+
+pub(super) async fn update_acme_dns(
+    tls: Arc<rustls::ClientConfig>,
+    server_url: &str,
+    username: &str,
+    password: &str,
+    subdomain: &str,
+    txt: &str,
+) -> io::Result<()> {
+    let trimmed = server_url.trim_end_matches('/');
+    let endpoint = if trimmed.ends_with("/update") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/update")
+    };
+    let url = validate_url(&endpoint)?;
+    let uri: http::Uri = endpoint
+        .parse()
+        .map_err(|_| invalid("invalid ACME-DNS endpoint URI"))?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| invalid("invalid ACME-DNS authority"))?
+        .as_str()
+        .to_owned();
+    let path_and_query = uri.path_and_query().map_or("/update", |pq| pq.as_str());
+
+    let payload = serde_json::to_vec(&AcmeDnsPayload { subdomain, txt })
+        .map_err(|e| io::Error::other(format!("failed to serialize ACME-DNS payload: {e}")))?;
+
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(path_and_query)
+        .header(http::header::HOST, authority)
+        .header("X-Api-User", username)
+        .header("X-Api-Key", password)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CONNECTION, "close")
+        .body(Full::new(Bytes::from(payload)))
+        .map_err(|e| io::Error::other(format!("failed to build ACME-DNS request: {e}")))?;
+
+    tokio::time::timeout(REQUEST_TIMEOUT, async {
+        let stream = connect_stream(&url, &tls).await?;
+        let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
+            .max_buf_size(32 * 1024)
+            .handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .map_err(io::Error::other)?;
+        let response = async {
+            let response = sender
+                .send_request(request)
+                .await
+                .map_err(io::Error::other)?;
+            let (parts, body) = response.into_parts();
+            let bytes = Limited::new(body, MAX_RESPONSE)
+                .collect()
+                .await
+                .map_err(|_| io::Error::other("ACME-DNS response failed or exceeded limit"))?
+                .to_bytes();
+            if !parts.status.is_success() {
+                let msg = String::from_utf8_lossy(&bytes);
+                return Err(io::Error::other(format!(
+                    "ACME-DNS update returned HTTP {}: {}",
+                    parts.status,
+                    msg.trim()
+                )));
+            }
+            Ok::<_, io::Error>(())
+        };
+        tokio::pin!(response, connection);
+        tokio::select! {
+            result = &mut response => result,
+            result = &mut connection => {
+                result.map_err(io::Error::other)?;
+                response.await
+            }
+        }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ACME-DNS request timed out"))?
+}
+
 impl instant_acme::HttpClient for HttpClient {
     fn request(
         &self,
@@ -238,47 +371,7 @@ impl instant_acme::HttpClient for HttpClient {
                         "ACME HTTPS directory cannot downgrade to HTTP endpoints",
                     ));
                 }
-                let host = url
-                    .host_str()
-                    .ok_or_else(|| invalid("ACME URL has no host"))?
-                    .trim_matches(['[', ']']);
-                let location = crate::address::NetLocation::new(
-                    crate::address::Address::from(host)?,
-                    url.port_or_known_default().unwrap(),
-                );
-                let addresses = crate::resolver::Resolver::resolve_location(
-                    &crate::resolver::NativeResolver::new(),
-                    &location,
-                )
-                .await?;
-                let mut stream = None;
-                for address in addresses.into_iter().take(8) {
-                    let socket = crate::socket_util::new_tcp_socket(None, address.is_ipv6())?;
-                    if let Ok(Ok(connected)) =
-                        tokio::time::timeout(Duration::from_secs(5), socket.connect(address)).await
-                    {
-                        stream = Some(connected);
-                        break;
-                    }
-                }
-                let stream = stream.ok_or_else(|| io::Error::other("ACME connection failed"))?;
-                let stream: Box<dyn crate::async_stream::AsyncStream> = if url.scheme() == "https" {
-                    let name = rustls::pki_types::ServerName::try_from(host.to_owned())
-                        .map_err(|_| invalid("invalid ACME TLS hostname"))?;
-                    let connection = rustls::ClientConnection::new(client.tls.clone(), name)
-                        .map_err(io::Error::other)?;
-                    Box::new(
-                        crate::crypto::CryptoTlsStream::handshake(
-                            stream,
-                            crate::crypto::TlsConnection::new(connection),
-                            crate::crypto::TlsReadMode::Stream,
-                            &[],
-                        )
-                        .await?,
-                    )
-                } else {
-                    Box::new(stream)
-                };
+                let stream = connect_stream(&url, &client.tls).await?;
                 let authority = request
                     .uri()
                     .authority()
@@ -1098,9 +1191,10 @@ impl Scheduler {
                 });
             }
             Self::defer_hint(config, state, response)?;
-            let kind = match config.challenge {
+            let kind = match &config.challenge {
                 ChallengeConfig::Http01 { .. } => ChallengeType::Http01,
                 ChallengeConfig::TlsAlpn01 => ChallengeType::TlsAlpn01,
+                ChallengeConfig::AcmeDns { .. } => ChallengeType::Dns01,
             };
             let mut challenge =
                 authorization
@@ -1138,6 +1232,36 @@ impl Scheduler {
                 return Err(instant_acme::Error::Str("CA returned invalid challenge token").into());
             }
             let authorization = challenge.key_authorization();
+            if let ChallengeConfig::AcmeDns {
+                server_url,
+                username,
+                password,
+                subdomain,
+                propagation_delay,
+            } = &config.challenge
+            {
+                if challenge.status == ChallengeStatus::Pending {
+                    let txt = authorization.dns_value();
+                    update_acme_dns(
+                        client.tls.clone(),
+                        server_url,
+                        username,
+                        password,
+                        subdomain,
+                        &txt,
+                    )
+                    .await
+                    .map_err(|error| instant_acme::Error::Other(Box::new(error)))?;
+                    if let Some(delay) = *propagation_delay {
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_secs(delay)).await;
+                        }
+                    }
+                    let ((), response) = client.perform(deadline, challenge.set_ready()).await?;
+                    Self::defer_hint(config, state, response)?;
+                }
+                continue;
+            }
             let tls = if kind == ChallengeType::TlsAlpn01 {
                 Some(
                     challenge::tls_config(&domain, authorization.digest().as_ref())
