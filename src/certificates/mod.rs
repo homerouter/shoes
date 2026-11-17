@@ -259,6 +259,15 @@ impl Material {
     }
 }
 
+/// True if `name` equals `pattern`, or `pattern` is `*.rest` and `name` is exactly one label above `rest`.
+fn domain_covers(pattern: &str, name: &str) -> bool {
+    pattern == name
+        || pattern.strip_prefix("*.").is_some_and(|rest| {
+            name.split_once('.')
+                .is_some_and(|(label, parent)| !label.is_empty() && label != "*" && parent == rest)
+        })
+}
+
 fn algorithm_matches(
     supported: rustls::pki_types::AlgorithmIdentifier,
     actual: &x509_parser::x509::AlgorithmIdentifier<'_>,
@@ -452,11 +461,14 @@ fn validate_acme(config: &AcmeConfig) -> io::Result<()> {
         return Err(invalid("ACME requires 1 to 100 explicit domains"));
     }
     let mut domains = HashSet::new();
+    // Only DNS-01 can prove control of a wildcard name.
+    let dns01 = matches!(config.challenge, ChallengeConfig::AcmeDns { .. });
     for domain in &config.domains {
+        let name = domain.strip_prefix("*.").filter(|_| dns01).unwrap_or(domain);
         if domain.len() > 253
-            || !domain.contains('.')
-            || domain.parse::<std::net::IpAddr>().is_ok()
-            || domain.split('.').any(|label| {
+            || !name.contains('.')
+            || name.parse::<std::net::IpAddr>().is_ok()
+            || name.split('.').any(|label| {
                 label.is_empty()
                     || label.len() > 63
                     || label.starts_with('-')
@@ -468,7 +480,7 @@ fn validate_acme(config: &AcmeConfig) -> io::Result<()> {
             || !domains.insert(domain)
         {
             return Err(invalid(
-                "ACME domains must be unique lowercase ASCII DNS names; wildcards and IPs are not supported",
+                "ACME domains must be unique lowercase ASCII DNS names; IPs are not supported, and wildcards need the acme_dns challenge",
             ));
         }
     }
@@ -825,7 +837,7 @@ pub(crate) fn configure(configs: &mut [Config]) -> io::Result<Vec<Arc<Source>>> 
         if let Some(source) = binding
             && let Spec::Acme(acme) = &source.spec
             && let Some(sni) = sni
-            && !acme.domains.iter().any(|domain| domain == sni)
+            && !acme.domains.iter().any(|domain| domain_covers(domain, sni))
         {
             return Err(invalid(
                 "TLS target SNI is not in certificate_source ACME domains",
