@@ -263,6 +263,55 @@ async fn connect_stream(
     }
 }
 
+/// Sends one request over a fresh HTTP/1 connection; `on_head` runs before the body is read.
+async fn send_http1<B>(
+    stream: Box<dyn crate::async_stream::AsyncStream>,
+    request: http::Request<B>,
+    on_head: impl FnOnce(&http::response::Parts) -> io::Result<()>,
+) -> io::Result<(http::response::Parts, Bytes)>
+where
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
+        .max_buf_size(32 * 1024)
+        .handshake(hyper_util::rt::TokioIo::new(stream))
+        .await
+        .map_err(io::Error::other)?;
+    let response = async {
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(io::Error::other)?;
+        let (parts, body) = response.into_parts();
+        if parts
+            .headers
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 4)
+            .sum::<usize>()
+            > 32 * 1024
+        {
+            return Err(io::Error::other("ACME response headers exceed 32 KiB"));
+        }
+        on_head(&parts)?;
+        let bytes = Limited::new(body, MAX_RESPONSE)
+            .collect()
+            .await
+            .map_err(|_| io::Error::other("ACME response failed or exceeded 1 MiB"))?
+            .to_bytes();
+        Ok::<_, io::Error>((parts, bytes))
+    };
+    tokio::pin!(response, connection);
+    tokio::select! {
+        result = &mut response => result,
+        result = &mut connection => {
+            result.map_err(io::Error::other)?;
+            response.await
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct AcmeDnsPayload<'a> {
     subdomain: &'a str,
@@ -308,38 +357,15 @@ pub(super) async fn update_acme_dns(
 
     tokio::time::timeout(REQUEST_TIMEOUT, async {
         let stream = connect_stream(&url, &tls).await?;
-        let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
-            .max_buf_size(32 * 1024)
-            .handshake(hyper_util::rt::TokioIo::new(stream))
-            .await
-            .map_err(io::Error::other)?;
-        let response = async {
-            let response = sender
-                .send_request(request)
-                .await
-                .map_err(io::Error::other)?;
-            let (parts, body) = response.into_parts();
-            Limited::new(body, MAX_RESPONSE)
-                .collect()
-                .await
-                .map_err(|_| io::Error::other("ACME-DNS response failed or exceeded limit"))?;
-            // Never log the remote body; the status is enough to diagnose.
-            if !parts.status.is_success() {
-                return Err(io::Error::other(format!(
-                    "ACME-DNS update returned HTTP {}",
-                    parts.status
-                )));
-            }
-            Ok::<_, io::Error>(())
-        };
-        tokio::pin!(response, connection);
-        tokio::select! {
-            result = &mut response => result,
-            result = &mut connection => {
-                result.map_err(io::Error::other)?;
-                response.await
-            }
+        let (parts, _) = send_http1(stream, request, |_| Ok(())).await?;
+        // Never log the remote body; the status is enough to diagnose.
+        if !parts.status.is_success() {
+            return Err(io::Error::other(format!(
+                "ACME-DNS update returned HTTP {}",
+                parts.status
+            )));
         }
+        Ok(())
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ACME-DNS request timed out"))?
@@ -395,52 +421,21 @@ impl instant_acme::HttpClient for HttpClient {
                     .map_or("/", |path| path.as_str())
                     .parse()
                     .map_err(|_| invalid("invalid ACME path"))?;
-                let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
-                    .max_buf_size(32 * 1024)
-                    .handshake(hyper_util::rt::TokioIo::new(stream))
-                    .await
-                    .map_err(io::Error::other)?;
-                let response = async {
-                    let response = sender
-                        .send_request(request)
-                        .await
-                        .map_err(io::Error::other)?;
-                    let (parts, body) = response.into_parts();
-                    if parts
-                        .headers
-                        .iter()
-                        .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 4)
-                        .sum::<usize>()
-                        > 32 * 1024
-                    {
-                        return Err(io::Error::other("ACME response headers exceed 32 KiB"));
-                    }
-                    let retry_after = parse_retry_after(&parts.headers)?;
+                let (parts, bytes) = send_http1(stream, request, |parts| {
                     *client.last.lock() = Some(ResponseMetadata {
                         url: request_url,
                         status: parts.status,
-                        retry_after,
+                        retry_after: parse_retry_after(&parts.headers)?,
                     });
-                    let bytes = Limited::new(body, MAX_RESPONSE)
-                        .collect()
-                        .await
-                        .map_err(|_| io::Error::other("ACME response failed or exceeded 1 MiB"))?
-                        .to_bytes();
-                    if is_directory {
-                        validate_directory(parts.status, &bytes, client.terms.as_deref())?;
-                    }
-                    Ok::<_, io::Error>(instant_acme::BytesResponse::from(
-                        http::Response::from_parts(parts, Full::new(bytes)),
-                    ))
-                };
-                tokio::pin!(response, connection);
-                tokio::select! {
-                    result = &mut response => result,
-                    result = &mut connection => {
-                        result.map_err(io::Error::other)?;
-                        response.await
-                    }
+                    Ok(())
+                })
+                .await?;
+                if is_directory {
+                    validate_directory(parts.status, &bytes, client.terms.as_deref())?;
                 }
+                Ok(instant_acme::BytesResponse::from(
+                    http::Response::from_parts(parts, Full::new(bytes)),
+                ))
             })
             .await;
             result
