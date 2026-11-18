@@ -70,6 +70,7 @@ class BuildVersionTests(unittest.TestCase):
             self.assertEqual(self.metadata(SHOES_BUILD_REVISION=revision)["SHOES_VERSION"],
                              f"1.2.3+g{revision[:12]}{suffix}")
         self.assertEqual(self.metadata(SHOES_RELEASE_TAG="v1.2.3")["SHOES_VERSION"], "1.2.3")
+        self.assertEqual(self.metadata(SHOES_RELEASE_TAG="v1.2.3.1")["SHOES_VERSION"], "1.2.3.1")
 
     def test_tagged_checkout_is_not_automatically_official(self):
         revision = self.initialize()
@@ -84,6 +85,7 @@ class BuildVersionTests(unittest.TestCase):
     def test_invalid_inputs_and_dirty_releases_fail(self):
         self.initialize()
         for environment in [{"SHOES_RELEASE_TAG": "v9.9.9"},
+                            {"SHOES_RELEASE_TAG": "v1.2.4.1"},
                             {"SHOES_BUILD_REVISION": "abc"},
                             {"SHOES_BUILD_REVISION": "a" * 40 + "\ncargo:rustc-env=BAD=1"},
                             {"SHOES_RELEASE_TAG": "v1.2.3", "SHOES_BUILD_REVISION": "a" * 40 + ".dirty"}]:

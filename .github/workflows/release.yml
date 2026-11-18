@@ -75,10 +75,10 @@ jobs:
           else:
               tag = f"v{manifest['version']}"
 
-          expected = f"v{manifest['version']}"
-          assert tag == expected, f"Tag {tag} does not match package version {expected}"
+          base_expected = f"v{manifest['version']}"
+          assert tag == base_expected or tag.startswith(f"{base_expected}."), f"Tag {tag} does not match package version {base_expected} or {base_expected}.*"
 
-          version = manifest["version"]
+          version = tag.lstrip("v")
           print(f"Validated release tag: {tag}, version: {version}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:

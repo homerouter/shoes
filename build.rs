@@ -81,13 +81,13 @@ fn main() {
         .any(|revision| revision.ends_with(".dirty"));
     let package_version = env::var("CARGO_PKG_VERSION").unwrap();
     let version = if let Some(tag) = release_tag {
-        assert_eq!(
-            tag,
-            format!("v{package_version}"),
-            "Release tag does not match package version"
+        let tag_ver = tag.strip_prefix('v').unwrap_or(&tag);
+        assert!(
+            tag_ver == package_version || tag_ver.starts_with(&format!("{package_version}.")),
+            "Release tag {tag} does not match package version {package_version}"
         );
         assert!(!dirty, "Official releases require a clean checkout");
-        package_version
+        tag_ver.to_owned()
     } else {
         let suffix = match revision {
             Some(revision) => format!("g{}", revision[..12].to_ascii_lowercase()),
