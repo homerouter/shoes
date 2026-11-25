@@ -61,6 +61,7 @@ mod http_handler;
 mod httpupgrade;
 mod hysteria2_server;
 mod listener_tasks;
+mod masque;
 mod mixed_handler;
 mod naiveproxy;
 mod network_tasks;

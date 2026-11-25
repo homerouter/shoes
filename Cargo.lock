@@ -1065,6 +1065,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3-datagram"
+version = "0.0.2"
+source = "git+https://github.com/cfal/h3?rev=90e3013710e35143d1969dc3421f5951fbe49966#90e3013710e35143d1969dc3421f5951fbe49966"
+dependencies = [
+ "bytes",
+ "h3",
+]
+
+[[package]]
 name = "h3-quinn"
 version = "0.0.10"
 source = "git+https://github.com/cfal/h3?rev=90e3013710e35143d1969dc3421f5951fbe49966#90e3013710e35143d1969dc3421f5951fbe49966"
@@ -1072,6 +1081,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "h3",
+ "h3-datagram",
  "quinn",
  "tokio-util",
 ]
@@ -2924,6 +2934,7 @@ dependencies = [
  "gotatun",
  "h2",
  "h3",
+ "h3-datagram",
  "h3-quinn",
  "hickory-resolver",
  "http",

@@ -24,6 +24,7 @@ rustls = { git = "https://github.com/cfal/rustls", rev = "f1a23c187330386e9e7f14
 blake3 = { git = "https://github.com/cfal/BLAKE3", rev = "5bd8a7ef060bac222502a449bb89b7bdcdb8ec09" }
 # Bounds buffered H3 frames before payload reads and skips unknown frames incrementally.
 h3 = { git = "https://github.com/cfal/h3", rev = "90e3013710e35143d1969dc3421f5951fbe49966" }
+h3-datagram = { git = "https://github.com/cfal/h3", rev = "90e3013710e35143d1969dc3421f5951fbe49966" }
 h3-quinn = { git = "https://github.com/cfal/h3", rev = "90e3013710e35143d1969dc3421f5951fbe49966" }
 # Preserves transport failover, bounded receive progress and scoped DoH driver retirement.
 hickory-net = { git = "https://github.com/cfal/hickory-dns", rev = "93435e55f102ee637eadca89126be85931a804f3" }
@@ -139,7 +140,8 @@ prost = "0.14.4"
 yaml-rust2 = { version = "0.13", default-features = false }
 h2 = "*"
 h3 = { version = "*", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
-h3-quinn = "*"
+h3-datagram = "*"
+h3-quinn = { version = "*", features = ["datagram"] }
 hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
 http = "*"
 httpdate = "1"
