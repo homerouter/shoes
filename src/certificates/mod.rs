@@ -506,7 +506,7 @@ fn validate_acme(config: &AcmeConfig) -> io::Result<()> {
         propagation_delay,
     } = &config.challenge
     {
-        let url = acme::validate_url(server_url)?;
+        let url = acme::validate_url_for(server_url, "ACME-DNS")?;
         if url.query().is_some() {
             return Err(invalid("ACME-DNS server_url must not contain a query string"));
         }

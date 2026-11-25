@@ -159,17 +159,25 @@ fn expire_retry(config: &AcmeConfig) {
     persist(config, &state).unwrap();
 }
 
+struct Auth {
+    domain: String,
+    status: &'static str,
+    token: String,
+}
+
 struct Order {
     status: &'static str,
-    challenge_status: &'static str,
-    token: String,
+    auths: Vec<Auth>,
     certificate: Option<String>,
 }
+
+type DnsRecords = Arc<Mutex<std::collections::HashMap<String, Vec<String>>>>;
 
 struct CaState {
     base: String,
     nonce_url: Option<String>,
     kind: &'static str,
+    domains: Vec<String>,
     challenge_address: SocketAddr,
     issuer: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
     jwk: Option<Value>,
@@ -198,7 +206,7 @@ struct CaState {
     nonce_failure: bool,
     bad_nonces: usize,
     fail_state_sync_on: Option<&'static str>,
-    dns_records: Option<Arc<Mutex<std::collections::HashMap<String, String>>>>,
+    dns_records: Option<DnsRecords>,
 }
 
 struct Fixture {
@@ -240,6 +248,7 @@ impl Fixture {
             base,
             nonce_url: None,
             kind: if tls_alpn { "tls-alpn-01" } else { "http-01" },
+            domains: vec!["proxy.test".into()],
             challenge_address,
             issuer,
             jwk: None,
@@ -318,7 +327,7 @@ impl Fixture {
         std::fs::write(&ca, &self.ca_pem).unwrap();
         let state = self.state.lock();
         AcmeConfig {
-            domains: vec!["proxy.test".into()],
+            domains: state.domains.clone(),
             directory_url: format!("{}/directory", state.base),
             state_dir: directory.join("state"),
             terms_of_service: Some("https://ca.test/terms".into()),
@@ -353,10 +362,26 @@ fn response(
     response.body(Full::new(body.into())).unwrap()
 }
 
+fn auth_url(base: &str, kind: &str, id: usize, auth_idx: usize) -> String {
+    if auth_idx == 0 {
+        format!("{base}/{kind}/{id}")
+    } else {
+        format!("{base}/{kind}/{id}-{auth_idx}")
+    }
+}
+
 fn order_json(state: &CaState, id: usize) -> Value {
     let order = &state.orders[id];
-    json!({"status": order.status, "identifiers": [{"type":"dns", "value":"proxy.test"}],
-        "authorizations":[format!("{}/auth/{id}", state.base)], "finalize":format!("{}/finalize/{id}", state.base),
+    let identifiers: Vec<_> = order
+        .auths
+        .iter()
+        .map(|auth| json!({"type":"dns", "value":auth.domain}))
+        .collect();
+    let authorizations: Vec<_> = (0..order.auths.len())
+        .map(|auth_idx| auth_url(&state.base, "auth", id, auth_idx))
+        .collect();
+    json!({"status": order.status, "identifiers": identifiers,
+        "authorizations": authorizations, "finalize":format!("{}/finalize/{id}", state.base),
         "certificate": order.certificate.as_ref().map(|_| format!("{}/certificate/{id}", state.base))})
 }
 
@@ -514,15 +539,26 @@ async fn handle(
             return Ok(response);
         }
         if path == "/new-order" {
-            assert_eq!(
-                payload["identifiers"],
-                json!([{"type":"dns", "value":"proxy.test"}])
-            );
+            let expected: Vec<_> = state
+                .domains
+                .iter()
+                .map(|domain| json!({"type":"dns", "value":domain}))
+                .collect();
+            assert_eq!(payload["identifiers"], Value::Array(expected));
             let id = state.orders.len();
+            let auths = state
+                .domains
+                .iter()
+                .cloned()
+                .map(|domain| Auth {
+                    domain,
+                    status: "pending",
+                    token: B64.encode(rand::random::<[u8; 24]>()),
+                })
+                .collect();
             state.orders.push(Order {
                 status: "pending",
-                challenge_status: "pending",
-                token: B64.encode(rand::random::<[u8; 24]>()),
+                auths,
                 certificate: None,
             });
             let order = order_json(&state, id).to_string();
@@ -536,16 +572,22 @@ async fn handle(
             return Ok(response);
         }
     }
-    let (operation, id) = path.trim_start_matches('/').split_once('/').unwrap();
-    let id: usize = id.parse().unwrap();
+    let (operation, raw_id) = path.trim_start_matches('/').split_once('/').unwrap();
+    let (id, auth_idx) = match raw_id.split_once('-') {
+        Some((order_id, auth_id)) => (
+            order_id.parse::<usize>().unwrap(),
+            auth_id.parse::<usize>().unwrap(),
+        ),
+        None => (raw_id.parse::<usize>().unwrap(), 0),
+    };
     if operation == "challenge" {
         let (deferred, stalled) = {
             let mut state = state.lock();
             assert_eq!(
-                state.orders[id].challenge_status, "pending",
+                state.orders[id].auths[auth_idx].status, "pending",
                 "processing challenges must not be resubmitted"
             );
-            state.orders[id].challenge_status = "processing";
+            state.orders[id].auths[auth_idx].status = "processing";
             state.challenge_requests += 1;
             (state.defer_validation, state.challenge_stall)
         };
@@ -553,11 +595,11 @@ async fn handle(
             std::future::pending::<()>().await;
         }
         if !deferred {
-            validate_challenge(&state, id).await?;
+            validate_challenge_auth(&state, id, auth_idx).await?;
         }
         let mut state = state.lock();
-        let value = json!({"type":state.kind, "url":format!("{}/challenge/{id}", state.base),
-            "token":state.orders[id].token, "status":if deferred {"processing"} else {"valid"}});
+        let value = json!({"type":state.kind, "url":auth_url(&state.base, "challenge", id, auth_idx),
+            "token":state.orders[id].auths[auth_idx].token, "status":if deferred {"processing"} else {"valid"}});
         let mut response = response(&mut state, 200, value.to_string(), None);
         if let Some(delay) = state.challenge_retry_after {
             response
@@ -566,9 +608,9 @@ async fn handle(
         }
         return Ok(response);
     }
-    let mut state = state.lock();
-    let value = match operation {
-        "order" => {
+    if operation == "order" {
+        let pending_processing = {
+            let mut state = state.lock();
             state.order_requests += 1;
             if let Some(status) = state.missing_order_status {
                 let mut response = response(
@@ -587,25 +629,60 @@ async fn handle(
             }
             if state.invalidate_on_poll {
                 state.orders[id].status = "invalid";
-                state.orders[id].challenge_status = "invalid";
+                for auth in &mut state.orders[id].auths {
+                    auth.status = "invalid";
+                }
             }
-            order_json(&state, id)
+            if !state.defer_validation && state.orders[id].status == "pending" {
+                (0..state.orders[id].auths.len())
+                    .filter(|&idx| state.orders[id].auths[idx].status == "processing")
+                    .collect::<Vec<_>>()
+            } else {
+                vec![]
+            }
+        };
+        for idx in pending_processing {
+            validate_challenge_auth(&state, id, idx).await?;
         }
-        "auth" => json!({"identifier":{"type":"dns", "value":"proxy.test"},
-            "status": if state.invalid_authorization || state.orders[id].status == "invalid" {"invalid"} else if state.orders[id].status == "pending" {"pending"} else {"valid"},
-            "challenges":[{"type":state.kind, "url":format!("{}/challenge/{id}", state.base),
-                "token":state.orders[id].token, "status":state.orders[id].challenge_status,
-                "error": if state.invalid_authorization || state.orders[id].challenge_status == "invalid" {
-                    Some(json!({"type":"urn:ietf:params:acme:error:connection", "detail":"PRIVATE VALIDATION DATA"}))
-                } else { None }}]}),
+        let mut state = state.lock();
+        let value = order_json(&state, id);
+        let mut response = response(&mut state, 200, value.to_string(), None);
+        if let Some(delay) = state.order_retry_after {
+            response
+                .headers_mut()
+                .insert("retry-after", delay.to_string().parse().unwrap());
+        }
+        return Ok(response);
+    }
+    let mut state = state.lock();
+    let value = match operation {
+        "auth" => {
+            let auth_status = state.orders[id].auths[auth_idx].status;
+            let overall_status = if state.invalid_authorization || state.orders[id].status == "invalid" {
+                "invalid"
+            } else if auth_status == "valid" {
+                "valid"
+            } else {
+                "pending"
+            };
+            json!({"identifier":{"type":"dns", "value":state.orders[id].auths[auth_idx].domain},
+                "status": overall_status,
+                "challenges":[{"type":state.kind, "url":auth_url(&state.base, "challenge", id, auth_idx),
+                    "token":state.orders[id].auths[auth_idx].token, "status":auth_status,
+                    "error": if state.invalid_authorization || auth_status == "invalid" {
+                        Some(json!({"type":"urn:ietf:params:acme:error:connection", "detail":"PRIVATE VALIDATION DATA"}))
+                    } else { None }}]})
+        }
         "finalize" => {
             assert_eq!(state.orders[id].status, "ready");
             let csr = B64.decode(payload["csr"].as_str().unwrap()).unwrap();
             let mut csr = rcgen::CertificateSigningRequestParams::from_der(&csr.into()).unwrap();
-            assert_eq!(
-                csr.params.subject_alt_names,
-                [rcgen::SanType::DnsName("proxy.test".try_into().unwrap())]
-            );
+            let expected_sans: Vec<_> = state
+                .domains
+                .iter()
+                .map(|domain| rcgen::SanType::DnsName(domain.clone().try_into().unwrap()))
+                .collect();
+            assert_eq!(csr.params.subject_alt_names, expected_sans);
             csr.params.serial_number = Some((id as u64 + 1).into());
             csr.params.use_authority_key_identifier_extension = true;
             let cert = csr.signed_by(&state.issuer).unwrap();
@@ -631,7 +708,6 @@ async fn handle(
     };
     let mut response = response(&mut state, 200, value.to_string(), None);
     let retry_after = match operation {
-        "order" => state.order_retry_after,
         "finalize" => state.finalize_retry_after,
         "auth" => state.authorization_retry_after,
         _ => None,
@@ -645,12 +721,22 @@ async fn handle(
 }
 
 async fn validate_challenge(state: &Arc<Mutex<CaState>>, id: usize) -> io::Result<()> {
-    let (address, kind, token, authorization, dns_records) = {
+    validate_challenge_auth(state, id, 0).await
+}
+
+async fn validate_challenge_auth(
+    state: &Arc<Mutex<CaState>>,
+    id: usize,
+    auth_idx: usize,
+) -> io::Result<()> {
+    let (address, kind, domain, token, authorization, dns_records) = {
         let state = state.lock();
-        let token = state.orders[id].token.clone();
+        let auth = &state.orders[id].auths[auth_idx];
+        let token = auth.token.clone();
         (
             state.challenge_address,
             state.kind,
+            auth.domain.clone(),
             token.clone(),
             format!("{token}.{}", thumbprint(state.jwk.as_ref().unwrap())),
             state.dns_records.clone(),
@@ -661,7 +747,7 @@ async fn validate_challenge(state: &Arc<Mutex<CaState>>, id: usize) -> io::Resul
         stream
             .write_all(
                 format!(
-                    "GET /.well-known/acme-challenge/{token} HTTP/1.1\r\nHost: proxy.test\r\n\r\n"
+                    "GET /.well-known/acme-challenge/{token} HTTP/1.1\r\nHost: {domain}\r\n\r\n"
                 )
                 .as_bytes(),
             )
@@ -677,7 +763,11 @@ async fn validate_challenge(state: &Arc<Mutex<CaState>>, id: usize) -> io::Resul
             &aws_lc_rs::digest::SHA256,
             authorization.as_bytes(),
         ));
-        let found = records.lock().values().any(|val| val == &expected_digest);
+        let found = records
+            .lock()
+            .values()
+            .flatten()
+            .any(|val| val == &expected_digest);
         assert!(
             found,
             "expected dns-01 TXT record with digest {expected_digest} was not found in acme-dns records"
@@ -685,8 +775,11 @@ async fn validate_challenge(state: &Arc<Mutex<CaState>>, id: usize) -> io::Resul
     } else {
         validate_tls_challenge(address, &authorization).await;
     }
-    state.lock().orders[id].status = "ready";
-    state.lock().orders[id].challenge_status = "valid";
+    let mut state = state.lock();
+    state.orders[id].auths[auth_idx].status = "valid";
+    if state.orders[id].auths.iter().all(|auth| auth.status == "valid") {
+        state.orders[id].status = "ready";
+    }
     Ok(())
 }
 
@@ -2350,7 +2443,8 @@ fn acme_diagnostics_omit_remote_details_and_json_values() {
 
 struct MockAcmeDns {
     address: SocketAddr,
-    records: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    records: DnsRecords,
+    updates: Arc<AtomicUsize>,
     auth: Arc<Mutex<Option<(String, String)>>>,
     status_code: Arc<std::sync::atomic::AtomicU16>,
     task: tokio::task::JoinHandle<()>,
@@ -2360,11 +2454,15 @@ impl MockAcmeDns {
     async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let records = Arc::new(Mutex::new(std::collections::HashMap::<String, String>::new()));
+        let records = Arc::new(Mutex::new(
+            std::collections::HashMap::<String, Vec<String>>::new(),
+        ));
+        let updates = Arc::new(AtomicUsize::new(0));
         let auth = Arc::new(Mutex::new(None));
         let status_code = Arc::new(std::sync::atomic::AtomicU16::new(200));
 
         let server_records = records.clone();
+        let server_updates = updates.clone();
         let server_auth = auth.clone();
         let server_status = status_code.clone();
 
@@ -2375,11 +2473,13 @@ impl MockAcmeDns {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break; };
                         let records = server_records.clone();
+                        let updates = server_updates.clone();
                         let auth = server_auth.clone();
                         let status_code = server_status.clone();
                         connections.spawn(async move {
                             let service = hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
                                 let records = records.clone();
+                                let updates = updates.clone();
                                 let auth = auth.clone();
                                 let status_code = status_code.clone();
                                 async move {
@@ -2425,7 +2525,16 @@ impl MockAcmeDns {
                                             .unwrap();
                                         return Ok(response);
                                     };
-                                    records.lock().insert(subdomain.to_string(), txt.to_string());
+                                    {
+                                        let mut map = records.lock();
+                                        let entry = map.entry(subdomain.to_string()).or_default();
+                                        entry.push(txt.to_string());
+                                        if entry.len() > 2 {
+                                            let excess = entry.len() - 2;
+                                            entry.drain(..excess);
+                                        }
+                                    }
+                                    updates.fetch_add(1, Ordering::SeqCst);
                                     let response = http::Response::builder()
                                         .status(200)
                                         .header("content-type", "application/json")
@@ -2447,6 +2556,7 @@ impl MockAcmeDns {
         Self {
             address,
             records,
+            updates,
             auth,
             status_code,
             task,
@@ -2482,7 +2592,11 @@ async fn acme_dns_client_update_and_error_handling() {
     .await
     .unwrap();
     assert_eq!(
-        mock.records.lock().get("sub-uuid-1").map(|s| s.as_str()),
+        mock.records
+            .lock()
+            .get("sub-uuid-1")
+            .and_then(|v| v.last())
+            .map(String::as_str),
         Some("txt-digest-abc")
     );
 
@@ -2514,7 +2628,20 @@ async fn acme_dns_client_update_and_error_handling() {
     assert!(err.to_string().contains("HTTP 500"), "{err}");
     assert!(!err.to_string().contains("error status"), "remote body leaked: {err}");
 
-    // 4. URL path variants: server_url with trailing slash or with /update
+    // 4. URL validation reports ACME-DNS label
+    let err = update_acme_dns(
+        tls.clone(),
+        "http://acme-dns.example.test",
+        "test-user",
+        "test-pass",
+        "sub-uuid-1",
+        "txt-digest-abc",
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().starts_with("ACME-DNS requires HTTPS"), "{err}");
+
+    // 5. URL path variants: server_url with trailing slash or with /update
     mock.status_code.store(200, Ordering::SeqCst);
     update_acme_dns(
         tls.clone(),
@@ -2527,7 +2654,11 @@ async fn acme_dns_client_update_and_error_handling() {
     .await
     .unwrap();
     assert_eq!(
-        mock.records.lock().get("sub-uuid-2").map(|s| s.as_str()),
+        mock.records
+            .lock()
+            .get("sub-uuid-2")
+            .and_then(|v| v.last())
+            .map(String::as_str),
         Some("txt-digest-2")
     );
 
@@ -2542,7 +2673,11 @@ async fn acme_dns_client_update_and_error_handling() {
     .await
     .unwrap();
     assert_eq!(
-        mock.records.lock().get("sub-uuid-3").map(|s| s.as_str()),
+        mock.records
+            .lock()
+            .get("sub-uuid-3")
+            .and_then(|v| v.last())
+            .map(String::as_str),
         Some("txt-digest-3")
     );
 }
@@ -2586,4 +2721,93 @@ async fn acme_dns_issuance_roundtrip() {
     let resumed = Source::new("fixture".into(), super::super::Spec::Acme(config.clone())).unwrap();
     load_cached(&resumed, &config).unwrap();
     assert_eq!(resumed.current().unwrap().cert[0], cert);
+}
+
+#[tokio::test]
+async fn acme_dns_wildcard_multidomain_single_wait_and_deferred_poll() {
+    let directory = tempfile::tempdir().unwrap();
+    let mock_dns = MockAcmeDns::start().await;
+    *mock_dns.auth.lock() = Some(("dns_user".into(), "dns_secret".into()));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture = Fixture::new(listener.local_addr().unwrap(), false).await;
+    {
+        let mut state = fixture.state.lock();
+        state.kind = "dns-01";
+        state.domains = vec!["proxy.test".into(), "*.proxy.test".into()];
+        state.dns_records = Some(mock_dns.records.clone());
+        state.defer_validation = true;
+    }
+
+    let mut config = fixture.config(directory.path(), false);
+    config.challenge = ChallengeConfig::AcmeDns {
+        server_url: mock_dns.url(),
+        username: "dns_user".into(),
+        password: crate::config::quic_client::Secret("dns_secret".into()),
+        subdomain: "wildcard-acme-dns-test".into(),
+        propagation_delay: Some(3),
+    };
+    let _lock = lock_state(&config).unwrap();
+
+    let source = Source::new("fixture".into(), super::super::Spec::Acme(config.clone())).unwrap();
+    let client = HttpClient::new(client_tls(config.ca_cert.as_deref()).unwrap(), &config);
+
+    // Turn 1: publishes both TXT values, waits the 3 s propagation delay once, marks both ready,
+    // and pauses while challenges are processing.
+    let started = Instant::now();
+    let mut scheduler = Scheduler::new();
+    scheduler.client = Some(client.clone());
+    let turn = scheduler.turn(&source, &config).await;
+    let elapsed = started.elapsed();
+    assert_eq!(turn.outcome.unwrap(), Progress::Pending);
+    assert!(
+        elapsed >= Duration::from_millis(2800) && elapsed < Duration::from_millis(5500),
+        "expected one shared 3 s wait across 2 domains, got {elapsed:?}"
+    );
+    assert_eq!(mock_dns.updates.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        mock_dns
+            .records
+            .lock()
+            .get("wildcard-acme-dns-test")
+            .map(Vec::len),
+        Some(2)
+    );
+
+    // Turn 2: CA finishes validation; resumed poll must not re-upload TXT or sleep again.
+    fixture.state.lock().defer_validation = false;
+    expire_retry(&config);
+    let resumed_start = Instant::now();
+    drive(&source, &config, client).await.unwrap();
+    assert!(
+        resumed_start.elapsed() < Duration::from_millis(2800),
+        "resumed poll should not re-wait propagation_delay"
+    );
+    assert_eq!(mock_dns.updates.load(Ordering::SeqCst), 2);
+
+    let material = source.current().unwrap();
+    let (_, parsed) = x509_parser::parse_x509_certificate(&material.cert[0]).unwrap();
+    let san = parsed.subject_alternative_name().unwrap().unwrap();
+    let names: Vec<_> = san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            x509_parser::extensions::GeneralName::DNSName(dns) => Some(*dns),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, ["proxy.test", "*.proxy.test"]);
+    assert!(
+        config
+            .domains
+            .iter()
+            .any(|pattern| super::super::domain_covers(pattern, "a.proxy.test"))
+    );
+    assert!(
+        !config
+            .domains
+            .iter()
+            .any(|pattern| super::super::domain_covers(pattern, "a.b.proxy.test"))
+    );
 }

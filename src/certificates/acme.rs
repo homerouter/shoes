@@ -28,12 +28,18 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
 mod tests;
 
 pub(super) fn validate_url(value: &str) -> io::Result<url::Url> {
+    validate_url_for(value, "ACME")
+}
+
+pub(super) fn validate_url_for(value: &str, service: &str) -> io::Result<url::Url> {
     // instant-acme builds requests from the original string, not Url's normalized form.
-    let uri: http::Uri = value.parse().map_err(|_| invalid("invalid ACME URL"))?;
+    let uri: http::Uri = value
+        .parse()
+        .map_err(|_| invalid(&format!("invalid {service} URL")))?;
     if uri.scheme().is_none() || uri.authority().is_none() {
-        return Err(invalid("invalid ACME URL"));
+        return Err(invalid(&format!("invalid {service} URL")));
     }
-    let url = url::Url::parse(value).map_err(|_| invalid("invalid ACME URL"))?;
+    let url = url::Url::parse(value).map_err(|_| invalid(&format!("invalid {service} URL")))?;
     let loopback = url.host_str().is_some_and(|host| {
         host.trim_matches(['[', ']'])
             .parse::<std::net::IpAddr>()
@@ -45,9 +51,9 @@ pub(super) fn validate_url(value: &str) -> io::Result<url::Url> {
         || url.password().is_some()
         || url.fragment().is_some()
     {
-        return Err(invalid(
-            "ACME requires HTTPS (HTTP is allowed only for a numeric loopback test CA), without credentials or fragments",
-        ));
+        return Err(invalid(&format!(
+            "{service} requires HTTPS (HTTP is allowed only for a numeric loopback test endpoint), without credentials or fragments"
+        )));
     }
     Ok(url)
 }
@@ -219,10 +225,11 @@ impl HttpClient {
 async fn connect_stream(
     url: &url::Url,
     tls: &Arc<rustls::ClientConfig>,
+    service: &str,
 ) -> io::Result<Box<dyn crate::async_stream::AsyncStream>> {
     let host = url
         .host_str()
-        .ok_or_else(|| invalid("ACME URL has no host"))?
+        .ok_or_else(|| invalid(&format!("{service} URL has no host")))?
         .trim_matches(['[', ']']);
     let location = crate::address::NetLocation::new(
         crate::address::Address::from(host)?,
@@ -243,10 +250,10 @@ async fn connect_stream(
             break;
         }
     }
-    let stream = stream.ok_or_else(|| io::Error::other("ACME connection failed"))?;
+    let stream = stream.ok_or_else(|| io::Error::other(format!("{service} connection failed")))?;
     if url.scheme() == "https" {
         let name = rustls::pki_types::ServerName::try_from(host.to_owned())
-            .map_err(|_| invalid("invalid ACME TLS hostname"))?;
+            .map_err(|_| invalid(&format!("invalid {service} TLS hostname")))?;
         let connection = rustls::ClientConnection::new(tls.clone(), name)
             .map_err(io::Error::other)?;
         Ok(Box::new(
@@ -267,6 +274,7 @@ async fn connect_stream(
 async fn send_http1<B>(
     stream: Box<dyn crate::async_stream::AsyncStream>,
     request: http::Request<B>,
+    service: &str,
     on_head: impl FnOnce(&http::response::Parts) -> io::Result<()>,
 ) -> io::Result<(http::response::Parts, Bytes)>
 where
@@ -292,13 +300,15 @@ where
             .sum::<usize>()
             > 32 * 1024
         {
-            return Err(io::Error::other("ACME response headers exceed 32 KiB"));
+            return Err(io::Error::other(format!(
+                "{service} response headers exceed 32 KiB"
+            )));
         }
         on_head(&parts)?;
         let bytes = Limited::new(body, MAX_RESPONSE)
             .collect()
             .await
-            .map_err(|_| io::Error::other("ACME response failed or exceeded 1 MiB"))?
+            .map_err(|_| io::Error::other(format!("{service} response failed or exceeded 1 MiB")))?
             .to_bytes();
         Ok::<_, io::Error>((parts, bytes))
     };
@@ -326,7 +336,7 @@ pub(super) async fn update_acme_dns(
     subdomain: &str,
     txt: &str,
 ) -> io::Result<()> {
-    let mut url = validate_url(server_url)?;
+    let mut url = validate_url_for(server_url, "ACME-DNS")?;
     if url.query().is_some() {
         return Err(invalid("ACME-DNS server_url must not contain a query string"));
     }
@@ -356,8 +366,8 @@ pub(super) async fn update_acme_dns(
         .map_err(|e| io::Error::other(format!("failed to build ACME-DNS request: {e}")))?;
 
     tokio::time::timeout(REQUEST_TIMEOUT, async {
-        let stream = connect_stream(&url, &tls).await?;
-        let (parts, _) = send_http1(stream, request, |_| Ok(())).await?;
+        let stream = connect_stream(&url, &tls, "ACME-DNS").await?;
+        let (parts, _) = send_http1(stream, request, "ACME-DNS", |_| Ok(())).await?;
         // Never log the remote body; the status is enough to diagnose.
         if !parts.status.is_success() {
             return Err(io::Error::other(format!(
@@ -393,7 +403,7 @@ impl instant_acme::HttpClient for HttpClient {
                         "ACME HTTPS directory cannot downgrade to HTTP endpoints",
                     ));
                 }
-                let stream = connect_stream(&url, &client.tls).await?;
+                let stream = connect_stream(&url, &client.tls, "ACME").await?;
                 let authority = request
                     .uri()
                     .authority()
@@ -421,7 +431,7 @@ impl instant_acme::HttpClient for HttpClient {
                     .map_or("/", |path| path.as_str())
                     .parse()
                     .map_err(|_| invalid("invalid ACME path"))?;
-                let (parts, bytes) = send_http1(stream, request, |parts| {
+                let (parts, bytes) = send_http1(stream, request, "ACME", |parts| {
                     *client.last.lock() = Some(ResponseMetadata {
                         url: request_url,
                         status: parts.status,
@@ -1154,6 +1164,11 @@ impl Scheduler {
         deadline: tokio::time::Instant,
     ) -> Result<(), Failure> {
         let client = self.client(config)?;
+        let acme_dns_tls = if matches!(config.challenge, ChallengeConfig::AcmeDns { .. }) {
+            Some(client_tls(None).map_err(|error| instant_acme::Error::Other(Box::new(error)))?)
+        } else {
+            None
+        };
         let mut dns_published = false;
         let mut authorizations = order.authorizations();
         loop {
@@ -1235,7 +1250,10 @@ impl Scheduler {
                 // Publish every TXT value now; challenges are marked ready after one shared wait below.
                 if challenge.status == ChallengeStatus::Pending {
                     update_acme_dns(
-                        client_tls(None).map_err(|error| instant_acme::Error::Other(Box::new(error)))?,
+                        acme_dns_tls
+                            .as_ref()
+                            .expect("acme-dns TLS config initialized")
+                            .clone(),
                         server_url,
                         username,
                         &password.0,
