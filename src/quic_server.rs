@@ -339,6 +339,12 @@ pub async fn start_quic_servers(
                 collect_started_listeners(&mut handles, result).await?;
             }
         }
+        ResolvedServerProxyConfig::Masque(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "MASQUE server not implemented yet",
+            ));
+        }
         tcp_protocol => {
             // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
             let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();

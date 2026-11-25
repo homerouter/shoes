@@ -965,6 +965,7 @@ pub enum ServerProxyConfig {
         #[serde(default = "default_true")]
         udp_enabled: bool,
     },
+    Masque(super::masque::MasqueServerConfig),
 }
 
 impl std::fmt::Display for ServerProxyConfig {
@@ -1017,6 +1018,7 @@ impl std::fmt::Display for ServerProxyConfig {
             Self::Mixed { .. } => write!(f, "Mixed (HTTP+SOCKS5)"),
             Self::Anytls { .. } => write!(f, "AnyTLS"),
             Self::Naiveproxy { .. } => write!(f, "NaiveProxy"),
+            Self::Masque(..) => write!(f, "MASQUE"),
         }
     }
 }
@@ -1141,6 +1143,7 @@ pub enum ResolvedServerProxyConfig {
         fallback: Option<NaiveFallbackConfig>,
         udp_enabled: bool,
     },
+    Masque(super::masque::MasqueServerConfig),
 }
 
 impl std::fmt::Display for ResolvedServerProxyConfig {
@@ -1193,6 +1196,7 @@ impl std::fmt::Display for ResolvedServerProxyConfig {
             Self::Mixed { .. } => write!(f, "Mixed (HTTP+SOCKS5)"),
             Self::Anytls { .. } => write!(f, "AnyTLS"),
             Self::Naiveproxy { .. } => write!(f, "NaiveProxy"),
+            Self::Masque(..) => write!(f, "MASQUE"),
         }
     }
 }

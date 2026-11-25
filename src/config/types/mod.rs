@@ -19,6 +19,7 @@ pub mod common;
 pub mod dns;
 pub mod global;
 pub mod groups;
+pub mod masque;
 pub mod ntp;
 pub mod quic_client;
 pub mod rules;
@@ -46,6 +47,7 @@ pub use groups::{
     ClientConfigGroup, ClientGroupMember, Config, GroupType, NamedPem, PemSource, RuleSourceGroup,
     UrlTestConfig,
 };
+pub use masque::{MasqueServerConfig, MasqueUserConfig};
 pub use ntp::NtpConfig;
 pub use rules::{ClientChain, ClientChainHop, RuleActionConfig, RuleConfig};
 pub use selection::ConfigSelection;

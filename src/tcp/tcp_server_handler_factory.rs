@@ -483,6 +483,12 @@ fn create_handler(
                 "NaiveProxy must be used inside a TLS or Reality protocol",
             ));
         }
+        ResolvedServerProxyConfig::Masque(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "MASQUE server not implemented yet",
+            ));
+        }
         unknown_config => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,

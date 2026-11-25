@@ -296,6 +296,7 @@ impl Inline for ResolvedServerProxyConfig {
                 fallback,
                 udp_enabled,
             },
+            ServerProxyConfig::Masque(config) => Self::Masque(config),
         }
     }
 }

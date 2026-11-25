@@ -211,6 +211,7 @@ pub fn inbound_type(protocol: &ResolvedServerProxyConfig) -> &'static str {
         ResolvedServerProxyConfig::Grpc { .. } => "gRPC",
         ResolvedServerProxyConfig::SudokuMask(config) => inbound_type(&config.protocol),
         ResolvedServerProxyConfig::Xhttp(_) => "XHTTP",
+        ResolvedServerProxyConfig::Masque(_) => "MASQUE",
         _ => "Shoes",
     }
 }

@@ -929,3 +929,331 @@ client_chain:
     let deserialized: ShadowTlsRemoteHandshake = serde_yaml::from_str(&serialized).unwrap();
     assert_eq!(deserialized.client_chain.len(), original.client_chain.len());
 }
+
+#[test]
+fn masque_config_deserialization_defaults_and_validation() {
+    use crate::config::create_server_configs;
+    use crate::config::resolved::ResolvedConfig;
+    use crate::config::types::masque::{MasqueServerConfig, MasqueUserConfig};
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.signing_key.serialize_pem();
+    let ca = rcgen::generate_simple_self_signed(vec!["client-ca".into()]).unwrap();
+    let ca_pem = ca.cert.pem();
+
+    // 1. Valid QUIC MASQUE with defaults + users (plaintext and $argon2id$)
+    let quic_yaml = serde_json::json!([{
+        "address": "0.0.0.0:443",
+        "transport": "quic",
+        "quic_settings": {
+            "cert": cert_pem,
+            "key": key_pem,
+        },
+        "protocol": {
+            "type": "masque",
+            "users": [
+                {"username": "alice", "password": "secret-password"},
+                {"username": "bob", "password": "$argon2id$v=19$m=65536,t=3,p=1$c2FsdA$aGFzaA"},
+            ]
+        }
+    }]);
+    let configs: Vec<crate::config::Config> =
+        serde_yaml::from_str(&quic_yaml.to_string()).unwrap();
+    let ServerConfig { protocol, .. } = match &configs[0] {
+        crate::config::Config::Server(s) => s,
+        _ => panic!("expected server"),
+    };
+    assert_eq!(protocol.to_string(), "MASQUE");
+    let debug_str = format!("{protocol:?}");
+    assert!(!debug_str.contains("secret-password"), "{debug_str}");
+    assert!(!debug_str.contains("$argon2id$"), "{debug_str}");
+
+    let validated = create_server_configs(configs).unwrap();
+    let ResolvedConfig::Server(resolved_server) = &validated.configs[0] else {
+        panic!("expected resolved server");
+    };
+    assert_eq!(resolved_server.protocol.to_string(), "MASQUE");
+    let ResolvedServerProxyConfig::Masque(masque) = &resolved_server.protocol else {
+        panic!("expected ResolvedServerProxyConfig::Masque");
+    };
+    assert!(masque.udp_enabled);
+    assert_eq!(
+        masque.udp_template,
+        "/.well-known/masque/udp/{target_host}/{target_port}/"
+    );
+    assert!(!masque.ip_enabled);
+    assert_eq!(
+        masque.ip_template,
+        "/.well-known/masque/ip/{target}/{ipproto}/"
+    );
+    assert!(masque.tunnel_addresses.is_empty());
+    assert!(masque.advertise_routes.is_empty());
+    assert_eq!(masque.mtu, 1280);
+    assert!(masque.stealth_404);
+    assert_eq!(masque.max_concurrent_requests, 1024);
+
+    // 2. Valid QUIC MASQUE with explicit h3 ALPN, mTLS only (no users), and CONNECT-IP
+    for quic_extra in [
+        serde_json::json!({"alpn_protocols": ["h3"], "client_ca_certs": ca_pem}),
+        serde_json::json!({"alpn_protocols": "h3", "client_fingerprints": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}),
+    ] {
+        let mut quic_settings = serde_json::json!({
+            "cert": cert_pem,
+            "key": key_pem,
+        });
+        for (k, v) in quic_extra.as_object().unwrap() {
+            quic_settings[k] = v.clone();
+        }
+        let ip_yaml = serde_json::json!([{
+            "address": "0.0.0.0:443",
+            "transport": "quic",
+            "quic_settings": quic_settings,
+            "protocol": {
+                "type": "masque",
+                "ip_enabled": true,
+                "tunnel_addresses": ["10.10.0.1/24", "fd00:10::1/64"],
+                "mtu": 1400,
+                "stealth_404": false,
+                "max_concurrent_requests": 256,
+            }
+        }]);
+        let configs: Vec<crate::config::Config> =
+            serde_yaml::from_str(&ip_yaml.to_string()).unwrap();
+        let validated = create_server_configs(configs).unwrap();
+        let ResolvedConfig::Server(resolved_server) = &validated.configs[0] else {
+            panic!("expected resolved server");
+        };
+        let ResolvedServerProxyConfig::Masque(masque) = &resolved_server.protocol else {
+            panic!("expected MASQUE");
+        };
+        assert_eq!(
+            masque.effective_advertise_routes(),
+            vec![
+                "0.0.0.0/0".parse::<ipnetwork::IpNetwork>().unwrap(),
+                "::/0".parse::<ipnetwork::IpNetwork>().unwrap(),
+            ]
+        );
+    }
+
+    // 3. Valid TCP + TLS + MASQUE (HTTP/2 fallback) in both tls_targets and default_target
+    for alpn in [
+        None,
+        Some(serde_json::json!(["h2"])),
+        Some(serde_json::json!(["h2", "http/1.1"])),
+    ] {
+        let mut target = serde_json::json!({
+            "cert": cert_pem,
+            "key": key_pem,
+            "protocol": {
+                "type": "masque",
+                "user": {"username": "alice", "password": "secret"}
+            }
+        });
+        if let Some(alpn) = alpn {
+            target["alpn_protocols"] = alpn;
+        }
+        let tls_yaml = serde_json::json!([{
+            "address": "0.0.0.0:443",
+            "protocol": {
+                "type": "tls",
+                "tls_targets": {
+                    "masque.example": target
+                },
+                "default_target": {
+                    "cert": cert_pem,
+                    "key": key_pem,
+                    "client_ca_certs": ca_pem,
+                    "protocol": {"type": "masque"}
+                }
+            }
+        }]);
+        let configs: Vec<crate::config::Config> =
+            serde_yaml::from_str(&tls_yaml.to_string()).unwrap();
+        create_server_configs(configs).unwrap();
+    }
+
+    // 4. Reject unknown fields on MasqueServerConfig / MasqueUserConfig
+    assert!(
+        serde_yaml::from_str::<MasqueServerConfig>("unknown_field: true").is_err(),
+        "unknown field on MasqueServerConfig must fail"
+    );
+    assert!(
+        serde_yaml::from_str::<MasqueUserConfig>(
+            "username: a\npassword: b\nextra: true"
+        )
+        .is_err(),
+        "unknown field on MasqueUserConfig must fail"
+    );
+
+    // 5. Reject ip_enabled: true without tunnel_addresses or invalid tunnel_addresses
+    for bad_ip_cfg in [
+        serde_json::json!({"type": "masque", "ip_enabled": true, "users": [{"username": "u", "password": "p"}]}),
+        serde_json::json!({"type": "masque", "ip_enabled": true, "tunnel_addresses": ["10.0.0.1/24", "10.1.0.1/24"], "users": [{"username": "u", "password": "p"}]}),
+        serde_json::json!({"type": "masque", "ip_enabled": true, "tunnel_addresses": ["fd00::1/64", "fd01::1/64"], "users": [{"username": "u", "password": "p"}]}),
+        serde_json::json!({"type": "masque", "ip_enabled": true, "tunnel_addresses": ["10.0.0.1/32"], "users": [{"username": "u", "password": "p"}]}),
+        serde_json::json!({"type": "masque", "ip_enabled": true, "tunnel_addresses": ["10.0.0.0/31"], "users": [{"username": "u", "password": "p"}]}),
+        serde_json::json!({"type": "masque", "ip_enabled": true, "tunnel_addresses": ["fd00::1/128"], "users": [{"username": "u", "password": "p"}]}),
+        serde_json::json!({"type": "masque", "ip_enabled": true, "tunnel_addresses": ["fd00::/127"], "users": [{"username": "u", "password": "p"}]}),
+    ] {
+        let cfg: ServerProxyConfig = serde_json::from_value(bad_ip_cfg.clone()).unwrap();
+        let ServerProxyConfig::Masque(m) = cfg else {
+            panic!();
+        };
+        assert!(m.validate().is_err(), "should reject {bad_ip_cfg}");
+    }
+
+    // 6. Reject mtu < 1280, max_concurrent_requests == 0, invalid templates, bad users
+    for bad_cfg in [
+        serde_json::json!({"type": "masque", "mtu": 1279}),
+        serde_json::json!({"type": "masque", "mtu": 0}),
+        serde_json::json!({"type": "masque", "max_concurrent_requests": 0}),
+        serde_json::json!({"type": "masque", "udp_template": "relative/no-leading-slash/{target_host}/{target_port}"}),
+        serde_json::json!({"type": "masque", "udp_template": "/udp/{target_host}/missing-port"}),
+        serde_json::json!({"type": "masque", "udp_template": "/udp/{unknown_var}/{target_port}"}),
+        serde_json::json!({"type": "masque", "ip_template": "/ip/{unknown}"}),
+        serde_json::json!({"type": "masque", "ip_template": "no-slash"}),
+        serde_json::json!({"type": "masque", "users": [{"username": "", "password": "p"}]}),
+        serde_json::json!({"type": "masque", "users": [{"username": "u", "password": ""}]}),
+        serde_json::json!({"type": "masque", "users": [{"username": "u", "password": "p1"}, {"username": "u", "password": "p2"}]}),
+    ] {
+        let cfg: ServerProxyConfig = serde_json::from_value(bad_cfg.clone()).unwrap();
+        let ServerProxyConfig::Masque(m) = cfg else {
+            panic!();
+        };
+        assert!(m.validate().is_err(), "should reject {bad_cfg}");
+    }
+
+    // 7. Reject masque with neither users nor client-cert auth (QUIC & TLS)
+    let quic_no_auth = serde_json::json!([{
+        "address": "0.0.0.0:443",
+        "transport": "quic",
+        "quic_settings": {"cert": cert_pem, "key": key_pem},
+        "protocol": {"type": "masque"}
+    }]);
+    let configs: Vec<crate::config::Config> =
+        serde_yaml::from_str(&quic_no_auth.to_string()).unwrap();
+    assert!(
+        create_server_configs(configs).is_err(),
+        "QUIC masque without users or mTLS must fail"
+    );
+
+    let tls_no_auth = serde_json::json!([{
+        "address": "0.0.0.0:443",
+        "protocol": {
+            "type": "tls",
+            "default_target": {
+                "cert": cert_pem,
+                "key": key_pem,
+                "protocol": {"type": "masque"}
+            }
+        }
+    }]);
+    let configs: Vec<crate::config::Config> =
+        serde_yaml::from_str(&tls_no_auth.to_string()).unwrap();
+    assert!(
+        create_server_configs(configs).is_err(),
+        "TLS masque without users or mTLS must fail"
+    );
+
+    // 8. Reject bare TCP without TLS, websocket/httpupgrade/grpc/shadowtls/sudoku_mask/reality
+    let masque_with_user = serde_json::json!({
+        "type": "masque",
+        "users": [{"username": "alice", "password": "secret"}]
+    });
+    for invalid_server in [
+        serde_json::json!({
+            "address": "0.0.0.0:8080",
+            "protocol": masque_with_user
+        }),
+        serde_json::json!({
+            "address": "0.0.0.0:8080",
+            "protocol": {"type": "websocket", "targets": [{"protocol": masque_with_user}]}
+        }),
+        serde_json::json!({
+            "address": "0.0.0.0:8080",
+            "protocol": {"type": "httpupgrade", "targets": [{"protocol": masque_with_user}]}
+        }),
+        serde_json::json!({
+            "address": "0.0.0.0:8080",
+            "protocol": {"type": "grpc", "targets": [{"protocol": masque_with_user}]}
+        }),
+        serde_json::json!({
+            "address": "0.0.0.0:8080",
+            "protocol": {"type": "sudoku_mask", "protocol": masque_with_user}
+        }),
+        serde_json::json!({
+            "address": "0.0.0.0:443",
+            "protocol": {
+                "type": "tls",
+                "shadowtls_targets": {
+                    "cover.example": {
+                        "password": "secret",
+                        "handshake": {"cert": cert_pem, "key": key_pem},
+                        "protocol": masque_with_user
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "address": "0.0.0.0:443",
+            "protocol": {
+                "type": "tls",
+                "reality_targets": {
+                    "cover.example": {
+                        "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        "dest": "example.com:443",
+                        "protocol": masque_with_user
+                    }
+                }
+            }
+        }),
+        // QUIC with non-h3 ALPN
+        serde_json::json!({
+            "address": "0.0.0.0:443",
+            "transport": "quic",
+            "quic_settings": {"cert": cert_pem, "key": key_pem, "alpn_protocols": ["h2"]},
+            "protocol": masque_with_user
+        }),
+        // QUIC with explicit empty ALPN
+        serde_json::json!({
+            "address": "0.0.0.0:443",
+            "transport": "quic",
+            "quic_settings": {"cert": cert_pem, "key": key_pem, "alpn_protocols": []},
+            "protocol": masque_with_user
+        }),
+        // TLS with ALPN missing h2
+        serde_json::json!({
+            "address": "0.0.0.0:443",
+            "protocol": {
+                "type": "tls",
+                "default_target": {
+                    "cert": cert_pem,
+                    "key": key_pem,
+                    "alpn_protocols": ["http/1.1"],
+                    "protocol": masque_with_user
+                }
+            }
+        }),
+        // TLS with explicit empty ALPN
+        serde_json::json!({
+            "address": "0.0.0.0:443",
+            "protocol": {
+                "type": "tls",
+                "default_target": {
+                    "cert": cert_pem,
+                    "key": key_pem,
+                    "alpn_protocols": [],
+                    "protocol": masque_with_user
+                }
+            }
+        }),
+    ] {
+        let configs: Vec<crate::config::Config> =
+            serde_yaml::from_str(&serde_json::json!([invalid_server]).to_string()).unwrap();
+        assert!(
+            create_server_configs(configs).is_err(),
+            "should reject invalid placement/ALPN: {invalid_server}"
+        );
+    }
+}

@@ -1285,6 +1285,23 @@ fn resolve_server_config(
     {
         return Err(super::types::xhttp::invalid("QUIC XHTTP ALPN must be h3"));
     }
+    if matches!(server_config.protocol, ServerProxyConfig::Masque(_))
+        && server_config.transport == Transport::Quic
+        && server_config.quic_settings.as_ref().is_some_and(|quic| {
+            !quic.alpn_protocols.is_unspecified()
+                && quic.alpn_protocols.clone().into_vec() != ["h3"]
+        })
+    {
+        return Err(super::types::masque::invalid("QUIC MASQUE ALPN must be h3"));
+    }
+    if server_config.transport == Transport::Quic
+        && !matches!(server_config.protocol, ServerProxyConfig::Masque(_))
+        && server_contains_masque(&server_config.protocol)
+    {
+        return Err(super::types::masque::invalid(
+            "QUIC MASQUE must be a top-level protocol",
+        ));
+    }
     if server_config.transport == Transport::Udp {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -1325,9 +1342,20 @@ fn resolve_server_config(
             Some(ServerQuicConfig {
                 ref mut client_fingerprints,
                 ref mut num_endpoints,
+                ref client_ca_certs,
                 ..
             }) => {
                 normalize_fingerprints(client_fingerprints, "Client")?;
+
+                if let ServerProxyConfig::Masque(masque) = &server_config.protocol
+                    && masque.users.is_empty()
+                    && client_ca_certs.is_empty()
+                    && client_fingerprints.is_empty()
+                {
+                    return Err(super::types::masque::invalid(
+                        "MASQUE requires at least one user or TLS client certificate authentication",
+                    ));
+                }
 
                 if *num_endpoints == 0 {
                     *num_endpoints = get_num_threads();
@@ -1405,6 +1433,42 @@ pub(super) fn source_contains_xhttp(protocol: &ClientProxyConfig) -> bool {
         ClientProxyConfig::HttpUpgrade(config) => source_contains_xhttp(&config.protocol),
         ClientProxyConfig::Grpc(config) => source_contains_xhttp(&config.protocol),
         ClientProxyConfig::SudokuMask(config) => source_contains_xhttp(&config.protocol),
+        _ => false,
+    }
+}
+
+fn server_contains_masque(protocol: &ServerProxyConfig) -> bool {
+    match protocol {
+        ServerProxyConfig::Masque(_) => true,
+        ServerProxyConfig::SudokuMask(config) => server_contains_masque(&config.protocol),
+        ServerProxyConfig::Xhttp(config) => server_contains_masque(&config.protocol),
+        ServerProxyConfig::Tls {
+            tls_targets,
+            default_tls_target,
+            shadowtls_targets,
+            reality_targets,
+            ..
+        } => {
+            tls_targets.values().any(|t| server_contains_masque(&t.protocol))
+                || default_tls_target
+                    .as_ref()
+                    .is_some_and(|t| server_contains_masque(&t.protocol))
+                || shadowtls_targets
+                    .values()
+                    .any(|t| server_contains_masque(&t.protocol))
+                || reality_targets
+                    .values()
+                    .any(|t| server_contains_masque(&t.protocol))
+        }
+        ServerProxyConfig::Websocket { targets } => {
+            targets.iter().any(|t| server_contains_masque(&t.protocol))
+        }
+        ServerProxyConfig::HttpUpgrade { targets } => {
+            targets.iter().any(|t| server_contains_masque(&t.protocol))
+        }
+        ServerProxyConfig::Grpc { targets } => {
+            targets.iter().any(|t| server_contains_masque(&t.protocol))
+        }
         _ => false,
     }
 }
@@ -2366,6 +2430,19 @@ fn validate_server_proxy_scalars(
         ServerProxyConfig::Xhttp(config) => {
             config.validate()?;
         }
+        ServerProxyConfig::Masque(_)
+            if !matches!(
+                context,
+                ServerProtocolContext::Quic | ServerProtocolContext::Tls
+            ) =>
+        {
+            return Err(super::types::masque::invalid(
+                "MASQUE requires QUIC or TLS transport",
+            ));
+        }
+        ServerProxyConfig::Masque(config) => {
+            config.validate()?;
+        }
         ServerProxyConfig::Anytls {
             padding_scheme: Some(lines),
             ..
@@ -2680,6 +2757,11 @@ fn resolve_server_proxy_config(
             }
             let mut reality = HashMap::with_capacity(reality_targets.len());
             for (name, config) in reality_targets {
+                if matches!(config.protocol, ServerProxyConfig::Masque(_)) {
+                    return Err(super::types::masque::invalid(
+                        "MASQUE is not supported with REALITY",
+                    ));
+                }
                 validate_server_vision(config.vision, &config.protocol)?;
                 if tls_targets.contains_key(&name) {
                     return Err(std::io::Error::new(
@@ -2881,6 +2963,7 @@ fn resolve_server_proxy_config(
             fallback,
             udp_enabled,
         },
+        ServerProxyConfig::Masque(config) => ResolvedServerProxyConfig::Masque(config),
     })
 }
 
@@ -2905,6 +2988,26 @@ fn resolve_tls_server(
         config.certificate_binding.as_ref(),
     )?;
     normalize_fingerprints(&mut config.client_fingerprints, "Client")?;
+    if let ServerProxyConfig::Masque(masque) = &config.protocol {
+        if !config.alpn_protocols.is_unspecified()
+            && !config
+                .alpn_protocols
+                .iter()
+                .any(|protocol| protocol == "h2")
+        {
+            return Err(super::types::masque::invalid(
+                "MASQUE TLS ALPN must include h2",
+            ));
+        }
+        if masque.users.is_empty()
+            && config.client_ca_certs.is_empty()
+            && config.client_fingerprints.is_empty()
+        {
+            return Err(super::types::masque::invalid(
+                "MASQUE requires at least one user or TLS client certificate authentication",
+            ));
+        }
+    }
     let protocol = resolve_server_proxy_config(
         config.protocol,
         groups,
