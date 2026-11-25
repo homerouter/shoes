@@ -483,12 +483,11 @@ fn create_handler(
                 "NaiveProxy must be used inside a TLS or Reality protocol",
             ));
         }
-        ResolvedServerProxyConfig::Masque(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "MASQUE server not implemented yet",
-            ));
-        }
+        ResolvedServerProxyConfig::Masque(config) => Box::new(crate::masque::MasqueServer::new(
+            config,
+            client_proxy_selector.clone(),
+            resolver.clone(),
+        )?),
         unknown_config => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -574,6 +573,10 @@ fn create_tls_server_target(
         naive_alpn
     } else if let ResolvedServerProxyConfig::Xhttp(config) = &protocol {
         config.tls_alpn(&alpn_protocols)?
+    } else if matches!(protocol, ResolvedServerProxyConfig::Masque(_))
+        && alpn_protocols.is_unspecified()
+    {
+        vec!["h2".to_string()]
     } else {
         alpn_protocols.into_vec()
     };
@@ -617,6 +620,12 @@ fn create_tls_server_target(
             udp_enabled,
             padding_enabled: padding,
         })
+    } else if let ResolvedServerProxyConfig::Masque(config) = protocol {
+        InnerProtocol::Masque(Arc::new(crate::masque::MasqueServer::new(
+            config,
+            effective_selector.clone(),
+            resolver.clone(),
+        )?))
     } else if vision {
         InnerProtocol::VisionVless(create_vision_vless_config(&protocol)?)
     } else {

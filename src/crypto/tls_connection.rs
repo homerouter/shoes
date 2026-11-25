@@ -63,6 +63,13 @@ impl TlsConnection {
             .map(|group| group.name())
     }
 
+    pub fn has_peer_certificates(&self) -> bool {
+        self.inner
+            .as_ref()
+            .and_then(|connection| connection.peer_certificates())
+            .is_some_and(|certs| !certs.is_empty())
+    }
+
     pub fn read_tls(&mut self, reader: &mut dyn Read) -> io::Result<usize> {
         self.inner
             .as_mut()

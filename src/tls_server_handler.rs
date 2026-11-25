@@ -50,6 +50,9 @@ pub enum InnerProtocol {
 
     /// NaiveProxy - hyper-based HTTP/2 proxy with built-in static file fallback
     Naive(NaiveConfig),
+
+    /// MASQUE - HTTP/2 CONNECT / CONNECT-UDP / CONNECT-IP server
+    Masque(Arc<crate::masque::MasqueServer>),
 }
 
 #[derive(Debug)]
@@ -232,6 +235,32 @@ impl TcpServerHandler for TlsServerHandler {
                             self.fallback_resolver.clone(),
                         )
                         .await
+                    }
+                    InnerProtocol::Masque(masque) => {
+                        if let Some(alpn) = tls_stream.alpn_protocol()
+                            && alpn != b"h2"
+                        {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "MASQUE over TLS requires h2 ALPN, got {}",
+                                    String::from_utf8_lossy(alpn)
+                                ),
+                            ));
+                        }
+                        let peer = tls_stream
+                            .peer_addr()
+                            .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                        let peer_authenticated_by_mtls = tls_stream.has_peer_certificates();
+                        let masque = masque.clone();
+                        Ok(TcpServerSetupResult::Session(Box::pin(async move {
+                            if let Err(err) = masque
+                                .serve_h2_stream(tls_stream, peer, peer_authenticated_by_mtls)
+                                .await
+                            {
+                                log::debug!("MASQUE H2 session ended: {err}");
+                            }
+                        })))
                     }
                 };
 

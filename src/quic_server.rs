@@ -193,8 +193,10 @@ pub async fn start_quic_servers(
         processed_ca_certs.push(cert.as_bytes().to_vec());
     }
 
-    let alpn_protocols = if matches!(protocol, ResolvedServerProxyConfig::Xhttp(_))
-        && alpn_protocols.is_unspecified()
+    let alpn_protocols = if matches!(
+        protocol,
+        ResolvedServerProxyConfig::Xhttp(_) | ResolvedServerProxyConfig::Masque(_)
+    ) && alpn_protocols.is_unspecified()
     {
         vec!["h3".to_owned()]
     } else {
@@ -339,11 +341,70 @@ pub async fn start_quic_servers(
                 collect_started_listeners(&mut handles, result).await?;
             }
         }
-        ResolvedServerProxyConfig::Masque(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "MASQUE server not implemented yet",
-            ));
+        ResolvedServerProxyConfig::Masque(config) => {
+            if alpn_protocols != ["h3"] {
+                return Err(std::io::Error::other("QUIC MASQUE ALPN must be h3"));
+            }
+            let max_requests = config.max_concurrent_requests.min(u32::MAX as usize) as u32;
+            let ip_enabled = config.ip_enabled;
+            let mtu = config.mtu;
+            let service = Arc::new(crate::masque::MasqueServer::new(
+                config,
+                client_proxy_selector,
+                resolver,
+            )?);
+            let mut endpoints = Vec::new();
+            for address in bind_addresses {
+                let mut config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
+                let memory_bytes = crate::resources::configure_quic(&mut config, max_requests, 16);
+                let transport = Arc::get_mut(&mut config.transport).unwrap();
+                transport
+                    .max_concurrent_bidi_streams(max_requests.into())
+                    .max_concurrent_uni_streams(16u32.into())
+                    .datagram_receive_buffer_size(Some(256 << 10))
+                    .datagram_send_buffer_size(256 << 10);
+                if ip_enabled {
+                    // Reserve headroom for QUIC short headers + H3 datagram context/stream IDs.
+                    transport.initial_mtu(mtu.saturating_add(96));
+                }
+                endpoints.extend(crate::listener_tasks::QuicListener::bind_all(
+                    address,
+                    config,
+                    num_endpoints,
+                    memory_bytes,
+                )?);
+            }
+            for endpoint in endpoints {
+                let service = service.clone();
+                handles.push(crate::network_tasks::spawn(async move {
+                    let mut tasks = crate::listener_tasks::ListenerTasks::immediate();
+                    loop {
+                        let incoming = tokio::select! {
+                            incoming = endpoint.accept() => incoming,
+                            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+                        };
+                        let Some(incoming) = incoming else {
+                            break;
+                        };
+                        let Some(permit) =
+                            crate::resources::try_connection(Some(incoming.remote_address().ip()))
+                        else {
+                            incoming.refuse();
+                            continue;
+                        };
+                        let service = service.clone();
+                        tasks.spawn(async move {
+                            let _permit = permit;
+                            if let Ok(connecting) = incoming.accept()
+                                && let Ok(connection) = connecting.await
+                                && let Err(error) = service.serve_h3(connection).await
+                            {
+                                log::debug!("MASQUE H3 session ended: {error}");
+                            }
+                        });
+                    }
+                }));
+            }
         }
         tcp_protocol => {
             // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
@@ -494,6 +555,22 @@ mod tests {
             username: None,
             password: None,
         })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn partial_masque_startup_releases_earlier_listeners() {
+        assert_partial_startup_cleanup(ResolvedServerProxyConfig::Masque(
+            crate::config::MasqueServerConfig {
+                users: NoneOrSome::One(crate::config::MasqueUserConfig {
+                    username: "alice".into(),
+                    password: "secret".into(),
+                }),
+                ip_enabled: true,
+                mtu: 1380,
+                ..Default::default()
+            },
+        ))
         .await;
     }
 }

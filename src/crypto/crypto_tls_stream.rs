@@ -156,6 +156,10 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
         self.session.is_client()
     }
 
+    pub fn has_peer_certificates(&self) -> bool {
+        self.session.has_peer_certificates()
+    }
+
     pub fn require_record_framing(&self) -> io::Result<()> {
         match self.input {
             TlsInput::Records { preserve: true, .. } => Ok(()),

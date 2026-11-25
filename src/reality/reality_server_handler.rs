@@ -215,6 +215,10 @@ pub async fn setup_reality_server_stream(
             )
             .await
         }
+        InnerProtocol::Masque(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "MASQUE cannot be used inside REALITY",
+        )),
     }?;
     setup_result.set_need_initial_flush(true);
     Ok(setup_result)
