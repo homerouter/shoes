@@ -113,6 +113,24 @@ pub(crate) async fn send_h2_data(
     Ok(())
 }
 
+pub(crate) async fn send_h3_data_with_timeout<S: h3::quic::SendStream<Bytes>>(
+    send_stream: &mut h3::server::RequestStream<S, Bytes>,
+    data: Bytes,
+    timeout: Duration,
+) -> io::Result<()> {
+    tokio::time::timeout(timeout, send_stream.send_data(data))
+        .await
+        .map_err(|_| send_stalled())?
+        .map_err(io::Error::other)
+}
+
+pub(crate) async fn send_h3_data<S: h3::quic::SendStream<Bytes>>(
+    send_stream: &mut h3::server::RequestStream<S, Bytes>,
+    data: Bytes,
+) -> io::Result<()> {
+    send_h3_data_with_timeout(send_stream, data, SEND_STALL_TIMEOUT).await
+}
+
 pub(crate) async fn send_h3_datagram_or_capsule<S: h3::quic::SendStream<Bytes>>(
     dgram_sender: &mut h3_server::H3DatagramSender,
     send_stream: &mut h3::server::RequestStream<S, Bytes>,
@@ -144,10 +162,7 @@ pub(crate) async fn send_h3_datagram_or_capsule<S: h3::quic::SendStream<Bytes>>(
         }
     }
     let capsule = encode_capsule(&Capsule::Datagram(encoded_context0));
-    tokio::time::timeout(SEND_STALL_TIMEOUT, send_stream.send_data(capsule))
-        .await
-        .map_err(|_| send_stalled())?
-        .map_err(io::Error::other)
+    send_h3_data(send_stream, capsule).await
 }
 
 #[derive(Clone)]

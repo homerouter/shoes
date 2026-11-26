@@ -626,3 +626,67 @@ async fn lru_eviction_aborts_stalled_session() {
     tokio::task::yield_now().await;
     assert_eq!(weak.strong_count(), 0);
 }
+
+#[tokio::test]
+async fn pending_source_eviction_drains_before_reused_ip_packet() {
+    use etherparse::PacketBuilder;
+
+    let local: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+    let remote: SocketAddr = "198.51.100.99:5353".parse().unwrap();
+
+    for round in 0..32 {
+        let (input, from_tun) = mpsc::channel(4);
+        let (to_tun, _output) = mpsc::channel(4);
+        let (wake, _wake_rx) = super::super::wake::Wake::new().unwrap();
+        let (reader, writer) =
+            super::super::udp_handler::UdpHandler::new(from_tun, to_tun, wake).split();
+        let (evict_tx, evict_rx) = mpsc::unbounded_channel();
+        let mut manager = TunUdpManager::new(
+            reader,
+            writer,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(crate::resolver::NativeResolver::new()),
+            TunResourceLimits::default(),
+        )
+        .with_source_eviction(evict_rx);
+
+        let (old_tx, mut old_rx) = mpsc::channel(4);
+        let handle = tokio::spawn(async move { std::future::pending::<()>().await });
+        manager.sessions.push(
+            local,
+            Session {
+                tx: old_tx,
+                handle,
+                last_active: Instant::now(),
+            },
+        );
+
+        let mut buf = Vec::new();
+        let (SocketAddr::V4(src_v4), SocketAddr::V4(dst_v4)) = (local, remote) else {
+            unreachable!();
+        };
+        PacketBuilder::ipv4(src_v4.ip().octets(), dst_v4.ip().octets(), 64)
+            .udp(src_v4.port(), dst_v4.port())
+            .write(&mut buf, b"reused-ip-packet")
+            .unwrap();
+
+        // Both channels are ready before manager.run() executes its first select! poll.
+        evict_tx.send(local.ip()).unwrap();
+        input.send(PacketBuffer::copy_from_slice(&buf)).await.unwrap();
+
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(manager.run());
+
+        let delivered = tokio::time::timeout(Duration::from_secs(1), old_rx.recv())
+            .await
+            .expect("eviction should close old session promptly");
+        assert!(
+            delivered.is_none(),
+            "round {round}: reused IP packet leaked into evicted session"
+        );
+
+        drop(input);
+        drop(evict_tx);
+        tasks.shutdown().await;
+    }
+}

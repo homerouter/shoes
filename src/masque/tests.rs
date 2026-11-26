@@ -2904,3 +2904,110 @@ async fn h3_shutdown_drain_unblocks_pending_acquire_sender() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn h3_send_data_with_timeout_fails_when_peer_stalls_flow_control() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+
+        let mut tls_server = crate::rustls_config_util::try_create_server_config(
+            cert.cert.pem().as_bytes(),
+            cert.signing_key.serialize_pem().as_bytes(),
+            vec![],
+            &["h3".to_string()],
+            &[],
+            &Default::default(),
+        )
+        .unwrap();
+        tls_server.max_early_data_size = u32::MAX;
+        let mut quic_server_cfg = quinn::ServerConfig::with_crypto(
+            crate::certificates::quic_config(Arc::new(tls_server), None).unwrap(),
+        );
+        crate::resources::configure_quic(&mut quic_server_cfg, 16, 16);
+        let server_ep =
+            quinn::Endpoint::server(quic_server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server_ep.local_addr().unwrap();
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let conn = server_ep.accept().await.unwrap().await.unwrap();
+            let mut driver = h3::server::builder()
+                .enable_extended_connect(true)
+                .build(h3_quinn::Connection::new(conn))
+                .await
+                .unwrap();
+            let resolver = driver.accept().await.unwrap().unwrap();
+            let (_req, mut stream) = resolver.resolve_request().await.unwrap();
+            stream
+                .send_response(
+                    http::Response::builder()
+                        .status(StatusCode::OK)
+                        .body(())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let (mut send_stream, _recv_stream) = stream.split();
+            // Fill the client's tiny stream window and confirm a subsequent send stalls and times out.
+            let err = loop {
+                match super::send_h3_data_with_timeout(
+                    &mut send_stream,
+                    Bytes::from(vec![0x5a; 1024]),
+                    Duration::from_millis(80),
+                )
+                .await
+                {
+                    Ok(()) => continue,
+                    Err(err) => break err,
+                }
+            };
+            let _ = done_tx.send(err.kind());
+        });
+
+        let mut tls_client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls_client.alpn_protocols = vec![b"h3".to_vec()];
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(256u32.into());
+        let mut quic_client_cfg = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls_client).unwrap(),
+        ));
+        quic_client_cfg.transport_config(Arc::new(transport));
+        let mut client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_ep.set_default_client_config(quic_client_cfg);
+        let quic_conn = client_ep.connect(server_addr, "localhost").unwrap().await.unwrap();
+
+        let (mut driver, mut send_req): (
+            h3::client::Connection<h3_quinn::Connection, Bytes>,
+            h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+        ) = h3::client::builder()
+            .enable_extended_connect(true)
+            .build(h3_quinn::Connection::new(quic_conn))
+            .await
+            .unwrap();
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let req = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h3::ext::Protocol::CONNECT_IP)
+            .uri("https://localhost/.well-known/masque/ip/*/*/")
+            .body(())
+            .unwrap();
+        // Keep req_stream alive without calling recv_data() so flow-control credit stays exhausted.
+        let mut req_stream = send_req.send_request(req).await.unwrap();
+        let resp = req_stream.recv_response().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(done_rx.await.unwrap(), std::io::ErrorKind::TimedOut);
+        drop((req_stream, send_req));
+        let _ = driver_task.await;
+        let _ = server_task.await;
+    })
+    .await
+    .unwrap();
+}

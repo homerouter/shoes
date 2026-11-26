@@ -35,7 +35,7 @@ use crate::masque::wire::{
 };
 use crate::masque::{
     MasqueConnCtx, capsule_ok_response, feed_capsule_buf, feed_h2_capsule_chunk, send_h2_data,
-    send_h3_datagram_or_capsule, status_response,
+    send_h3_data, send_h3_datagram_or_capsule, status_response,
 };
 use crate::resolver::Resolver;
 use crate::resources::Budget;
@@ -798,10 +798,7 @@ pub(crate) async fn handle_connect_ip_h3(
         .map_err(io::Error::other)?;
 
     let (mut send_stream, mut recv_stream) = stream.split();
-    send_stream
-        .send_data(initial_capsules_bytes(&lease))
-        .await
-        .map_err(io::Error::other)?;
+    send_h3_data(&mut send_stream, initial_capsules_bytes(&lease)).await?;
 
     let mut outbound_rx = lease
         .take_receiver()
@@ -831,10 +828,7 @@ pub(crate) async fn handle_connect_ip_h3(
                         idle_sleep.as_mut().reset(Instant::now() + IP_IDLE_TIMEOUT);
                         feed_capsule_buf(&mut decoder, &mut chunk);
                         if let Some(reply_bytes) = drain_ip_capsules(&mut decoder, &engine, &lease).await? {
-                            send_stream
-                                .send_data(reply_bytes)
-                                .await
-                                .map_err(io::Error::other)?;
+                            send_h3_data(&mut send_stream, reply_bytes).await?;
                         }
                     }
                     Ok(None) => {
