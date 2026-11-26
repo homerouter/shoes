@@ -419,7 +419,7 @@ impl TcpClientHandler for GrpcTcpClientHandler {
         let peer_addr = client_stream.peer_addr();
         let local_addr = client_stream.local_addr();
 
-        let (mut send_request, connection) = h2::client::Builder::new()
+        let (mut send_request, connection) = crate::http2::client_builder()
             .initial_window_size(INITIAL_WINDOW_SIZE)
             .initial_connection_window_size(INITIAL_CONN_WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
@@ -483,7 +483,7 @@ impl TcpClientHandler for GrpcTcpClientHandler {
         let peer_addr = client_stream.peer_addr();
         let local_addr = client_stream.local_addr();
 
-        let (mut send_request, connection) = h2::client::Builder::new()
+        let (mut send_request, connection) = crate::http2::client_builder()
             .initial_window_size(INITIAL_WINDOW_SIZE)
             .initial_connection_window_size(INITIAL_CONN_WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
@@ -562,7 +562,7 @@ impl TcpServerHandler for GrpcTcpServerHandler {
         let peer_addr = server_stream.peer_addr();
         let local_addr = server_stream.local_addr();
 
-        let mut connection = h2::server::Builder::new()
+        let mut connection = crate::http2::server_builder()
             .initial_window_size(INITIAL_WINDOW_SIZE)
             .initial_connection_window_size(INITIAL_CONN_WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
