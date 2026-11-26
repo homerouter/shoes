@@ -71,13 +71,8 @@ where
                 .await?;
             route.connect(&ctx.resolver).await
         })
-        .await;
-        let Ok(routed) = routed else {
-            crate::util::shutdown_stream(&mut h3_stream).await;
-            return Ok(());
-        };
+        .await?;
         let Some(upstream) = routed.setup else {
-            crate::util::shutdown_stream(&mut h3_stream).await;
             return Ok(());
         };
         return relay_connect_stream(h3_stream, upstream, routed.prefix).await;
@@ -317,6 +312,7 @@ where
     fn drop(&mut self) {
         if let H3SendState::Idle(Some(send)) = self.send.get_mut() {
             send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+            self.recv.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
         }
     }
 }

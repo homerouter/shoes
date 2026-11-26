@@ -567,6 +567,7 @@ mod tests {
                     password: "secret".into(),
                 }),
                 ip_enabled: true,
+                tunnel_addresses: vec!["10.99.0.0/24".parse().unwrap()],
                 mtu: 1380,
                 ..Default::default()
             },

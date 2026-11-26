@@ -7,7 +7,7 @@ use http::{Method, Request, Response, StatusCode};
 use crate::async_stream::AsyncStream;
 use crate::resources;
 
-use super::{MasqueConnCtx, MasqueServer, connect};
+use super::{MasqueConnCtx, MasqueServer, connect, connect_udp};
 
 pub(crate) async fn serve_h2_stream<IO: AsyncStream + 'static>(
     server: &MasqueServer,
@@ -66,7 +66,7 @@ async fn dispatch_h2_request(
     ctx: MasqueConnCtx,
     request: Request<()>,
     mut respond: h2::server::SendResponse<Bytes>,
-    _recv: h2::RecvStream,
+    recv: h2::RecvStream,
 ) -> io::Result<()> {
     if request.method() != Method::CONNECT {
         return send_empty_response(
@@ -91,7 +91,7 @@ async fn dispatch_h2_request(
             {
                 return send_empty_response(&mut respond, rejection.into_response());
             }
-            connect::handle_connect_h2(ctx, request, respond, _recv).await
+            connect::handle_connect_h2(ctx, request, respond, recv).await
         }
         Some("connect-udp") => {
             if let Err(rejection) =
@@ -100,12 +100,7 @@ async fn dispatch_h2_request(
             {
                 return send_empty_response(&mut respond, rejection.into_response());
             }
-            let status = if ctx.config.stealth_404 {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::NOT_IMPLEMENTED
-            };
-            send_empty_response(&mut respond, Response::builder().status(status).body(()).unwrap())
+            connect_udp::handle_connect_udp_h2(ctx, request, respond, recv).await
         }
         Some("connect-ip") => {
             if let Err(rejection) =

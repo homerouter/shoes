@@ -18,7 +18,7 @@ pub struct IpTunnelTarget {
     pub ipproto: Option<u8>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum UdpVar {
     Host,
     Port,
@@ -36,7 +36,7 @@ impl UdpVar {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum IpVar {
     Target,
     Protocol,
@@ -54,17 +54,20 @@ impl IpVar {
     }
 }
 
+#[derive(Debug)]
 enum Component<V> {
     Literal(Box<str>),
     Variable(V),
 }
 
+#[derive(Debug)]
 struct QueryParam<V> {
     name: Box<str>,
     value: Component<V>,
     optional: bool,
 }
 
+#[derive(Debug)]
 struct CompiledTemplate<V> {
     path: Vec<Component<V>>,
     query: Vec<QueryParam<V>>,
@@ -234,6 +237,7 @@ fn parse_component<V: Copy + Eq + Hash>(
     }
 }
 
+#[derive(Debug)]
 pub struct UdpUriTemplate(CompiledTemplate<UdpVar>);
 
 impl UdpUriTemplate {
@@ -267,6 +271,7 @@ impl UdpUriTemplate {
     }
 }
 
+#[derive(Debug)]
 pub struct IpUriTemplate(CompiledTemplate<IpVar>);
 
 impl IpUriTemplate {

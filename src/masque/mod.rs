@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod connect;
+pub mod connect_udp;
 pub mod h2_server;
 pub mod h3_server;
 #[allow(dead_code)] // Wired into MASQUE UDP/IP handlers in Tasks 4-6.
@@ -22,11 +23,13 @@ use crate::resources::Budget;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 
 use auth::MasqueAuth;
+use wire::UdpUriTemplate;
 
 #[derive(Clone)]
 pub(crate) struct MasqueConnCtx {
     pub(crate) config: Arc<MasqueServerConfig>,
     pub(crate) auth: Arc<MasqueAuth>,
+    pub(crate) udp_template: Arc<UdpUriTemplate>,
     pub(crate) selector: Arc<ClientProxySelector>,
     pub(crate) resolver: Arc<dyn Resolver>,
     pub(crate) peer: SocketAddr,
@@ -37,6 +40,7 @@ pub(crate) struct MasqueConnCtx {
 pub struct MasqueServer {
     config: Arc<MasqueServerConfig>,
     auth: Arc<MasqueAuth>,
+    udp_template: Arc<UdpUriTemplate>,
     selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     requests: Arc<Budget>,
@@ -51,10 +55,12 @@ impl MasqueServer {
         config.validate()?;
         let users = config.users.clone().into_vec();
         let auth = Arc::new(MasqueAuth::from_users(&users, config.stealth_404)?);
+        let udp_template = Arc::new(UdpUriTemplate::parse(&config.udp_template)?);
         let requests = Arc::new(Budget::new(Some(config.max_concurrent_requests)));
         Ok(Self {
             config: Arc::new(config),
             auth,
+            udp_template,
             selector,
             resolver,
             requests,
@@ -69,6 +75,7 @@ impl MasqueServer {
         MasqueConnCtx {
             config: self.config.clone(),
             auth: self.auth.clone(),
+            udp_template: self.udp_template.clone(),
             selector: self.selector.clone(),
             resolver: self.resolver.clone(),
             peer,
