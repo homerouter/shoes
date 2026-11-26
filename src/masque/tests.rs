@@ -1153,3 +1153,410 @@ async fn connect_udp_rejects_disabled_malformed_and_non_matching_requests() {
     .await
     .unwrap();
 }
+
+fn test_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut chunks = data.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    if let Some(&last) = chunks.remainder().first() {
+        sum += u32::from(u16::from_be_bytes([last, 0]));
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn make_ipv4_udp_packet(
+    src: std::net::Ipv4Addr,
+    src_port: u16,
+    dst: std::net::Ipv4Addr,
+    dst_port: u16,
+    ttl: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let udp_len = (8 + payload.len()) as u16;
+    let total_len = 20 + udp_len;
+    let mut pkt = vec![0u8; total_len as usize];
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+    pkt[6] = 0x40;
+    pkt[8] = ttl;
+    pkt[9] = 17;
+    pkt[12..16].copy_from_slice(&src.octets());
+    pkt[16..20].copy_from_slice(&dst.octets());
+    let ip_csum = test_checksum(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+    pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    pkt[24..26].copy_from_slice(&udp_len.to_be_bytes());
+    pkt[28..].copy_from_slice(payload);
+
+    let mut pseudo = Vec::with_capacity(12 + usize::from(udp_len));
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.extend_from_slice(&[0, 17]);
+    pseudo.extend_from_slice(&udp_len.to_be_bytes());
+    pseudo.extend_from_slice(&pkt[20..]);
+    let mut udp_csum = test_checksum(&pseudo);
+    if udp_csum == 0 {
+        udp_csum = 0xffff;
+    }
+    pkt[26..28].copy_from_slice(&udp_csum.to_be_bytes());
+    pkt
+}
+
+#[test]
+fn address_pool_reserves_gateway_network_broadcast_rolls_back_and_reclaims() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use super::ip_pool::{AddressPool, IpRangeSet, IpSessionRegistry, ip_in_networks, routes_contain};
+    use super::wire::AddressRange;
+
+    let v4_net: ipnetwork::IpNetwork = "10.0.0.1/29".parse().unwrap();
+    let v6_net: ipnetwork::IpNetwork = "fd00::1/126".parse().unwrap();
+    let pool = AddressPool::new(&[v4_net, v6_net]).unwrap();
+    assert_eq!(pool.prefixes(), &[v4_net, v6_net]);
+
+    assert_eq!(
+        pool.server_addresses(),
+        vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V6("fd00::1".parse::<Ipv6Addr>().unwrap()),
+        ]
+    );
+    assert!(pool.contains_prefix(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0))));
+    assert!(pool.contains_prefix(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))));
+    assert!(!pool.contains_prefix(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1))));
+    assert!(ip_in_networks(
+        IpAddr::V6("fd00::2".parse().unwrap()),
+        &[v4_net, v6_net]
+    ));
+
+    let a1 = pool.allocate().unwrap();
+    assert_eq!(
+        a1,
+        vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            IpAddr::V6("fd00::2".parse().unwrap()),
+        ]
+    );
+    let a2 = pool.allocate().unwrap();
+    assert_eq!(
+        a2,
+        vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
+            IpAddr::V6("fd00::3".parse().unwrap()),
+        ]
+    );
+    // v6 /126 only has ::2 and ::3; partial v4 (10.0.0.4) must roll back.
+    assert!(pool.allocate().is_none());
+
+    pool.release(&a1);
+    let a3 = pool.allocate().unwrap();
+    assert_eq!(a3, a1);
+    assert!(pool.allocate().is_none());
+
+    // Verify routes_contain, IpRangeSet, and IpSessionRegistry lookup/unregister.
+    let range = vec![AddressRange {
+        start: IpAddr::V4(Ipv4Addr::new(192, 168, 10, 0)),
+        end: IpAddr::V4(Ipv4Addr::new(192, 168, 10, 255)),
+        ip_protocol: 17,
+    }];
+    let range_set = IpRangeSet::new(range.clone());
+    assert_eq!(range_set.as_slice(), range.as_slice());
+    assert!(range_set.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 5)), 17));
+    let net_range_set = IpRangeSet::from_networks(&[v4_net]);
+    assert!(net_range_set.contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 6));
+    assert!(routes_contain(
+        &range,
+        IpAddr::V4(Ipv4Addr::new(192, 168, 10, 5)),
+        17
+    ));
+    assert!(!routes_contain(
+        &range,
+        IpAddr::V4(Ipv4Addr::new(192, 168, 10, 5)),
+        6
+    ));
+
+    let registry = IpSessionRegistry::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    registry.register(7, a3.clone(), tx);
+    registry.set_peer_routes(7, range);
+    assert_eq!(
+        registry.lookup(a3[0], 6).map(|(id, _)| id),
+        Some(7)
+    );
+    assert_eq!(
+        registry
+            .lookup(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 9)), 17)
+            .map(|(id, _)| id),
+        Some(7)
+    );
+    registry.unregister(7);
+    assert!(registry.lookup(a3[0], 6).is_none());
+    assert!(
+        registry
+            .lookup(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 9)), 17)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn connect_ip_engine_spoofed_source_and_disallowed_route_emit_icmp_errors() {
+    use std::net::{IpAddr, Ipv4Addr};
+    use super::connect_ip::MasqueIpEngine;
+    use super::wire::{AddressRange, inspect_ip_packet};
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let selector = direct_selector(&resolver);
+        let config = MasqueServerConfig {
+            ip_enabled: true,
+            tunnel_addresses: vec!["10.20.0.1/24".parse().unwrap()],
+            advertise_routes: vec!["198.51.100.0/24".parse().unwrap()],
+            ..Default::default()
+        };
+        let engine = MasqueIpEngine::new(&config, selector, resolver).unwrap();
+        let allowed_routes = vec![
+            AddressRange {
+                start: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)),
+                end: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 255)),
+                ip_protocol: 0,
+            },
+            AddressRange {
+                start: IpAddr::V4(Ipv4Addr::new(10, 20, 0, 0)),
+                end: IpAddr::V4(Ipv4Addr::new(10, 20, 0, 255)),
+                ip_protocol: 0,
+            },
+        ];
+        let mut lease = engine.open_session(allowed_routes).unwrap();
+        let assigned_v4 = match lease.assigned_ips()[0] {
+            IpAddr::V4(v4) => v4,
+            _ => panic!("expected ipv4"),
+        };
+
+        // 1. Spoofed source -> ICMP SourcePolicy (type 3, code 13)
+        let spoofed = make_ipv4_udp_packet(
+            Ipv4Addr::new(10, 20, 0, 99),
+            40000,
+            Ipv4Addr::new(198, 51, 100, 10),
+            53,
+            64,
+            b"spoof",
+        );
+        engine.handle_inbound_packet(&lease, &spoofed).await;
+        let icmp = lease.recv().await.unwrap();
+        let meta = inspect_ip_packet(&icmp).unwrap();
+        assert_eq!(meta.src, IpAddr::V4(Ipv4Addr::new(10, 20, 0, 1)));
+        assert_eq!(meta.dst, IpAddr::V4(Ipv4Addr::new(10, 20, 0, 99)));
+        assert_eq!(meta.proto, 1);
+        assert_eq!(icmp[20], 3);
+        assert_eq!(icmp[21], 13);
+
+        // 2. Disallowed destination outside advertised_routes -> ICMP NoRoute (type 3, code 0)
+        let disallowed = make_ipv4_udp_packet(
+            assigned_v4,
+            40000,
+            Ipv4Addr::new(203, 0, 113, 10),
+            53,
+            64,
+            b"noroute",
+        );
+        engine.handle_inbound_packet(&lease, &disallowed).await;
+        let icmp = lease.recv().await.unwrap();
+        let meta = inspect_ip_packet(&icmp).unwrap();
+        assert_eq!(meta.dst, IpAddr::V4(assigned_v4));
+        assert_eq!(meta.proto, 1);
+        assert_eq!(icmp[20], 3);
+        assert_eq!(icmp[21], 0);
+
+        // 3. Unassigned non-gateway address inside tunnel prefix -> ICMP AddressUnreachable (type 3, code 1)
+        let unreach = make_ipv4_udp_packet(
+            assigned_v4,
+            40000,
+            Ipv4Addr::new(10, 20, 0, 50),
+            53,
+            64,
+            b"unreach",
+        );
+        engine.handle_inbound_packet(&lease, &unreach).await;
+        let icmp = lease.recv().await.unwrap();
+        let meta = inspect_ip_packet(&icmp).unwrap();
+        assert_eq!(meta.dst, IpAddr::V4(assigned_v4));
+        assert_eq!(meta.proto, 1);
+        assert_eq!(icmp[20], 3);
+        assert_eq!(icmp[21], 1);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn connect_ip_lease_drop_reclaims_ip_and_removes_registry_route() {
+    use super::connect_ip::MasqueIpEngine;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let selector = direct_selector(&resolver);
+        let config = MasqueServerConfig {
+            ip_enabled: true,
+            tunnel_addresses: vec!["10.21.0.1/30".parse().unwrap()],
+            ..Default::default()
+        };
+        let engine = MasqueIpEngine::new(&config, selector, resolver).unwrap();
+        let routes = engine.default_advertised_routes().to_vec();
+
+        let lease1 = engine.open_session(routes.clone()).unwrap();
+        let ip1 = lease1.assigned_ips()[0];
+        assert!(engine.registry().lookup(ip1, 17).is_some());
+        assert!(engine.open_session(routes.clone()).is_err());
+
+        drop(lease1);
+        assert!(engine.registry().lookup(ip1, 17).is_none());
+
+        let lease2 = engine.open_session(routes).unwrap();
+        assert_eq!(lease2.assigned_ips()[0], ip1);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn connect_ip_peer_to_peer_routing_and_ttl_expiry() {
+    use std::net::{IpAddr, Ipv4Addr};
+    use super::connect_ip::MasqueIpEngine;
+    use super::wire::inspect_ip_packet;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let selector = direct_selector(&resolver);
+        let config = MasqueServerConfig {
+            ip_enabled: true,
+            tunnel_addresses: vec!["10.22.0.1/24".parse().unwrap()],
+            ..Default::default()
+        };
+        let engine = MasqueIpEngine::new(&config, selector, resolver).unwrap();
+        let routes = engine.default_advertised_routes().to_vec();
+
+        let mut lease_a = engine.open_session(routes.clone()).unwrap();
+        let mut lease_b = engine.open_session(routes).unwrap();
+        assert_ne!(lease_a.session_id(), lease_b.session_id());
+        assert_eq!(engine.mtu(), 1280);
+        assert!(engine.pool().is_server_address(IpAddr::V4(Ipv4Addr::new(10, 22, 0, 1))));
+        assert!(!lease_a.advertised_routes().is_empty());
+
+        // Exercise peer_routes on lease_a and take_receiver on lease_b.
+        let extra_src_range = vec![super::wire::AddressRange {
+            start: IpAddr::V4(Ipv4Addr::new(192, 168, 50, 0)),
+            end: IpAddr::V4(Ipv4Addr::new(192, 168, 50, 255)),
+            ip_protocol: 17,
+        }];
+        lease_a.set_peer_routes(extra_src_range.clone());
+        assert_eq!(lease_a.peer_routes(), extra_src_range);
+        assert!(!lease_a.tx().is_closed());
+        let mut rx_b = lease_b.take_receiver().unwrap();
+
+        let ip_a = match lease_a.assigned_ips()[0] {
+            IpAddr::V4(v4) => v4,
+            _ => panic!("expected ipv4"),
+        };
+        let ip_b = match lease_b.assigned_ips()[0] {
+            IpAddr::V4(v4) => v4,
+            _ => panic!("expected ipv4"),
+        };
+
+        let pkt = make_ipv4_udp_packet(ip_a, 1111, ip_b, 2222, 64, b"p2p-ok");
+        engine.handle_inbound_packet(&lease_a, &pkt).await;
+        let forwarded = rx_b.recv().await.unwrap();
+        let meta = inspect_ip_packet(&forwarded).unwrap();
+        assert_eq!(meta.src, IpAddr::V4(ip_a));
+        assert_eq!(meta.dst, IpAddr::V4(ip_b));
+        assert_eq!(meta.ttl, 63);
+        assert_eq!(&forwarded[28..], b"p2p-ok");
+
+        let expired = make_ipv4_udp_packet(ip_a, 1111, ip_b, 2222, 1, b"p2p-ttl1");
+        engine.handle_inbound_packet(&lease_a, &expired).await;
+        let icmp = lease_a.recv().await.unwrap();
+        let meta = inspect_ip_packet(&icmp).unwrap();
+        assert_eq!(meta.src, IpAddr::V4(Ipv4Addr::new(10, 22, 0, 1)));
+        assert_eq!(meta.dst, IpAddr::V4(ip_a));
+        assert_eq!(meta.proto, 1);
+        assert_eq!(icmp[20], 11); // Time Exceeded
+        assert_eq!(icmp[21], 0);  // Hop Limit / TTL Exceeded
+        assert!(rx_b.try_recv().is_err());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn connect_ip_udp_echo_via_packet_stack_and_tun_udp_manager() {
+    use std::net::IpAddr;
+    use super::wire::inspect_ip_packet;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (udp_addr, udp_handle) = spawn_udp_echo().await;
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let selector = direct_selector(&resolver);
+
+        let disabled_server = MasqueServer::new(
+            MasqueServerConfig::default(),
+            selector.clone(),
+            resolver.clone(),
+        )
+        .unwrap();
+        assert!(disabled_server.ip_engine().is_none());
+
+        let server = MasqueServer::new(
+            MasqueServerConfig {
+                ip_enabled: true,
+                tunnel_addresses: vec!["10.30.0.1/24".parse().unwrap()],
+                ..Default::default()
+            },
+            selector,
+            resolver,
+        )
+        .unwrap();
+        let engine = server.ip_engine().expect("ip_enabled must initialize ip_engine");
+        let mut lease = engine
+            .open_session(engine.default_advertised_routes().to_vec())
+            .unwrap();
+        let client_ip = match lease.assigned_ips()[0] {
+            IpAddr::V4(v4) => v4,
+            _ => panic!("expected ipv4"),
+        };
+        let target_ip = match udp_addr.ip() {
+            IpAddr::V4(v4) => v4,
+            _ => panic!("expected ipv4 echo addr"),
+        };
+
+        let pkt = make_ipv4_udp_packet(
+            client_ip,
+            40001,
+            target_ip,
+            udp_addr.port(),
+            64,
+            b"hello connect-ip",
+        );
+        engine.handle_inbound_packet(&lease, &pkt).await;
+
+        let reply = lease.recv().await.unwrap();
+        let meta = inspect_ip_packet(&reply).unwrap();
+        assert_eq!(meta.src, IpAddr::V4(target_ip));
+        assert_eq!(meta.dst, IpAddr::V4(client_ip));
+        assert_eq!(meta.proto, 17);
+        let ihl = usize::from(reply[0] & 0x0f) * 4;
+        let src_port = u16::from_be_bytes([reply[ihl], reply[ihl + 1]]);
+        let dst_port = u16::from_be_bytes([reply[ihl + 2], reply[ihl + 3]]);
+        assert_eq!(src_port, udp_addr.port());
+        assert_eq!(dst_port, 40001);
+        assert_eq!(&reply[ihl + 8..], b"hello connect-ip");
+
+        udp_handle.abort();
+    })
+    .await
+    .unwrap();
+}

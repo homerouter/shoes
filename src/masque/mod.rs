@@ -1,8 +1,12 @@
 pub mod auth;
 pub mod connect;
+#[allow(dead_code)] // Wired into CONNECT-IP HTTP handler in Task 6.
+pub mod connect_ip;
 pub mod connect_udp;
 pub mod h2_server;
 pub mod h3_server;
+#[allow(dead_code)] // Wired into CONNECT-IP HTTP handler in Task 6.
+pub mod ip_pool;
 #[allow(dead_code)] // Wired into MASQUE UDP/IP handlers in Tasks 4-6.
 pub mod wire;
 
@@ -23,6 +27,7 @@ use crate::resources::Budget;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 
 use auth::MasqueAuth;
+use connect_ip::MasqueIpEngine;
 use wire::UdpUriTemplate;
 
 #[derive(Clone)]
@@ -30,6 +35,8 @@ pub(crate) struct MasqueConnCtx {
     pub(crate) config: Arc<MasqueServerConfig>,
     pub(crate) auth: Arc<MasqueAuth>,
     pub(crate) udp_template: Arc<UdpUriTemplate>,
+    #[allow(dead_code)] // Wired into CONNECT-IP HTTP handler in Task 6.
+    pub(crate) ip_engine: Option<Arc<MasqueIpEngine>>,
     pub(crate) selector: Arc<ClientProxySelector>,
     pub(crate) resolver: Arc<dyn Resolver>,
     pub(crate) peer: SocketAddr,
@@ -41,6 +48,7 @@ pub struct MasqueServer {
     config: Arc<MasqueServerConfig>,
     auth: Arc<MasqueAuth>,
     udp_template: Arc<UdpUriTemplate>,
+    ip_engine: Option<Arc<MasqueIpEngine>>,
     selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     requests: Arc<Budget>,
@@ -56,15 +64,30 @@ impl MasqueServer {
         let users = config.users.clone().into_vec();
         let auth = Arc::new(MasqueAuth::from_users(&users, config.stealth_404)?);
         let udp_template = Arc::new(UdpUriTemplate::parse(&config.udp_template)?);
+        let ip_engine = if config.ip_enabled {
+            Some(MasqueIpEngine::new(
+                &config,
+                selector.clone(),
+                resolver.clone(),
+            )?)
+        } else {
+            None
+        };
         let requests = Arc::new(Budget::new(Some(config.max_concurrent_requests)));
         Ok(Self {
             config: Arc::new(config),
             auth,
             udp_template,
+            ip_engine,
             selector,
             resolver,
             requests,
         })
+    }
+
+    #[allow(dead_code)] // Wired into CONNECT-IP HTTP handler in Task 6.
+    pub fn ip_engine(&self) -> Option<&Arc<MasqueIpEngine>> {
+        self.ip_engine.as_ref()
     }
 
     pub(crate) fn conn_ctx(
@@ -76,6 +99,7 @@ impl MasqueServer {
             config: self.config.clone(),
             auth: self.auth.clone(),
             udp_template: self.udp_template.clone(),
+            ip_engine: self.ip_engine.clone(),
             selector: self.selector.clone(),
             resolver: self.resolver.clone(),
             peer,
