@@ -22,6 +22,9 @@ mod anytls_padding;
 #[path = "cases/optional_peer/http2_proxy.rs"]
 mod http2_proxy;
 
+#[path = "cases/optional_peer/masque_singbox.rs"]
+mod masque_singbox;
+
 #[path = "cases/optional_peer/shadowsocks_identity.rs"]
 mod shadowsocks_identity;
 
