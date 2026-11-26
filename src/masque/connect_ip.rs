@@ -411,46 +411,29 @@ fn dns_error_response() -> Response<()> {
 }
 
 fn v4_interval(net: Ipv4Network) -> (u32, u32) {
-    (u32::from(net.network()), u32::from(net.broadcast()))
+    let start = u32::from(net.network());
+    let host_mask = u32::MAX.checked_shr(u32::from(net.prefix())).unwrap_or(0);
+    (start, start | host_mask)
 }
 
 fn v6_interval(net: Ipv6Network) -> (u128, u128) {
     let start = u128::from(net.network());
-    let host_mask = if net.prefix() == 0 {
-        u128::MAX
-    } else {
-        u128::MAX >> net.prefix()
-    };
+    let host_mask = u128::MAX.checked_shr(u32::from(net.prefix())).unwrap_or(0);
     (start, start | host_mask)
 }
 
-fn coalesce_u32_intervals(mut intervals: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+fn coalesce_intervals<T: Ord + Copy>(
+    mut intervals: Vec<(T, T)>,
+    saturating_next: impl Fn(T) -> T,
+) -> Vec<(T, T)> {
     if intervals.is_empty() {
         return intervals;
     }
     intervals.sort_unstable();
-    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(intervals.len());
+    let mut merged: Vec<(T, T)> = Vec::with_capacity(intervals.len());
     for (start, end) in intervals {
         if let Some(last) = merged.last_mut()
-            && start <= last.1.saturating_add(1)
-        {
-            last.1 = last.1.max(end);
-        } else {
-            merged.push((start, end));
-        }
-    }
-    merged
-}
-
-fn coalesce_u128_intervals(mut intervals: Vec<(u128, u128)>) -> Vec<(u128, u128)> {
-    if intervals.is_empty() {
-        return intervals;
-    }
-    intervals.sort_unstable();
-    let mut merged: Vec<(u128, u128)> = Vec::with_capacity(intervals.len());
-    for (start, end) in intervals {
-        if let Some(last) = merged.last_mut()
-            && start <= last.1.saturating_add(1)
+            && start <= saturating_next(last.1)
         {
             last.1 = last.1.max(end);
         } else {
@@ -476,8 +459,8 @@ fn compute_advertised_routes(
 
     let (v4_intervals, v6_intervals) = match target {
         None => (
-            coalesce_u32_intervals(base_v4),
-            coalesce_u128_intervals(base_v6),
+            coalesce_intervals(base_v4, |x| x.saturating_add(1)),
+            coalesce_intervals(base_v6, |x| x.saturating_add(1)),
         ),
         Some(target_nets) => {
             let mut iv4 = Vec::new();
@@ -506,7 +489,10 @@ fn compute_advertised_routes(
                     }
                 }
             }
-            (coalesce_u32_intervals(iv4), coalesce_u128_intervals(iv6))
+            (
+                coalesce_intervals(iv4, |x| x.saturating_add(1)),
+                coalesce_intervals(iv6, |x| x.saturating_add(1)),
+            )
         }
     };
 

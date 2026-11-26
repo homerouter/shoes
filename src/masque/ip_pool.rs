@@ -384,11 +384,7 @@ pub fn networks_to_address_ranges(networks: &[IpNetwork]) -> Vec<AddressRange> {
             },
             IpNetwork::V6(v6) => {
                 let network = u128::from(v6.network());
-                let host_mask = if v6.prefix() == 0 {
-                    u128::MAX
-                } else {
-                    u128::MAX >> v6.prefix()
-                };
+                let host_mask = u128::MAX.checked_shr(u32::from(v6.prefix())).unwrap_or(0);
                 AddressRange {
                     start: IpAddr::V6(v6.network()),
                     end: IpAddr::V6(Ipv6Addr::from(network | host_mask)),

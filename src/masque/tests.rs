@@ -2265,3 +2265,209 @@ async fn connect_ip_rejects_disabled_exhausted_and_unroutable_targets() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn connect_ip_ipv6_128_target_and_route_advertisement() {
+    use std::net::{IpAddr, Ipv6Addr};
+    use super::ip_pool::networks_to_address_ranges;
+    use super::wire::{AddressRange, AssignedAddress, Capsule, CapsuleDecoder, encode_capsule};
+
+    #[derive(Debug)]
+    struct V6DnsResolver;
+
+    impl Resolver for V6DnsResolver {
+        fn resolve_location(
+            &self,
+            location: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            let host = location.address().hostname().map(str::to_owned);
+            let port = location.port();
+            Box::pin(async move {
+                match host.as_deref() {
+                    Some("v6target.test") => Ok(vec![SocketAddr::new(
+                        IpAddr::V6("2001:db8:1::42".parse().unwrap()),
+                        port,
+                    )]),
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "nxdomain",
+                    )),
+                }
+            })
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        // Direct check on networks_to_address_ranges for /128 without shift overflow.
+        let exact_128: Ipv6Addr = "2001:db8::42".parse().unwrap();
+        assert_eq!(
+            networks_to_address_ranges(&["2001:db8::42/128".parse().unwrap()]),
+            vec![AddressRange {
+                start: IpAddr::V6(exact_128),
+                end: IpAddr::V6(exact_128),
+                ip_protocol: 0,
+            }]
+        );
+
+        let resolver: Arc<dyn Resolver> = Arc::new(V6DnsResolver);
+        let selector = direct_selector(&resolver);
+        let masque = Arc::new(
+            MasqueServer::new(
+                MasqueServerConfig {
+                    users: NoneOrSome::One(MasqueUserConfig {
+                        username: "alice".into(),
+                        password: "secret".into(),
+                    }),
+                    ip_enabled: true,
+                    tunnel_addresses: vec!["fd00:10::1/64".parse().unwrap()],
+                    stealth_404: false,
+                    ..Default::default()
+                },
+                selector,
+                resolver,
+            )
+            .unwrap(),
+        );
+
+        let (client_io, server_io) = tokio::io::duplex(32768);
+        let peer: SocketAddr = "[::1]:44452".parse().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = masque.serve_h2_stream(server_io, peer, false).await;
+        });
+        let (mut send_req, conn) = h2::client::handshake(client_io).await.unwrap();
+        let h2_driver = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        async fn next_capsule(
+            recv: &mut h2::RecvStream,
+            decoder: &mut CapsuleDecoder,
+        ) -> Capsule {
+            loop {
+                if let Some(cap) = decoder.next_capsule().unwrap() {
+                    return cap;
+                }
+                let chunk = recv.data().await.unwrap().unwrap();
+                decoder.feed(&chunk);
+                recv.flow_control().release_capacity(chunk.len()).unwrap();
+            }
+        }
+
+        // 1. Literal /128 IPv6 target CIDR.
+        let req_cidr = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .uri("https://localhost/.well-known/masque/ip/2001%3Adb8%3A%3A42%2F128/17/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let (resp_fut, mut send_stream) = send_req.send_request(req_cidr, false).unwrap();
+        let resp = resp_fut.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut recv_stream = resp.into_body();
+        let mut decoder = CapsuleDecoder::new();
+
+        let assigned = match next_capsule(&mut recv_stream, &mut decoder).await {
+            Capsule::AddressAssign(addrs) => addrs,
+            other => panic!("expected AddressAssign, got {other:?}"),
+        };
+        let expected_client_v6: Ipv6Addr = "fd00:10::2".parse().unwrap();
+        assert_eq!(
+            assigned,
+            vec![AssignedAddress {
+                request_id: 0,
+                ip: IpAddr::V6(expected_client_v6),
+                prefix_len: 128,
+            }]
+        );
+
+        let routes = match next_capsule(&mut recv_stream, &mut decoder).await {
+            Capsule::RouteAdvertisement(routes) => routes,
+            other => panic!("expected RouteAdvertisement, got {other:?}"),
+        };
+        assert_eq!(
+            routes,
+            vec![AddressRange {
+                start: IpAddr::V6(exact_128),
+                end: IpAddr::V6(exact_128),
+                ip_protocol: 17,
+            }]
+        );
+
+        // Verify IPv6 ADDRESS_REQUEST reply.
+        send_stream
+            .send_data(
+                encode_capsule(&Capsule::AddressRequest(vec![AssignedAddress {
+                    request_id: 9,
+                    ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                    prefix_len: 128,
+                }])),
+                false,
+            )
+            .unwrap();
+        let reply_assign = match next_capsule(&mut recv_stream, &mut decoder).await {
+            Capsule::AddressAssign(addrs) => addrs,
+            other => panic!("expected AddressAssign reply, got {other:?}"),
+        };
+        assert_eq!(
+            reply_assign,
+            vec![AssignedAddress {
+                request_id: 9,
+                ip: IpAddr::V6(expected_client_v6),
+                prefix_len: 128,
+            }]
+        );
+
+        send_stream.send_data(Bytes::new(), true).unwrap();
+        while let Some(chunk) = recv_stream.data().await {
+            if chunk.unwrap().is_empty() {
+                break;
+            }
+        }
+        drop(recv_stream);
+        drop(send_stream);
+
+        // 2. Hostname resolving to a single IPv6 (/128) address.
+        let req_host = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .uri("https://localhost/.well-known/masque/ip/v6target.test/6/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let (resp_fut2, mut send_stream2) = send_req.send_request(req_host, false).unwrap();
+        let resp2 = resp_fut2.await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let mut recv_stream2 = resp2.into_body();
+        let mut decoder2 = CapsuleDecoder::new();
+
+        let _ = next_capsule(&mut recv_stream2, &mut decoder2).await;
+        let routes2 = match next_capsule(&mut recv_stream2, &mut decoder2).await {
+            Capsule::RouteAdvertisement(routes) => routes,
+            other => panic!("expected RouteAdvertisement, got {other:?}"),
+        };
+        let resolved_v6: Ipv6Addr = "2001:db8:1::42".parse().unwrap();
+        assert_eq!(
+            routes2,
+            vec![AddressRange {
+                start: IpAddr::V6(resolved_v6),
+                end: IpAddr::V6(resolved_v6),
+                ip_protocol: 6,
+            }]
+        );
+
+        send_stream2.send_data(Bytes::new(), true).unwrap();
+        while let Some(chunk) = recv_stream2.data().await {
+            if chunk.unwrap().is_empty() {
+                break;
+            }
+        }
+        drop(recv_stream2);
+        drop(send_stream2);
+        drop(send_req);
+        let _ = h2_driver.await;
+        server_task.abort();
+    })
+    .await
+    .unwrap();
+}
