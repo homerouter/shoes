@@ -312,8 +312,8 @@ where
     fn drop(&mut self) {
         if let H3SendState::Idle(Some(send)) = self.send.get_mut() {
             send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
-            self.recv.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
         }
+        self.recv.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
     }
 }
 

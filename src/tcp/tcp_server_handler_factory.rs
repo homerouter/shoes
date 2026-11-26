@@ -483,11 +483,12 @@ fn create_handler(
                 "NaiveProxy must be used inside a TLS or Reality protocol",
             ));
         }
-        ResolvedServerProxyConfig::Masque(config) => Box::new(crate::masque::MasqueServer::new(
-            config,
-            client_proxy_selector.clone(),
-            resolver.clone(),
-        )?),
+        ResolvedServerProxyConfig::Masque(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "MASQUE requires QUIC or TLS transport",
+            ));
+        }
         unknown_config => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -1106,6 +1107,11 @@ mod tests {
                 json!({"type": "naive", "users": [{"username": "user", "password": "do-not-log"}]}),
                 ErrorKind::InvalidInput,
                 "NaiveProxy must be used inside a TLS or Reality protocol",
+            ),
+            (
+                json!({"type": "masque", "users": [{"username": "user", "password": "do-not-log"}]}),
+                ErrorKind::InvalidInput,
+                "MASQUE requires QUIC or TLS transport",
             ),
             (
                 json!({"type": "tls", "default_target": {"cert": "unused", "key": "unused", "vision": true, "protocol": {"type": "trojan", "password": "do-not-log"}}}),

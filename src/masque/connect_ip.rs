@@ -10,7 +10,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use http::{Request, Response, StatusCode};
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -57,7 +57,6 @@ pub struct MasqueIpSessionLease {
     id: u64,
     assigned_ips: Vec<IpAddr>,
     advertised_routes: Vec<AddressRange>,
-    peer_routes: RwLock<Vec<AddressRange>>,
     tx: mpsc::Sender<Bytes>,
     rx: Option<mpsc::Receiver<Bytes>>,
     pool: Arc<AddressPool>,
@@ -76,17 +75,6 @@ impl MasqueIpSessionLease {
 
     pub fn advertised_routes(&self) -> &[AddressRange] {
         &self.advertised_routes
-    }
-
-    pub fn set_peer_routes(&self, routes: Vec<AddressRange>) {
-        let mut guard = self.peer_routes.write();
-        self.registry.set_peer_routes(self.id, routes.clone());
-        *guard = routes;
-    }
-
-    #[cfg(test)]
-    pub fn peer_routes(&self) -> Vec<AddressRange> {
-        self.peer_routes.read().clone()
     }
 
     #[cfg(test)]
@@ -237,7 +225,7 @@ impl MasqueIpEngine {
                         pool_out.server_v4(),
                         pool_out.server_v6(),
                     ) {
-                        if let Some((_, sender_tx)) = registry_out.lookup(meta.src, meta.proto) {
+                        if let Some((_, sender_tx)) = registry_out.lookup(meta.src) {
                             let _ = sender_tx.try_send(icmp);
                         } else if stack_input_out
                             .try_send(PacketBuffer::copy_from_slice(&icmp))
@@ -248,7 +236,7 @@ impl MasqueIpEngine {
                     }
                     continue;
                 }
-                if let Some((_, target_tx)) = registry_out.lookup(meta.dst, meta.proto) {
+                if let Some((_, target_tx)) = registry_out.lookup(meta.dst) {
                     let _ = target_tx.try_send(Bytes::copy_from_slice(raw_pkt));
                 }
             }
@@ -304,7 +292,6 @@ impl MasqueIpEngine {
             id,
             assigned_ips,
             advertised_routes,
-            peer_routes: RwLock::new(Vec::new()),
             tx,
             rx: Some(rx),
             pool: self.pool.clone(),
@@ -334,10 +321,8 @@ impl MasqueIpEngine {
             return;
         };
 
-        // 2. Enforce source IP policy against assigned IPs and peer advertised routes.
-        let src_allowed = lease.assigned_ips.contains(&meta.src)
-            || routes_contain(&lease.peer_routes.read(), meta.src, meta.proto);
-        if !src_allowed {
+        // 2. Enforce source IP policy strictly against server-assigned IPs.
+        if !lease.assigned_ips.contains(&meta.src) {
             self.send_icmp_to_lease(lease, raw_pkt, IcmpErrorKind::SourcePolicy);
             return;
         }
@@ -354,7 +339,7 @@ impl MasqueIpEngine {
         }
 
         // 5. Route to peer session, reject unassigned tunnel prefix, or enter PacketStack.
-        if let Some((target_id, target_tx)) = self.registry.lookup(meta.dst, meta.proto) {
+        if let Some((target_id, target_tx)) = self.registry.lookup(meta.dst) {
             if target_id == lease.id {
                 return;
             }
@@ -696,7 +681,11 @@ async fn drain_ip_capsules(
                 replies.extend_from_slice(&assign);
             }
             Capsule::RouteAdvertisement(routes) => {
-                lease.set_peer_routes(routes);
+                // Fail closed: do not trust client-supplied routes without an authorized allowlist.
+                log::debug!(
+                    "ignoring client-supplied MASQUE CONNECT-IP ROUTE_ADVERTISEMENT ({} ranges)",
+                    routes.len()
+                );
             }
             Capsule::AddressAssign(_) | Capsule::Unknown { .. } => {}
         }

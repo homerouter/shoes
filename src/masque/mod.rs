@@ -14,7 +14,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use bytes::{Buf, Bytes};
 use h3_datagram::datagram_handler::SendDatagramError;
 use http::{Response, StatusCode};
@@ -24,7 +23,6 @@ use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::MasqueServerConfig;
 use crate::resolver::Resolver;
 use crate::resources::Budget;
-use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 
 use auth::MasqueAuth;
 use connect_ip::MasqueIpEngine;
@@ -223,23 +221,5 @@ impl MasqueServer {
         peer_authenticated_by_mtls: bool,
     ) -> io::Result<()> {
         h2_server::serve_h2_stream(self, stream, peer, peer_authenticated_by_mtls).await
-    }
-}
-
-#[async_trait]
-impl TcpServerHandler for MasqueServer {
-    async fn setup_server_stream(
-        &self,
-        stream: Box<dyn AsyncStream>,
-    ) -> io::Result<TcpServerSetupResult> {
-        let peer = stream
-            .peer_addr()
-            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-        let server = self.clone();
-        Ok(TcpServerSetupResult::Session(Box::pin(async move {
-            if let Err(err) = server.serve_h2_stream(stream, peer, false).await {
-                log::debug!("MASQUE H2 session ended: {err}");
-            }
-        })))
     }
 }

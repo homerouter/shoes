@@ -38,6 +38,21 @@ impl Drop for H3DatagramRxGuard {
 }
 
 impl H3DatagramHub {
+    pub(crate) fn new() -> (
+        Self,
+        mpsc::Receiver<(h3::quic::StreamId, oneshot::Sender<H3DatagramSender>)>,
+    ) {
+        let streams: DatagramStreams = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
+        let (sender_req_tx, sender_req_rx) = mpsc::channel(64);
+        (
+            Self {
+                streams,
+                sender_req_tx,
+            },
+            sender_req_rx,
+        )
+    }
+
     pub(crate) fn register(
         &self,
         stream_id: h3::quic::StreamId,
@@ -76,6 +91,17 @@ impl Drop for AbortOnDrop {
     }
 }
 
+pub(crate) async fn drain_h3_requests_on_shutdown(
+    mut sender_req_rx: mpsc::Receiver<(h3::quic::StreamId, oneshot::Sender<H3DatagramSender>)>,
+    hub: H3DatagramHub,
+    mut requests: tokio::task::JoinSet<()>,
+) {
+    sender_req_rx.close();
+    drop(sender_req_rx);
+    drop(hub);
+    while requests.join_next().await.is_some() {}
+}
+
 pub(crate) async fn serve_h3(server: &MasqueServer, connection: quinn::Connection) -> io::Result<()> {
     let peer = connection.remote_address();
     let peer_authenticated_by_mtls = connection.peer_identity().is_some();
@@ -87,12 +113,8 @@ pub(crate) async fn serve_h3(server: &MasqueServer, connection: quinn::Connectio
         .await
         .map_err(io::Error::other)?;
 
-    let streams: DatagramStreams = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
-    let (sender_req_tx, mut sender_req_rx) = mpsc::channel(64);
-    let hub = H3DatagramHub {
-        streams: streams.clone(),
-        sender_req_tx,
-    };
+    let (hub, mut sender_req_rx) = H3DatagramHub::new();
+    let streams = hub.streams.clone();
 
     let mut dgram_reader = driver.get_datagram_reader();
     let dgram_task = crate::network_tasks::spawn(async move {
@@ -124,7 +146,7 @@ pub(crate) async fn serve_h3(server: &MasqueServer, connection: quinn::Connectio
         let Some(resolver) = resolver else {
             drop(driver);
             drop(_dgram_guard);
-            while requests.join_next().await.is_some() {}
+            drain_h3_requests_on_shutdown(sender_req_rx, hub, requests).await;
             return Ok(());
         };
         while requests.try_join_next().is_some() {}

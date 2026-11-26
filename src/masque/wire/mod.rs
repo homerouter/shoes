@@ -9,22 +9,21 @@ mod tests;
 
 use std::fmt;
 
-#[allow(unused_imports)] // Re-exported for MASQUE server modules added in Tasks 3-6.
 pub use capsule::{
-    AddressRange, AssignedAddress, CAPSULE_ADDRESS_ASSIGN, CAPSULE_ADDRESS_REQUEST,
-    CAPSULE_DATAGRAM, CAPSULE_ROUTE_ADVERTISEMENT, Capsule, CapsuleDecoder, encode_capsule,
+    AddressRange, AssignedAddress, Capsule, CapsuleDecoder, encode_capsule,
 };
-#[allow(unused_imports)]
-pub use datagram::{
-    decode_context0_datagram, decode_datagram_context, encode_context0_datagram,
-};
-#[allow(unused_imports)]
-pub use ip_packet::{
-    IcmpErrorKind, IpPacketMeta, build_icmp_error, decrement_hop_limit, inspect_ip_packet,
-};
-#[allow(unused_imports)]
-pub use uri::{IpTunnelTarget, IpUriTemplate, TargetHostPort, UdpUriTemplate};
-#[allow(unused_imports)]
+#[cfg(test)]
+pub use capsule::CAPSULE_DATAGRAM;
+pub use datagram::{decode_context0_datagram, encode_context0_datagram};
+#[cfg(test)]
+pub use datagram::decode_datagram_context;
+pub use ip_packet::{IcmpErrorKind, build_icmp_error, decrement_hop_limit, inspect_ip_packet};
+#[cfg(test)]
+pub use ip_packet::IpPacketMeta;
+pub use uri::{IpUriTemplate, UdpUriTemplate};
+#[cfg(test)]
+pub use uri::{IpTunnelTarget, TargetHostPort};
+#[cfg(test)]
 pub use varint::{MAX_VARINT, decode_varint, encode_varint, varint_len};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

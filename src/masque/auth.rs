@@ -52,7 +52,7 @@ impl MasqueAuth {
         let mut configured = Vec::with_capacity(users.len());
         for user in users {
             let secret = if user.password.starts_with("$argon2id$") {
-                argon2::verify_encoded(&user.password, b"").map_err(|err| {
+                validate_argon2id_phc(&user.password).map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!("invalid MASQUE argon2id hash for {}: {err}", user.username),
@@ -149,4 +149,68 @@ impl MasqueAuth {
 
         Err(self.rejection())
     }
+}
+
+/// Validates PHC structure and Argon2id bounds without executing the memory-hard KDF.
+fn validate_argon2id_phc(encoded: &str) -> Result<(), &'static str> {
+    let parts: Vec<&str> = encoded.split('$').collect();
+    let (params_str, salt_b64, hash_b64) = match parts.as_slice() {
+        ["", "argon2id", version, params, salt, hash] => {
+            if !matches!(*version, "v=16" | "v=19") {
+                return Err("unsupported argon2 version");
+            }
+            (*params, *salt, *hash)
+        }
+        ["", "argon2id", params, salt, hash] => (*params, *salt, *hash),
+        _ => return Err("malformed PHC string"),
+    };
+
+    let mut params = params_str.split(',');
+    let (Some(m_part), Some(t_part), Some(p_part), None) =
+        (params.next(), params.next(), params.next(), params.next())
+    else {
+        return Err("malformed argon2 parameters");
+    };
+
+    let mem_cost: u32 = m_part
+        .strip_prefix("m=")
+        .and_then(|v| v.parse().ok())
+        .ok_or("invalid memory cost")?;
+    let time_cost: u32 = t_part
+        .strip_prefix("t=")
+        .and_then(|v| v.parse().ok())
+        .ok_or("invalid time cost")?;
+    let lanes: u32 = p_part
+        .strip_prefix("p=")
+        .and_then(|v| v.parse().ok())
+        .ok_or("invalid parallelism")?;
+
+    if !(1..=0x00FF_FFFF).contains(&lanes) {
+        return Err("parallelism out of range");
+    }
+    if mem_cost < 8
+        || u64::from(mem_cost) < 8 * u64::from(lanes)
+        || (cfg!(target_pointer_width = "32") && mem_cost > 0x20_0000)
+    {
+        return Err("memory cost out of range");
+    }
+    if time_cost < 1 {
+        return Err("time cost out of range");
+    }
+
+    let salt = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(salt_b64)
+        .map_err(|_| "invalid base64 salt")?;
+    if salt.len() < 8 {
+        return Err("salt too short");
+    }
+
+    let hash = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(hash_b64)
+        .map_err(|_| "invalid base64 hash")?;
+    if hash.len() < 4 {
+        return Err("hash too short");
+    }
+
+    Ok(())
 }

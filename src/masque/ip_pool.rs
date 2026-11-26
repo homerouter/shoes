@@ -395,20 +395,13 @@ pub fn networks_to_address_ranges(networks: &[IpNetwork]) -> Vec<AddressRange> {
         .collect()
 }
 
-#[derive(Debug)]
-struct SessionEntry {
-    assigned: Vec<IpAddr>,
-    tx: mpsc::Sender<Bytes>,
-}
-
+/// Routes outbound IP packets back to active `CONNECT-IP` sessions by assigned IP.
 #[derive(Debug, Default)]
 struct RegistryState {
     by_ip: HashMap<IpAddr, (u64, mpsc::Sender<Bytes>)>,
-    sessions: HashMap<u64, SessionEntry>,
-    peer_routes: Vec<(u64, Vec<AddressRange>, mpsc::Sender<Bytes>)>,
+    sessions: HashMap<u64, Vec<IpAddr>>,
 }
 
-/// Routes outbound IP packets back to active `CONNECT-IP` sessions by assigned IP or peer route.
 #[derive(Debug, Default)]
 pub struct IpSessionRegistry {
     state: Mutex<RegistryState>,
@@ -421,8 +414,8 @@ impl IpSessionRegistry {
 
     pub fn register(&self, session_id: u64, assigned: Vec<IpAddr>, tx: mpsc::Sender<Bytes>) {
         let mut state = self.state.lock();
-        if let Some(prev) = state.sessions.remove(&session_id) {
-            for ip in prev.assigned {
+        if let Some(prev_assigned) = state.sessions.remove(&session_id) {
+            for ip in prev_assigned {
                 if state
                     .by_ip
                     .get(&ip)
@@ -431,32 +424,18 @@ impl IpSessionRegistry {
                     state.by_ip.remove(&ip);
                 }
             }
-            state.peer_routes.retain(|(id, _, _)| *id != session_id);
         }
 
         for &ip in &assigned {
             state.by_ip.insert(ip, (session_id, tx.clone()));
         }
-        state
-            .sessions
-            .insert(session_id, SessionEntry { assigned, tx });
-    }
-
-    pub fn set_peer_routes(&self, session_id: u64, routes: Vec<AddressRange>) {
-        let mut state = self.state.lock();
-        state.peer_routes.retain(|(id, _, _)| *id != session_id);
-        if routes.is_empty() {
-            return;
-        }
-        if let Some(tx) = state.sessions.get(&session_id).map(|entry| entry.tx.clone()) {
-            state.peer_routes.push((session_id, routes, tx));
-        }
+        state.sessions.insert(session_id, assigned);
     }
 
     pub fn unregister(&self, session_id: u64) {
         let mut state = self.state.lock();
-        if let Some(entry) = state.sessions.remove(&session_id) {
-            for ip in entry.assigned {
+        if let Some(assigned) = state.sessions.remove(&session_id) {
+            for ip in assigned {
                 if state
                     .by_ip
                     .get(&ip)
@@ -466,16 +445,13 @@ impl IpSessionRegistry {
                 }
             }
         }
-        state.peer_routes.retain(|(id, _, _)| *id != session_id);
     }
 
-    pub fn lookup(&self, dst: IpAddr, proto: u8) -> Option<(u64, mpsc::Sender<Bytes>)> {
-        let state = self.state.lock();
-        if let Some((session_id, tx)) = state.by_ip.get(&dst) {
-            return Some((*session_id, tx.clone()));
-        }
-        state.peer_routes.iter().find_map(|(session_id, routes, tx)| {
-            routes_contain(routes, dst, proto).then(|| (*session_id, tx.clone()))
-        })
+    pub fn lookup(&self, dst: IpAddr) -> Option<(u64, mpsc::Sender<Bytes>)> {
+        self.state
+            .lock()
+            .by_ip
+            .get(&dst)
+            .map(|(session_id, tx)| (*session_id, tx.clone()))
     }
 }
