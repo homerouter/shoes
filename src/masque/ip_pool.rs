@@ -70,6 +70,13 @@ impl V4Pool {
     }
 
     fn allocate_one(&mut self) -> Option<Ipv4Addr> {
+        // Fresh addresses first, so a released address is reused as late as possible.
+        while let Some(cur) = self.next {
+            self.next = if cur < self.end { Some(cur + 1) } else { None };
+            if cur != self.gateway && self.allocated.insert(cur) {
+                return Some(Ipv4Addr::from(cur));
+            }
+        }
         while let Some(addr) = self.free.pop_front() {
             if addr != self.gateway
                 && addr >= self.start
@@ -77,12 +84,6 @@ impl V4Pool {
                 && self.allocated.insert(addr)
             {
                 return Some(Ipv4Addr::from(addr));
-            }
-        }
-        while let Some(cur) = self.next {
-            self.next = if cur < self.end { Some(cur + 1) } else { None };
-            if cur != self.gateway && self.allocated.insert(cur) {
-                return Some(Ipv4Addr::from(cur));
             }
         }
         None
@@ -160,6 +161,13 @@ impl V6Pool {
     }
 
     fn allocate_one(&mut self) -> Option<Ipv6Addr> {
+        // Fresh addresses first, so a released address is reused as late as possible.
+        while let Some(cur) = self.next {
+            self.next = if cur < self.end { Some(cur + 1) } else { None };
+            if cur != self.gateway && self.allocated.insert(cur) {
+                return Some(Ipv6Addr::from(cur));
+            }
+        }
         while let Some(addr) = self.free.pop_front() {
             if addr != self.gateway
                 && addr >= self.start
@@ -167,12 +175,6 @@ impl V6Pool {
                 && self.allocated.insert(addr)
             {
                 return Some(Ipv6Addr::from(addr));
-            }
-        }
-        while let Some(cur) = self.next {
-            self.next = if cur < self.end { Some(cur + 1) } else { None };
-            if cur != self.gateway && self.allocated.insert(cur) {
-                return Some(Ipv6Addr::from(cur));
             }
         }
         None

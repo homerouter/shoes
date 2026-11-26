@@ -6,11 +6,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 fn internet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut chunks = data.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (pairs, rest) = data.as_chunks::<2>();
+    for pair in pairs {
+        sum += u32::from(u16::from_be_bytes(*pair));
     }
-    if let Some(&last) = chunks.remainder().first() {
+    if let Some(&last) = rest.first() {
         sum += u32::from(u16::from_be_bytes([last, 0]));
     }
     while (sum >> 16) != 0 {

@@ -114,7 +114,7 @@ pub(crate) async fn handle_connect_udp_h3(
         .map_err(io::Error::other)?;
 
     let (mut send_stream, mut recv_stream) = stream.split();
-    let mut decoder = CapsuleDecoder::new();
+    let mut decoder = super::capsule_decoder();
     let mut datagrams_unavailable = false;
     let idle_sleep = tokio::time::sleep(UDP_IDLE_TIMEOUT);
     tokio::pin!(idle_sleep);
@@ -192,7 +192,7 @@ pub(crate) async fn handle_connect_udp_h2(
     let mut send = respond
         .send_response(capsule_ok_response(), false)
         .map_err(io::Error::other)?;
-    let mut decoder = CapsuleDecoder::new();
+    let mut decoder = super::capsule_decoder();
     let idle_sleep = tokio::time::sleep(UDP_IDLE_TIMEOUT);
     tokio::pin!(idle_sleep);
 

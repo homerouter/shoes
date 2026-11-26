@@ -76,6 +76,8 @@ pub struct TunUdpManager {
     destinations_per_session: Option<usize>,
     queued_bytes: Arc<Budget>,
     compact_payloads: bool,
+    /// Source IPs whose sessions must be dropped (their owner went away).
+    evict_sources: Option<mpsc::UnboundedReceiver<std::net::IpAddr>>,
 }
 
 struct QueuedPacket {
@@ -146,7 +148,17 @@ impl TunUdpManager {
             destinations_per_session: limits.max_udp_destinations_per_session,
             queued_bytes: Arc::new(Budget::new(limits.max_udp_queued_bytes)),
             compact_payloads: limits.max_udp_queued_bytes.is_some(),
+            evict_sources: None,
         }
+    }
+
+    /// Drops every session whose local address uses an IP received on `rx`.
+    pub(crate) fn with_source_eviction(
+        mut self,
+        rx: mpsc::UnboundedReceiver<std::net::IpAddr>,
+    ) -> Self {
+        self.evict_sources = Some(rx);
+        self
     }
 
     /// Run the UDP manager until shutdown.
@@ -190,6 +202,23 @@ impl TunUdpManager {
                             debug!("[TunUdpManager] TUN reader closed");
                             break;
                         }
+                    }
+                }
+
+                Some(ip) = async {
+                    match self.evict_sources.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let evicted: Vec<SocketAddr> = self
+                        .sessions
+                        .iter()
+                        .filter(|(addr, _)| addr.ip() == ip)
+                        .map(|(addr, _)| *addr)
+                        .collect();
+                    for addr in evicted {
+                        self.sessions.pop(&addr);
                     }
                 }
 

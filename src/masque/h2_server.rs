@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
+use tokio::time::Instant;
 
 use crate::async_stream::AsyncStream;
 use crate::resources;
@@ -17,9 +18,10 @@ pub(crate) async fn serve_h2_stream<IO: AsyncStream + 'static>(
 ) -> io::Result<()> {
     let max_streams = server.config.max_concurrent_requests.min(u32::MAX as usize) as u32;
     let mut connection = crate::util::timeout_stream_setup(async {
-        h2::server::Builder::new()
+        crate::http2::server_builder()
             .enable_connect_protocol()
             .max_concurrent_streams(max_streams)
+            .max_header_list_size(super::MAX_HEADER_BYTES)
             .handshake(stream)
             .await
             .map_err(io::Error::other)
@@ -27,12 +29,29 @@ pub(crate) async fn serve_h2_stream<IO: AsyncStream + 'static>(
     .await?;
 
     let ctx = server.conn_ctx(peer, peer_authenticated_by_mtls);
+    let budget = server.connection_budget();
     let mut requests = tokio::task::JoinSet::new();
+    let mut idle_deadline = Instant::now() + super::IDLE_CONNECTION_TIMEOUT;
+    let mut shutdown_deadline = None;
 
     loop {
         let accepted = tokio::select! {
             accepted = connection.accept() => accepted,
-            _ = requests.join_next(), if !requests.is_empty() => continue,
+            _ = requests.join_next(), if !requests.is_empty() => {
+                if requests.is_empty() {
+                    idle_deadline = Instant::now() + super::IDLE_CONNECTION_TIMEOUT;
+                }
+                continue;
+            }
+            _ = tokio::time::sleep_until(shutdown_deadline.unwrap_or(idle_deadline)),
+                if requests.is_empty() => {
+                if shutdown_deadline.is_some() {
+                    return Ok(());
+                }
+                connection.graceful_shutdown();
+                shutdown_deadline = Some(Instant::now() + crate::util::SHUTDOWN_TIMEOUT);
+                continue;
+            }
         };
         let Some(accepted) = accepted else {
             break;
@@ -41,7 +60,7 @@ pub(crate) async fn serve_h2_stream<IO: AsyncStream + 'static>(
         while requests.try_join_next().is_some() {}
 
         let (Some(local_permit), Some(global_permit)) =
-            (server.requests.acquire(1), resources::try_stream())
+            (budget.acquire(1), resources::try_stream())
         else {
             respond.send_reset(h2::Reason::REFUSED_STREAM);
             continue;
@@ -85,31 +104,38 @@ async fn dispatch_h2_request(
 
     match protocol.as_deref() {
         None => {
-            if let Err(rejection) =
-                ctx.auth
-                    .verify_headers(request.headers(), false, ctx.peer_authenticated_by_mtls)
+            if let Err(rejection) = ctx
+                .auth
+                .verify_headers(request.headers(), false, ctx.peer_authenticated_by_mtls)
+                .await
             {
                 return send_empty_response(&mut respond, rejection.into_response());
             }
             connect::handle_connect_h2(ctx, request, respond, recv).await
         }
         Some("connect-udp") => {
-            if let Err(rejection) =
-                ctx.auth
-                    .verify_headers(request.headers(), false, ctx.peer_authenticated_by_mtls)
+            if let Err(rejection) = ctx
+                .auth
+                .verify_headers(request.headers(), false, ctx.peer_authenticated_by_mtls)
+                .await
             {
                 return send_empty_response(&mut respond, rejection.into_response());
             }
             connect_udp::handle_connect_udp_h2(ctx, request, respond, recv).await
         }
         Some("connect-ip") => {
-            if let Err(rejection) =
-                ctx.auth
-                    .verify_headers(request.headers(), true, ctx.peer_authenticated_by_mtls)
+            let user = match ctx
+                .auth
+                .verify_headers(request.headers(), true, ctx.peer_authenticated_by_mtls)
+                .await
             {
-                return send_empty_response(&mut respond, rejection.into_response());
-            }
-            connect_ip::handle_connect_ip_h2(ctx, request, respond, recv).await
+                Ok(user) => user,
+                Err(rejection) => {
+                    return send_empty_response(&mut respond, rejection.into_response());
+                }
+            };
+            let owner = user.unwrap_or_else(|| ctx.peer.ip().to_string());
+            connect_ip::handle_connect_ip_h2(ctx, request, respond, recv, owner).await
         }
         Some(_) => send_empty_response(
             &mut respond,

@@ -41,8 +41,8 @@ async fn spawn_tcp_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
-#[test]
-fn auth_plaintext_proxy_authorization_and_non_connect_ip_rules() {
+#[tokio::test]
+async fn auth_plaintext_proxy_authorization_and_non_connect_ip_rules() {
     let users = vec![MasqueUserConfig {
         username: "alice".into(),
         password: "secret:password".into(),
@@ -52,14 +52,14 @@ fn auth_plaintext_proxy_authorization_and_non_connect_ip_rules() {
     let mut headers = HeaderMap::new();
     headers.insert(header::PROXY_AUTHORIZATION, basic_header("alice", "secret:password"));
     assert_eq!(
-        auth.verify_headers(&headers, false, false),
+        auth.verify_headers(&headers, false, false).await,
         Ok(Some("alice".to_string()))
     );
 
     // Authorization header alone is rejected when allow_authorization == false.
     let mut auth_only = HeaderMap::new();
     auth_only.insert(header::AUTHORIZATION, basic_header("alice", "secret:password"));
-    let err = auth.verify_headers(&auth_only, false, false).unwrap_err();
+    let err = auth.verify_headers(&auth_only, false, false).await.unwrap_err();
     assert_eq!(err.status_code(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
     let resp = err.into_response();
     assert_eq!(
@@ -68,8 +68,8 @@ fn auth_plaintext_proxy_authorization_and_non_connect_ip_rules() {
     );
 }
 
-#[test]
-fn auth_connect_ip_accepts_authorization_and_rejects_both_headers() {
+#[tokio::test]
+async fn auth_connect_ip_accepts_authorization_and_rejects_both_headers() {
     let users = vec![MasqueUserConfig {
         username: "alice".into(),
         password: "secret".into(),
@@ -79,18 +79,18 @@ fn auth_connect_ip_accepts_authorization_and_rejects_both_headers() {
     let mut headers = HeaderMap::new();
     headers.insert(header::AUTHORIZATION, basic_header("alice", "secret"));
     assert_eq!(
-        auth.verify_headers(&headers, true, false),
+        auth.verify_headers(&headers, true, false).await,
         Ok(Some("alice".to_string()))
     );
 
     // RFC 9484 Section 11: both Proxy-Authorization and Authorization present must reject.
     headers.insert(header::PROXY_AUTHORIZATION, basic_header("alice", "secret"));
-    let err = auth.verify_headers(&headers, true, false).unwrap_err();
+    let err = auth.verify_headers(&headers, true, false).await.unwrap_err();
     assert_eq!(err.status_code(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
 }
 
-#[test]
-fn auth_rejects_malformed_wrong_and_non_ascii_without_panicking() {
+#[tokio::test]
+async fn auth_rejects_malformed_wrong_and_non_ascii_without_panicking() {
     let users = vec![MasqueUserConfig {
         username: "alice".into(),
         password: "secret".into(),
@@ -155,7 +155,7 @@ fn auth_rejects_malformed_wrong_and_non_ascii_without_panicking() {
         ];
 
         for headers in cases {
-            let err = auth.verify_headers(&headers, false, false).unwrap_err();
+            let err = auth.verify_headers(&headers, false, false).await.unwrap_err();
             assert_eq!(err.status_code(), expected_status);
             let resp = err.into_response();
             assert_eq!(resp.status(), expected_status);
@@ -171,8 +171,8 @@ fn auth_rejects_malformed_wrong_and_non_ascii_without_panicking() {
     }
 }
 
-#[test]
-fn auth_argon2id_hash_verification() {
+#[tokio::test]
+async fn auth_argon2id_hash_verification() {
     let config = argon2::Config {
         variant: argon2::Variant::Argon2id,
         mem_cost: 1024,
@@ -192,14 +192,14 @@ fn auth_argon2id_hash_verification() {
     let mut ok_headers = HeaderMap::new();
     ok_headers.insert(header::PROXY_AUTHORIZATION, basic_header("alice", "hunter2"));
     assert_eq!(
-        auth.verify_headers(&ok_headers, false, false),
+        auth.verify_headers(&ok_headers, false, false).await,
         Ok(Some("alice".to_string()))
     );
 
     let mut bad_headers = HeaderMap::new();
     bad_headers.insert(header::PROXY_AUTHORIZATION, basic_header("alice", "wrong"));
     assert_eq!(
-        auth.verify_headers(&bad_headers, false, false)
+        auth.verify_headers(&bad_headers, false, false).await
             .unwrap_err()
             .status_code(),
         StatusCode::NOT_FOUND
@@ -212,6 +212,8 @@ fn auth_argon2id_hash_verification() {
         "$argon2id$v=19$m=1024,t=1,p=1$c2FsdA$aGFzaGhhc2g",
         "$argon2id$v=19$m=1024,t=1,p=1$c2FsdHNhbHRzYWx0$aGFz",
         "$argon2id$v=19$m=1024,t=1,p=1$not!base64!$aGFzaGhhc2g",
+        "$argon2id$v=19$m=4194304000,t=1,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2g",
+        "$argon2id$v=19$m=1024,t=1,p=65$c2FsdHNhbHRzYWx0$aGFzaGhhc2g",
     ] {
         let invalid_phc = vec![MasqueUserConfig {
             username: "alice".into(),
@@ -228,13 +230,13 @@ fn auth_argon2id_hash_verification() {
     assert!(MasqueAuth::from_users(&high_cost_phc, true).is_ok());
 }
 
-#[test]
-fn auth_mtls_only_mode() {
+#[tokio::test]
+async fn auth_mtls_only_mode() {
     let auth = MasqueAuth::from_users(&[], false).unwrap();
     let headers = HeaderMap::new();
-    assert_eq!(auth.verify_headers(&headers, false, true), Ok(None));
+    assert_eq!(auth.verify_headers(&headers, false, true).await, Ok(None));
     assert_eq!(
-        auth.verify_headers(&headers, false, false)
+        auth.verify_headers(&headers, false, false).await
             .unwrap_err()
             .status_code(),
         StatusCode::PROXY_AUTHENTICATION_REQUIRED
@@ -884,11 +886,10 @@ async fn h2_connect_udp_relays_datagrams_via_capsules() {
 
             let received = loop {
                 if let Some(cap) = decoder.next_capsule().unwrap() {
-                    if let Capsule::Datagram(payload) = cap {
-                        if let Some(udp) = decode_context0_datagram(payload).unwrap() {
+                    if let Capsule::Datagram(payload) = cap
+                        && let Some(udp) = decode_context0_datagram(payload).unwrap() {
                             break udp;
                         }
-                    }
                     continue;
                 }
                 let chunk = recv_stream.data().await.unwrap().unwrap();
@@ -1172,11 +1173,11 @@ async fn connect_udp_rejects_disabled_malformed_and_non_matching_requests() {
 
 fn test_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut chunks = data.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (pairs, rest) = data.as_chunks::<2>();
+    for pair in pairs {
+        sum += u32::from(u16::from_be_bytes(*pair));
     }
-    if let Some(&last) = chunks.remainder().first() {
+    if let Some(&last) = rest.first() {
         sum += u32::from(u16::from_be_bytes([last, 0]));
     }
     while (sum >> 16) != 0 {
@@ -1272,7 +1273,9 @@ fn address_pool_reserves_gateway_network_broadcast_rolls_back_and_reclaims() {
 
     pool.release(&a1);
     let a3 = pool.allocate().unwrap();
-    assert_eq!(a3, a1);
+    // Fresh v4 addresses (10.0.0.5) are used before released ones; v6 has only the released ::2.
+    assert_eq!(a3[1], a1[1]);
+    assert_ne!(a3[0], a1[0]);
     assert!(pool.allocate().is_none());
 
     // Verify routes_contain, IpRangeSet, and IpSessionRegistry lookup/unregister.
@@ -1338,7 +1341,7 @@ async fn connect_ip_engine_spoofed_source_and_disallowed_route_emit_icmp_errors(
                 ip_protocol: 0,
             },
         ];
-        let mut lease = engine.open_session(allowed_routes).unwrap();
+        let mut lease = engine.open_session("test", allowed_routes).unwrap();
         let assigned_v4 = match lease.assigned_ips()[0] {
             IpAddr::V4(v4) => v4,
             _ => panic!("expected ipv4"),
@@ -1415,16 +1418,93 @@ async fn connect_ip_lease_drop_reclaims_ip_and_removes_registry_route() {
         let engine = MasqueIpEngine::new(&config, selector, resolver).unwrap();
         let routes = engine.default_advertised_routes().to_vec();
 
-        let lease1 = engine.open_session(routes.clone()).unwrap();
+        let lease1 = engine.open_session("test", routes.clone()).unwrap();
         let ip1 = lease1.assigned_ips()[0];
         assert!(engine.registry().lookup(ip1).is_some());
-        assert!(engine.open_session(routes.clone()).is_err());
+        assert!(engine.open_session("test", routes.clone()).is_err());
 
         drop(lease1);
         assert!(engine.registry().lookup(ip1).is_none());
 
-        let lease2 = engine.open_session(routes).unwrap();
+        let lease2 = engine.open_session("test", routes).unwrap();
         assert_eq!(lease2.assigned_ips()[0], ip1);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn connect_ip_lease_drop_closes_flows_and_prefers_fresh_addresses() {
+    use super::connect_ip::MasqueIpEngine;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let selector = direct_selector(&resolver);
+        let config = MasqueServerConfig {
+            ip_enabled: true,
+            tunnel_addresses: vec!["10.23.0.1/29".parse().unwrap()],
+            ..Default::default()
+        };
+        let engine = MasqueIpEngine::new(&config, selector, resolver).unwrap();
+        let routes = engine.default_advertised_routes().to_vec();
+
+        let lease1 = engine.open_session("alice", routes.clone()).unwrap();
+        let ip1 = lease1.assigned_ips()[0];
+        let closed = engine.flow_token(ip1).expect("live session owns its flows");
+        drop(lease1);
+        assert!(closed.is_cancelled(), "TCP flows must end with the session");
+        assert!(engine.flow_token(ip1).is_none(), "no new flows for a released address");
+
+        let lease2 = engine.open_session("bob", routes).unwrap();
+        assert_ne!(lease2.assigned_ips()[0], ip1, "a fresh address is used before a released one");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn connect_ip_limits_sessions_per_user_and_peer_routing_is_opt_in() {
+    use std::net::IpAddr;
+    use super::connect_ip::MasqueIpEngine;
+    use super::wire::inspect_ip_packet;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let selector = direct_selector(&resolver);
+        let config = MasqueServerConfig {
+            ip_enabled: true,
+            tunnel_addresses: vec!["10.24.0.1/24".parse().unwrap()],
+            ..Default::default()
+        };
+        let engine = MasqueIpEngine::new(&config, selector, resolver).unwrap();
+        let routes = engine.default_advertised_routes().to_vec();
+
+        let mut alice: Vec<_> = (0..16)
+            .map(|_| engine.open_session("alice", routes.clone()).unwrap())
+            .collect();
+        assert!(engine.open_session("alice", routes.clone()).is_err());
+        let mut bob = engine.open_session("bob", routes.clone()).unwrap();
+        alice.pop();
+        assert!(engine.open_session("alice", routes.clone()).is_ok());
+
+        // Default routes do not cover the tunnel explicitly, so alice cannot reach bob directly.
+        let IpAddr::V4(src) = alice[0].assigned_ips()[0] else { panic!() };
+        let IpAddr::V4(dst) = bob.assigned_ips()[0] else { panic!() };
+        let pkt = make_ipv4_udp_packet(src, 1111, dst, 2222, 64, b"blocked");
+        engine.handle_inbound_packet(&alice[0], &pkt).await;
+        let icmp = tokio::time::timeout(Duration::from_secs(1), alice[0].recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let meta = inspect_ip_packet(&icmp).unwrap();
+        assert_eq!(meta.dst, IpAddr::V4(src));
+        assert_eq!(meta.proto, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), bob.recv())
+                .await
+                .is_err(),
+            "peer traffic must not be forwarded without explicit routes"
+        );
     })
     .await
     .unwrap();
@@ -1442,13 +1522,15 @@ async fn connect_ip_peer_to_peer_routing_and_ttl_expiry() {
         let config = MasqueServerConfig {
             ip_enabled: true,
             tunnel_addresses: vec!["10.22.0.1/24".parse().unwrap()],
+            // Client-to-client forwarding is opt-in through explicit routes covering the tunnel.
+            advertise_routes: vec!["0.0.0.0/0".parse().unwrap()],
             ..Default::default()
         };
         let engine = MasqueIpEngine::new(&config, selector, resolver).unwrap();
         let routes = engine.default_advertised_routes().to_vec();
 
-        let mut lease_a = engine.open_session(routes.clone()).unwrap();
-        let mut lease_b = engine.open_session(routes).unwrap();
+        let mut lease_a = engine.open_session("test", routes.clone()).unwrap();
+        let mut lease_b = engine.open_session("test", routes).unwrap();
         assert_ne!(lease_a.session_id(), lease_b.session_id());
         assert_eq!(engine.mtu(), 1280);
         assert!(engine.pool().is_server_address(IpAddr::V4(Ipv4Addr::new(10, 22, 0, 1))));
@@ -1520,7 +1602,7 @@ async fn connect_ip_udp_echo_via_packet_stack_and_tun_udp_manager() {
         .unwrap();
         let engine = server.ip_engine().expect("ip_enabled must initialize ip_engine");
         let mut lease = engine
-            .open_session(engine.default_advertised_routes().to_vec())
+            .open_session("test", engine.default_advertised_routes().to_vec())
             .unwrap();
         let client_ip = match lease.assigned_ips()[0] {
             IpAddr::V4(v4) => v4,
@@ -1923,14 +2005,12 @@ async fn h2_connect_ip_handshake_and_tcp_roundtrip() {
 
         let syn_ack = loop {
             if let Capsule::Datagram(payload) = next_h2_capsule(&mut recv_stream, &mut decoder).await
-            {
-                if let Some(pkt) = decode_context0_datagram(payload).unwrap() {
+                && let Some(pkt) = decode_context0_datagram(payload).unwrap() {
                     let meta = inspect_ip_packet(&pkt).unwrap();
                     if meta.proto == 6 && (pkt[33] & 0x12) == 0x12 {
                         break pkt;
                     }
                 }
-            }
         };
         let server_isn = u32::from_be_bytes(syn_ack[24..28].try_into().unwrap());
         let server_ack = u32::from_be_bytes(syn_ack[28..32].try_into().unwrap());
@@ -1958,8 +2038,7 @@ async fn h2_connect_ip_handshake_and_tcp_roundtrip() {
         let mut echoed = Vec::new();
         while echoed.len() < msg.len() {
             if let Capsule::Datagram(payload) = next_h2_capsule(&mut recv_stream, &mut decoder).await
-            {
-                if let Some(pkt) = decode_context0_datagram(payload).unwrap() {
+                && let Some(pkt) = decode_context0_datagram(payload).unwrap() {
                     let meta = inspect_ip_packet(&pkt).unwrap();
                     if meta.proto == 6 {
                         let ihl = usize::from(pkt[0] & 0x0f) * 4;
@@ -1969,7 +2048,6 @@ async fn h2_connect_ip_handshake_and_tcp_roundtrip() {
                         echoed.extend_from_slice(data);
                     }
                 }
-            }
         }
         assert_eq!(echoed, msg);
 
@@ -2490,6 +2568,7 @@ async fn connect_ip_ignores_client_route_advertisement_and_blocks_spoofing_and_h
                     }),
                     ip_enabled: true,
                     tunnel_addresses: vec!["10.42.0.1/24".parse().unwrap()],
+                    advertise_routes: vec!["0.0.0.0/0".parse().unwrap()],
                     stealth_404: false,
                     ..Default::default()
                 },
@@ -2594,11 +2673,10 @@ async fn connect_ip_ignores_client_route_advertisement_and_blocks_spoofing_and_h
             .unwrap();
 
         let icmp = loop {
-            if let Capsule::Datagram(payload) = next_capsule(&mut recv_b, &mut dec_b).await {
-                if let Some(pkt) = decode_context0_datagram(payload).unwrap() {
+            if let Capsule::Datagram(payload) = next_capsule(&mut recv_b, &mut dec_b).await
+                && let Some(pkt) = decode_context0_datagram(payload).unwrap() {
                     break pkt;
                 }
-            }
         };
         let meta = inspect_ip_packet(&icmp).unwrap();
         assert_eq!(meta.proto, 1);
@@ -2629,11 +2707,10 @@ async fn connect_ip_ignores_client_route_advertisement_and_blocks_spoofing_and_h
             .unwrap();
 
         let delivered_to_a = loop {
-            if let Capsule::Datagram(payload) = next_capsule(&mut recv_a, &mut dec_a).await {
-                if let Some(pkt) = decode_context0_datagram(payload).unwrap() {
+            if let Capsule::Datagram(payload) = next_capsule(&mut recv_a, &mut dec_a).await
+                && let Some(pkt) = decode_context0_datagram(payload).unwrap() {
                     break pkt;
                 }
-            }
         };
         let delivered_meta = inspect_ip_packet(&delivered_to_a).unwrap();
         assert_eq!(delivered_meta.src, IpAddr::V4(ip_c));

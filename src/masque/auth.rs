@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::Arc;
 
 use base64::Engine;
 use http::{HeaderMap, Response, StatusCode, header};
@@ -45,6 +46,8 @@ impl AuthRejection {
 pub struct MasqueAuth {
     users: Vec<ConfiguredUser>,
     stealth_404: bool,
+    /// Bounds concurrent memory-hard verifications so a flood cannot exhaust RAM.
+    argon2_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl MasqueAuth {
@@ -67,9 +70,11 @@ impl MasqueAuth {
                 secret,
             });
         }
+        let slots = std::thread::available_parallelism().map_or(2, |n| n.get());
         Ok(Self {
             users: configured,
             stealth_404,
+            argon2_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
         })
     }
 
@@ -83,7 +88,7 @@ impl MasqueAuth {
         }
     }
 
-    pub fn verify_headers(
+    pub async fn verify_headers(
         &self,
         headers: &HeaderMap,
         allow_authorization: bool,
@@ -130,24 +135,43 @@ impl MasqueAuth {
         let credentials = std::str::from_utf8(&decoded).map_err(|_| self.rejection())?;
         let (username, password) = credentials.split_once(':').ok_or_else(|| self.rejection())?;
 
-        for user in &self.users {
-            if bool::from(user.username.as_bytes().ct_eq(username.as_bytes())) {
-                let valid = match &user.secret {
-                    StoredSecret::Plain(expected) => {
-                        bool::from(expected.as_bytes().ct_eq(password.as_bytes()))
-                    }
-                    StoredSecret::Argon2id(encoded) => {
-                        argon2::verify_encoded(encoded, password.as_bytes()).unwrap_or(false)
-                    }
-                };
-                if valid {
-                    return Ok(Some(user.username.clone()));
-                }
-                return Err(self.rejection());
+        let user = self
+            .users
+            .iter()
+            .find(|user| bool::from(user.username.as_bytes().ct_eq(username.as_bytes())));
+        let valid = match user.map(|user| &user.secret) {
+            Some(StoredSecret::Plain(expected)) => {
+                bool::from(expected.as_bytes().ct_eq(password.as_bytes()))
             }
+            Some(StoredSecret::Argon2id(encoded)) => self.verify_argon2(encoded, password).await,
+            None => {
+                // Pay the same KDF cost for unknown names so timing does not reveal valid ones.
+                if let Some(encoded) = self.users.iter().find_map(|user| match &user.secret {
+                    StoredSecret::Argon2id(encoded) => Some(encoded),
+                    StoredSecret::Plain(_) => None,
+                }) {
+                    self.verify_argon2(encoded, password).await;
+                }
+                false
+            }
+        };
+        match user {
+            Some(user) if valid => Ok(Some(user.username.clone())),
+            _ => Err(self.rejection()),
         }
+    }
 
-        Err(self.rejection())
+    /// Runs the memory-hard KDF off the async workers.
+    async fn verify_argon2(&self, encoded: &str, password: &str) -> bool {
+        let Ok(_slot) = self.argon2_slots.acquire().await else {
+            return false;
+        };
+        let (encoded, password) = (encoded.to_owned(), password.to_owned());
+        tokio::task::spawn_blocking(move || {
+            argon2::verify_encoded(&encoded, password.as_bytes()).unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
     }
 }
 
@@ -185,11 +209,13 @@ fn validate_argon2id_phc(encoded: &str) -> Result<(), &'static str> {
         .and_then(|v| v.parse().ok())
         .ok_or("invalid parallelism")?;
 
-    if !(1..=0x00FF_FFFF).contains(&lanes) {
+    // Operator-typo guards: verification allocates m KiB and may use p threads.
+    if !(1..=64).contains(&lanes) {
         return Err("parallelism out of range");
     }
     if mem_cost < 8
         || u64::from(mem_cost) < 8 * u64::from(lanes)
+        || mem_cost > 0x40_0000
         || (cfg!(target_pointer_width = "32") && mem_cost > 0x20_0000)
     {
         return Err("memory cost out of range");

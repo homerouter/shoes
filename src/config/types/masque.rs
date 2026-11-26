@@ -11,6 +11,7 @@ use crate::option_util::NoneOrSome;
 const DEFAULT_UDP_TEMPLATE: &str = "/.well-known/masque/udp/{target_host}/{target_port}/";
 const DEFAULT_IP_TEMPLATE: &str = "/.well-known/masque/ip/{target}/{ipproto}/";
 const DEFAULT_MTU: u16 = 1280;
+const MAX_MTU: u16 = 1452;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 1024;
 
 pub(crate) fn invalid(message: &str) -> io::Error {
@@ -89,8 +90,9 @@ impl MasqueServerConfig {
         crate::masque::wire::UdpUriTemplate::parse(&self.udp_template)?;
         crate::masque::wire::IpUriTemplate::parse(&self.ip_template)?;
 
-        if self.mtu < DEFAULT_MTU {
-            return Err(invalid("MASQUE mtu must be at least 1280"));
+        // 1452 keeps tunnel packets inside one QUIC datagram on a 1500-byte path.
+        if !(DEFAULT_MTU..=MAX_MTU).contains(&self.mtu) {
+            return Err(invalid("MASQUE mtu must be between 1280 and 1452"));
         }
         if self.max_concurrent_requests == 0 {
             return Err(invalid(

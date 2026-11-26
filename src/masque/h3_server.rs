@@ -108,7 +108,7 @@ pub(crate) async fn serve_h3(server: &MasqueServer, connection: quinn::Connectio
     let mut driver = h3::server::builder()
         .enable_extended_connect(true)
         .enable_datagram(true)
-        .max_field_section_size(64 * 1024)
+        .max_field_section_size(super::MAX_HEADER_BYTES.into())
         .build(h3_quinn::Connection::new(connection))
         .await
         .map_err(io::Error::other)?;
@@ -132,6 +132,7 @@ pub(crate) async fn serve_h3(server: &MasqueServer, connection: quinn::Connectio
     let _dgram_guard = AbortOnDrop(dgram_task.abort_handle());
 
     let ctx = server.conn_ctx(peer, peer_authenticated_by_mtls);
+    let budget = server.connection_budget();
     let mut requests = tokio::task::JoinSet::new();
 
     loop {
@@ -152,7 +153,7 @@ pub(crate) async fn serve_h3(server: &MasqueServer, connection: quinn::Connectio
         while requests.try_join_next().is_some() {}
 
         let (Some(local_permit), Some(global_permit)) =
-            (server.requests.acquire(1), resources::try_stream())
+            (budget.acquire(1), resources::try_stream())
         else {
             drop(resolver);
             continue;
@@ -199,6 +200,7 @@ async fn dispatch_h3_request(
             if let Err(rejection) =
                 ctx.auth
                     .verify_headers(request.headers(), false, ctx.peer_authenticated_by_mtls)
+                    .await
             {
                 return send_empty_response(&mut stream, rejection.into_response()).await;
             }
@@ -208,19 +210,25 @@ async fn dispatch_h3_request(
             if let Err(rejection) =
                 ctx.auth
                     .verify_headers(request.headers(), false, ctx.peer_authenticated_by_mtls)
+                    .await
             {
                 return send_empty_response(&mut stream, rejection.into_response()).await;
             }
             connect_udp::handle_connect_udp_h3(ctx, request, stream, hub).await
         }
         Some(proto) if proto == h3::ext::Protocol::CONNECT_IP => {
-            if let Err(rejection) =
-                ctx.auth
-                    .verify_headers(request.headers(), true, ctx.peer_authenticated_by_mtls)
+            let user = match ctx
+                .auth
+                .verify_headers(request.headers(), true, ctx.peer_authenticated_by_mtls)
+                .await
             {
-                return send_empty_response(&mut stream, rejection.into_response()).await;
-            }
-            connect_ip::handle_connect_ip_h3(ctx, request, stream, hub).await
+                Ok(user) => user,
+                Err(rejection) => {
+                    return send_empty_response(&mut stream, rejection.into_response()).await;
+                }
+            };
+            let owner = user.unwrap_or_else(|| ctx.peer.ip().to_string());
+            connect_ip::handle_connect_ip_h3(ctx, request, stream, hub, owner).await
         }
         Some(_) => {
             send_empty_response(

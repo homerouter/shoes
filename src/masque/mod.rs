@@ -13,6 +13,7 @@ mod tests;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use h3_datagram::datagram_handler::SendDatagramError;
@@ -29,6 +30,22 @@ use connect_ip::MasqueIpEngine;
 use wire::{Capsule, CapsuleDecoder, IpUriTemplate, UdpUriTemplate, encode_capsule};
 
 const CAPSULE_PROTOCOL_HEADER: &str = "capsule-protocol";
+/// Request header block limit, shared by H2 and H3.
+pub(crate) const MAX_HEADER_BYTES: u32 = 64 * 1024;
+/// Largest capsule accepted from a client: one maximal UDP payload or IP packet plus framing.
+pub(crate) const MAX_CAPSULE_BYTES: usize = 64 * 1024 + 16;
+/// An H2 connection with no requests is closed after this long.
+pub(crate) const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
+/// A send that the peer does not grant flow-control credit for fails after this long.
+const SEND_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub(crate) fn capsule_decoder() -> CapsuleDecoder {
+    CapsuleDecoder::with_max_capsule_size(MAX_CAPSULE_BYTES)
+}
+
+fn send_stalled() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "MASQUE peer stopped reading")
+}
 
 pub(crate) fn capsule_ok_response() -> Response<()> {
     Response::builder()
@@ -79,7 +96,11 @@ pub(crate) async fn send_h2_data(
             if current > 0 {
                 break current;
             }
-            match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+            let capacity = std::future::poll_fn(|cx| send.poll_capacity(cx));
+            match tokio::time::timeout(SEND_STALL_TIMEOUT, capacity)
+                .await
+                .map_err(|_| send_stalled())?
+            {
                 Some(Ok(_)) => continue,
                 Some(Err(err)) => return Err(io::Error::other(err)),
                 None => return Err(io::ErrorKind::BrokenPipe.into()),
@@ -123,9 +144,9 @@ pub(crate) async fn send_h3_datagram_or_capsule<S: h3::quic::SendStream<Bytes>>(
         }
     }
     let capsule = encode_capsule(&Capsule::Datagram(encoded_context0));
-    send_stream
-        .send_data(capsule)
+    tokio::time::timeout(SEND_STALL_TIMEOUT, send_stream.send_data(capsule))
         .await
+        .map_err(|_| send_stalled())?
         .map_err(io::Error::other)
 }
 
@@ -151,7 +172,6 @@ pub struct MasqueServer {
     ip_engine: Option<Arc<MasqueIpEngine>>,
     selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    requests: Arc<Budget>,
 }
 
 impl MasqueServer {
@@ -174,7 +194,6 @@ impl MasqueServer {
         } else {
             None
         };
-        let requests = Arc::new(Budget::new(Some(config.max_concurrent_requests)));
         Ok(Self {
             config: Arc::new(config),
             auth,
@@ -183,8 +202,12 @@ impl MasqueServer {
             ip_engine,
             selector,
             resolver,
-            requests,
         })
+    }
+
+    /// Request slots for one connection, so one client cannot starve the others.
+    pub(crate) fn connection_budget(&self) -> Arc<Budget> {
+        Arc::new(Budget::new(Some(self.config.max_concurrent_requests)))
     }
 
     #[cfg(test)]

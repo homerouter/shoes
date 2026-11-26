@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -14,6 +15,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::address::{Address, NetLocation};
 use crate::client_proxy_selector::ClientProxySelector;
@@ -36,31 +38,49 @@ use crate::masque::{
     send_h3_datagram_or_capsule, status_response,
 };
 use crate::resolver::Resolver;
+use crate::resources::Budget;
 use crate::tun::udp_handler::UdpHandler;
 use crate::tun::udp_manager::TunUdpManager;
 
 const SESSION_OUTBOUND_QUEUE: usize = 256;
 const IP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+// shortcut: fixed caps, not configurable; make them config fields if operators need other values.
+/// Concurrent CONNECT-IP sessions per user (or per peer IP for mTLS-only clients).
+const MAX_SESSIONS_PER_OWNER: usize = 16;
+/// Concurrent TCP flows per CONNECT-IP session.
+const MAX_TCP_FLOWS_PER_SESSION: usize = 64;
 
 fn is_link_local_or_multicast(addr: IpAddr) -> bool {
     match addr {
-        IpAddr::V4(v4) => v4.is_link_local() || v4.is_multicast(),
+        IpAddr::V4(v4) => v4.is_link_local() || v4.is_multicast() || v4.is_broadcast(),
         IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80 || v6.is_multicast(),
     }
 }
 
+/// Per-session state the shared stack tasks need to find by tunnel IP.
+#[derive(Default)]
+struct SessionTracker {
+    /// Cancels a session's TCP flows and bounds how many it may open.
+    flows: Mutex<HashMap<IpAddr, (CancellationToken, Arc<Budget>)>>,
+    per_owner: Mutex<HashMap<String, usize>>,
+}
+
 /// RAII lease representing a single active `CONNECT-IP` session.
 ///
-/// Dropping the lease deterministically unregisters its routes and returns all
-/// allocated tunnel IP addresses to `AddressPool`.
+/// Dropping the lease unregisters its routes, closes the TCP and UDP flows it
+/// opened, and returns all allocated tunnel IP addresses to `AddressPool`.
 pub struct MasqueIpSessionLease {
     id: u64,
+    owner: String,
     assigned_ips: Vec<IpAddr>,
     advertised_routes: Vec<AddressRange>,
     tx: mpsc::Sender<Bytes>,
     rx: Option<mpsc::Receiver<Bytes>>,
     pool: Arc<AddressPool>,
     registry: Arc<IpSessionRegistry>,
+    tracker: Arc<SessionTracker>,
+    closed: CancellationToken,
+    evict_udp: mpsc::UnboundedSender<IpAddr>,
 }
 
 impl MasqueIpSessionLease {
@@ -95,6 +115,26 @@ impl MasqueIpSessionLease {
 impl Drop for MasqueIpSessionLease {
     fn drop(&mut self) {
         self.registry.unregister(self.id);
+        // Flows must not outlive the lease, or the next holder of the address inherits them.
+        {
+            let mut flows = self.tracker.flows.lock();
+            for ip in &self.assigned_ips {
+                flows.remove(ip);
+            }
+        }
+        self.closed.cancel();
+        for &ip in &self.assigned_ips {
+            let _ = self.evict_udp.send(ip);
+        }
+        {
+            let mut per_owner = self.tracker.per_owner.lock();
+            if let Some(count) = per_owner.get_mut(&self.owner) {
+                *count -= 1;
+                if *count == 0 {
+                    per_owner.remove(&self.owner);
+                }
+            }
+        }
         self.pool.release(&self.assigned_ips);
     }
 }
@@ -106,7 +146,11 @@ pub struct MasqueIpEngine {
     #[cfg(test)]
     default_advertised_routes: Vec<AddressRange>,
     mtu: u16,
+    /// Client-to-client forwarding, only when the operator routes the tunnel prefix explicitly.
+    peer_routing: bool,
     next_session_id: AtomicU64,
+    tracker: Arc<SessionTracker>,
+    evict_udp: mpsc::UnboundedSender<IpAddr>,
     stack_input: mpsc::Sender<PacketBuffer>,
     wake: Wake,
     tasks: Mutex<JoinSet<()>>,
@@ -140,7 +184,10 @@ impl MasqueIpEngine {
         #[cfg(test)]
         let default_advertised_routes =
             networks_to_address_ranges(&config.effective_advertise_routes());
-        let limits = TunResourceLimits::default();
+        let limits = crate::config::wireguard::device_limits(&TunResourceLimits::default());
+        let tracker = Arc::new(SessionTracker::default());
+        let (evict_udp, evict_udp_rx) = mpsc::unbounded_channel();
+        let peer_routing = routes_cover(&config.advertise_routes, &config.tunnel_addresses);
         let mut stack = PacketStack::new(
             pool.server_addresses(),
             config.mtu,
@@ -162,7 +209,8 @@ impl MasqueIpEngine {
             selector.clone(),
             resolver.clone(),
             limits,
-        );
+        )
+        .with_source_eviction(evict_udp_rx);
         crate::network_tasks::spawn_in(&mut tasks, async move {
             if let Err(error) = manager.run().await {
                 log::warn!("MASQUE CONNECT-IP UDP forwarding stopped: {error}");
@@ -171,6 +219,7 @@ impl MasqueIpEngine {
 
         // 2. Spawn TCP accept loop calling handle_tcp_connection.
         let mut tcp = stack.tcp.take().expect("PacketStack tcp receiver");
+        let tracker_tcp = tracker.clone();
         crate::network_tasks::spawn_in(&mut tasks, async move {
             let mut flows = JoinSet::new();
             loop {
@@ -181,9 +230,19 @@ impl MasqueIpEngine {
                     },
                     _ = flows.join_next(), if !flows.is_empty() => continue,
                 };
+                // Dropping the connection resets it: no live session owns this source, or it is at its cap.
+                let Some((closed, budget)) =
+                    tracker_tcp.flows.lock().get(&connection.source.ip()).cloned()
+                else {
+                    continue;
+                };
+                let Some(permit) = budget.acquire(1) else {
+                    continue;
+                };
                 let selector = selector.clone();
                 let resolver = resolver.clone();
                 crate::network_tasks::spawn_in(&mut flows, async move {
+                    let _permit = permit;
                     log::debug!(
                         "MASQUE CONNECT-IP TCP {} -> {}",
                         connection.source,
@@ -193,14 +252,16 @@ impl MasqueIpEngine {
                         connection.target.ip(),
                         connection.target.port(),
                     );
-                    let _ = crate::tun::handle_tcp_connection(
-                        connection.connection,
-                        target,
-                        selector,
-                        resolver,
-                        Some(connection.source),
-                    )
-                    .await;
+                    tokio::select! {
+                        _ = closed.cancelled() => {}
+                        _ = crate::tun::handle_tcp_connection(
+                            connection.connection,
+                            target,
+                            selector,
+                            resolver,
+                            Some(connection.source),
+                        ) => {}
+                    }
                 });
             }
         });
@@ -208,34 +269,13 @@ impl MasqueIpEngine {
         // 3. Spawn stack.output demux loop routing outbound IP packets back to sessions.
         let mut output = stack.output.take().expect("PacketStack output receiver");
         let registry_out = registry.clone();
-        let pool_out = pool.clone();
-        let stack_input_out = stack_input.clone();
-        let wake_out = wake.clone();
-        let mtu = config.mtu;
         crate::network_tasks::spawn_in(&mut tasks, async move {
+            // The stack's device already drops packets larger than the MTU.
             while let Some(packet) = output.recv().await {
                 let raw_pkt: &[u8] = &packet;
                 let Some(meta) = inspect_ip_packet(raw_pkt) else {
                     continue;
                 };
-                if raw_pkt.len() > mtu as usize {
-                    if let Some(icmp) = build_icmp_error(
-                        raw_pkt,
-                        IcmpErrorKind::PacketTooBig(mtu),
-                        pool_out.server_v4(),
-                        pool_out.server_v6(),
-                    ) {
-                        if let Some((_, sender_tx)) = registry_out.lookup(meta.src) {
-                            let _ = sender_tx.try_send(icmp);
-                        } else if stack_input_out
-                            .try_send(PacketBuffer::copy_from_slice(&icmp))
-                            .is_ok()
-                        {
-                            wake_out.notify();
-                        }
-                    }
-                    continue;
-                }
                 if let Some((_, target_tx)) = registry_out.lookup(meta.dst) {
                     let _ = target_tx.try_send(Bytes::copy_from_slice(raw_pkt));
                 }
@@ -248,7 +288,10 @@ impl MasqueIpEngine {
             #[cfg(test)]
             default_advertised_routes,
             mtu: config.mtu,
+            peer_routing,
             next_session_id: AtomicU64::new(1),
+            tracker,
+            evict_udp,
             stack_input,
             wake,
             tasks: Mutex::new(tasks),
@@ -275,27 +318,57 @@ impl MasqueIpEngine {
         self.mtu
     }
 
+    #[cfg(test)]
+    pub fn flow_token(&self, ip: IpAddr) -> Option<CancellationToken> {
+        self.tracker.flows.lock().get(&ip).map(|(token, _)| token.clone())
+    }
+
+    /// Opens a session for `owner` (the authenticated user, or the peer IP for mTLS-only clients).
     pub fn open_session(
         self: &Arc<Self>,
+        owner: &str,
         advertised_routes: Vec<AddressRange>,
     ) -> io::Result<MasqueIpSessionLease> {
+        let mut per_owner = self.tracker.per_owner.lock();
+        let count = per_owner.get(owner).copied().unwrap_or(0);
+        if count >= MAX_SESSIONS_PER_OWNER {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "MASQUE CONNECT-IP session limit reached for this user",
+            ));
+        }
         let assigned_ips = self.pool.allocate().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
                 "MASQUE CONNECT-IP address pool exhausted",
             )
         })?;
+        per_owner.insert(owner.to_owned(), count + 1);
+        drop(per_owner);
+
         let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(SESSION_OUTBOUND_QUEUE);
+        let closed = CancellationToken::new();
+        {
+            let budget = Arc::new(Budget::new(Some(MAX_TCP_FLOWS_PER_SESSION)));
+            let mut flows = self.tracker.flows.lock();
+            for &ip in &assigned_ips {
+                flows.insert(ip, (closed.clone(), budget.clone()));
+            }
+        }
         self.registry.register(id, assigned_ips.clone(), tx.clone());
         Ok(MasqueIpSessionLease {
             id,
+            owner: owner.to_owned(),
             assigned_ips,
             advertised_routes,
             tx,
             rx: Some(rx),
             pool: self.pool.clone(),
             registry: self.registry.clone(),
+            tracker: self.tracker.clone(),
+            closed,
+            evict_udp: self.evict_udp.clone(),
         })
     }
 
@@ -339,7 +412,9 @@ impl MasqueIpEngine {
         }
 
         // 5. Route to peer session, reject unassigned tunnel prefix, or enter PacketStack.
-        if let Some((target_id, target_tx)) = self.registry.lookup(meta.dst) {
+        if let Some((target_id, target_tx)) =
+            self.registry.lookup(meta.dst).filter(|_| self.peer_routing)
+        {
             if target_id == lease.id {
                 return;
             }
@@ -366,15 +441,13 @@ impl MasqueIpEngine {
             return;
         }
 
-        let pkt = PacketBuffer::copy_from_slice(raw_pkt);
-        match self.stack_input.try_send(pkt) {
-            Ok(()) => self.wake.notify(),
-            Err(mpsc::error::TrySendError::Full(pkt)) => {
-                self.wake.notify();
-                let _ = self.stack_input.send(pkt).await;
-                self.wake.notify();
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        // Drop on a full queue like a router, so one busy client cannot stall the others.
+        if self
+            .stack_input
+            .try_send(PacketBuffer::copy_from_slice(raw_pkt))
+            .is_ok()
+        {
+            self.wake.notify();
         }
     }
 }
@@ -499,7 +572,11 @@ fn compute_advertised_routes(
     out
 }
 
-async fn prepare_connect_ip(ctx: &MasqueConnCtx, request: &Request<()>) -> ConnectIpPrep {
+async fn prepare_connect_ip(
+    ctx: &MasqueConnCtx,
+    request: &Request<()>,
+    owner: &str,
+) -> ConnectIpPrep {
     let Some(engine) = ctx
         .ip_engine
         .as_ref()
@@ -565,7 +642,7 @@ async fn prepare_connect_ip(ctx: &MasqueConnCtx, request: &Request<()>) -> Conne
         return ConnectIpPrep::Reject(status_response(StatusCode::FORBIDDEN));
     }
 
-    match engine.open_session(advertised_routes) {
+    match engine.open_session(owner, advertised_routes) {
         Ok(lease) => ConnectIpPrep::Ready { engine, lease },
         Err(_) => ConnectIpPrep::Reject(status_response(StatusCode::SERVICE_UNAVAILABLE)),
     }
@@ -698,8 +775,9 @@ pub(crate) async fn handle_connect_ip_h3(
     request: Request<()>,
     mut stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     hub: H3DatagramHub,
+    owner: String,
 ) -> io::Result<()> {
-    let (engine, mut lease) = match prepare_connect_ip(&ctx, &request).await {
+    let (engine, mut lease) = match prepare_connect_ip(&ctx, &request, &owner).await {
         ConnectIpPrep::Ready { engine, lease } => (engine, lease),
         ConnectIpPrep::Reject(resp) => {
             stream
@@ -728,7 +806,7 @@ pub(crate) async fn handle_connect_ip_h3(
     let mut outbound_rx = lease
         .take_receiver()
         .expect("fresh CONNECT-IP lease must have outbound receiver");
-    let mut decoder = CapsuleDecoder::new();
+    let mut decoder = super::capsule_decoder();
     let mut datagrams_unavailable = false;
     let idle_sleep = tokio::time::sleep(IP_IDLE_TIMEOUT);
     tokio::pin!(idle_sleep);
@@ -791,8 +869,9 @@ pub(crate) async fn handle_connect_ip_h2(
     request: Request<()>,
     mut respond: h2::server::SendResponse<Bytes>,
     mut recv: h2::RecvStream,
+    owner: String,
 ) -> io::Result<()> {
-    let (engine, mut lease) = match prepare_connect_ip(&ctx, &request).await {
+    let (engine, mut lease) = match prepare_connect_ip(&ctx, &request, &owner).await {
         ConnectIpPrep::Ready { engine, lease } => (engine, lease),
         ConnectIpPrep::Reject(resp) => {
             return respond
@@ -810,7 +889,7 @@ pub(crate) async fn handle_connect_ip_h2(
     let mut outbound_rx = lease
         .take_receiver()
         .expect("fresh CONNECT-IP lease must have outbound receiver");
-    let mut decoder = CapsuleDecoder::new();
+    let mut decoder = super::capsule_decoder();
     let idle_sleep = tokio::time::sleep(IP_IDLE_TIMEOUT);
     tokio::pin!(idle_sleep);
 
@@ -847,4 +926,16 @@ pub(crate) async fn handle_connect_ip_h2(
             }
         }
     }
+}
+
+/// True when explicit operator routes cover every tunnel prefix, opting in to client-to-client traffic.
+fn routes_cover(routes: &[IpNetwork], tunnels: &[IpNetwork]) -> bool {
+    !routes.is_empty()
+        && tunnels.iter().all(|tunnel| {
+            routes.iter().any(|route| {
+                route.prefix() <= tunnel.prefix()
+                    && route.contains(tunnel.network())
+                    && route.is_ipv4() == tunnel.is_ipv4()
+            })
+        })
 }

@@ -1103,10 +1103,11 @@ fn masque_config_deserialization_defaults_and_validation() {
         assert!(m.validate().is_err(), "should reject {bad_ip_cfg}");
     }
 
-    // 6. Reject mtu < 1280, max_concurrent_requests == 0, invalid templates, bad users
+    // 6. Reject mtu outside 1280..=1452, max_concurrent_requests == 0, invalid templates, bad users
     for bad_cfg in [
         serde_json::json!({"type": "masque", "mtu": 1279}),
         serde_json::json!({"type": "masque", "mtu": 0}),
+        serde_json::json!({"type": "masque", "mtu": 1453}),
         serde_json::json!({"type": "masque", "max_concurrent_requests": 0}),
         serde_json::json!({"type": "masque", "udp_template": "relative/no-leading-slash/{target_host}/{target_port}"}),
         serde_json::json!({"type": "masque", "udp_template": "/udp/{target_host}/missing-port"}),

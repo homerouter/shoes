@@ -346,8 +346,6 @@ pub async fn start_quic_servers(
                 return Err(std::io::Error::other("QUIC MASQUE ALPN must be h3"));
             }
             let max_requests = config.max_concurrent_requests.min(u32::MAX as usize) as u32;
-            let ip_enabled = config.ip_enabled;
-            let mtu = config.mtu;
             let service = Arc::new(crate::masque::MasqueServer::new(
                 config,
                 client_proxy_selector,
@@ -356,17 +354,8 @@ pub async fn start_quic_servers(
             let mut endpoints = Vec::new();
             for address in bind_addresses {
                 let mut config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
+                // configure_quic clamps streams to the global limits and enables datagrams.
                 let memory_bytes = crate::resources::configure_quic(&mut config, max_requests, 16);
-                let transport = Arc::get_mut(&mut config.transport).unwrap();
-                transport
-                    .max_concurrent_bidi_streams(max_requests.into())
-                    .max_concurrent_uni_streams(16u32.into())
-                    .datagram_receive_buffer_size(Some(256 << 10))
-                    .datagram_send_buffer_size(256 << 10);
-                if ip_enabled {
-                    // Reserve headroom for QUIC short headers + H3 datagram context/stream IDs.
-                    transport.initial_mtu(mtu.saturating_add(96));
-                }
                 endpoints.extend(crate::listener_tasks::QuicListener::bind_all(
                     address,
                     config,
