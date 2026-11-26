@@ -191,6 +191,8 @@ impl TunUdpManager {
                 packet = self.reader.next() => {
                     match packet {
                         Some((payload, local_addr, remote_addr)) => {
+                            // Drain pending source evictions before routing so a reused IP never hits a stale session.
+                            self.drain_pending_evictions();
                             debug!(
                                 "[TunUdpManager] Packet: {} -> {} ({} bytes)",
                                 local_addr, remote_addr, payload.len()
@@ -211,15 +213,7 @@ impl TunUdpManager {
                         None => std::future::pending().await,
                     }
                 } => {
-                    let evicted: Vec<SocketAddr> = self
-                        .sessions
-                        .iter()
-                        .filter(|(addr, _)| addr.ip() == ip)
-                        .map(|(addr, _)| *addr)
-                        .collect();
-                    for addr in evicted {
-                        self.sessions.pop(&addr);
-                    }
+                    self.evict_source_ip(ip);
                 }
 
                 // Periodic cleanup
@@ -231,6 +225,28 @@ impl TunUdpManager {
 
         debug!("[TunUdpManager] Stopping");
         Ok(())
+    }
+
+    fn evict_source_ip(&mut self, ip: std::net::IpAddr) {
+        let evicted: Vec<SocketAddr> = self
+            .sessions
+            .iter()
+            .filter(|(addr, _)| addr.ip() == ip)
+            .map(|(addr, _)| *addr)
+            .collect();
+        for addr in evicted {
+            self.sessions.pop(&addr);
+        }
+    }
+
+    fn drain_pending_evictions(&mut self) {
+        while let Some(ip) = self
+            .evict_sources
+            .as_mut()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.evict_source_ip(ip);
+        }
     }
 
     /// Handle an incoming UDP packet from the TUN.
