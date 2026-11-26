@@ -1560,3 +1560,708 @@ async fn connect_ip_udp_echo_via_packet_stack_and_tun_udp_manager() {
     .await
     .unwrap();
 }
+
+#[allow(clippy::too_many_arguments)]
+fn make_ipv4_tcp_packet(
+    src: std::net::Ipv4Addr,
+    src_port: u16,
+    dst: std::net::Ipv4Addr,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let tcp_len = (20 + payload.len()) as u16;
+    let total_len = 20 + tcp_len;
+    let mut pkt = vec![0u8; total_len as usize];
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+    pkt[6] = 0x40;
+    pkt[8] = 64;
+    pkt[9] = 6;
+    pkt[12..16].copy_from_slice(&src.octets());
+    pkt[16..20].copy_from_slice(&dst.octets());
+    let ip_csum = test_checksum(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+    pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    pkt[24..28].copy_from_slice(&seq.to_be_bytes());
+    pkt[28..32].copy_from_slice(&ack.to_be_bytes());
+    pkt[32] = 0x50; // data offset = 5 (20 bytes)
+    pkt[33] = flags;
+    pkt[34..36].copy_from_slice(&65535u16.to_be_bytes());
+    pkt[40..].copy_from_slice(payload);
+
+    let mut pseudo = Vec::with_capacity(12 + usize::from(tcp_len));
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.extend_from_slice(&[0, 6]);
+    pseudo.extend_from_slice(&tcp_len.to_be_bytes());
+    pseudo.extend_from_slice(&pkt[20..]);
+    let tcp_csum = test_checksum(&pseudo);
+    pkt[36..38].copy_from_slice(&tcp_csum.to_be_bytes());
+    pkt
+}
+
+#[tokio::test]
+async fn h3_connect_ip_handshake_and_udp_roundtrip() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use h3_datagram::datagram_handler::HandleDatagramsExt;
+    use super::wire::{
+        AssignedAddress, Capsule, CapsuleDecoder, decode_context0_datagram, encode_capsule,
+        encode_context0_datagram, inspect_ip_packet,
+    };
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (udp_addr, udp_handle) = spawn_udp_echo().await;
+        let (mut driver, mut send_req, accept_task) = spawn_h3_masque_pair(MasqueServerConfig {
+            users: NoneOrSome::One(MasqueUserConfig {
+                username: "alice".into(),
+                password: "secret".into(),
+            }),
+            ip_enabled: true,
+            tunnel_addresses: vec!["10.40.0.1/24".parse().unwrap()],
+            stealth_404: false,
+            ..Default::default()
+        })
+        .await;
+
+        let mut dgram_reader = driver.get_datagram_reader();
+        let req = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h3::ext::Protocol::CONNECT_IP)
+            .uri("https://localhost/.well-known/masque/ip/*/*/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let mut stream = send_req.send_request(req).await.unwrap();
+        let stream_id = stream.id();
+        let mut dgram_sender = driver.get_datagram_sender(stream_id);
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let resp = stream.recv_response().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("capsule-protocol").unwrap(), "?1");
+
+        let (mut send_stream, mut recv_stream) = stream.split();
+        let mut decoder = CapsuleDecoder::new();
+        let mut read_capsule = async || loop {
+            if let Some(cap) = decoder.next_capsule().unwrap() {
+                return cap;
+            }
+            let mut chunk = recv_stream.recv_data().await.unwrap().unwrap();
+            while chunk.has_remaining() {
+                let bytes = chunk.chunk();
+                decoder.feed(bytes);
+                let len = bytes.len();
+                chunk.advance(len);
+            }
+        };
+
+        let assigned = match read_capsule().await {
+            Capsule::AddressAssign(addrs) => addrs,
+            other => panic!("expected AddressAssign, got {other:?}"),
+        };
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].request_id, 0);
+        assert_eq!(assigned[0].prefix_len, 32);
+        let client_ip = match assigned[0].ip {
+            IpAddr::V4(v4) => v4,
+            other => panic!("expected IPv4 assignment, got {other:?}"),
+        };
+        assert_eq!(client_ip, Ipv4Addr::new(10, 40, 0, 2));
+
+        let routes = match read_capsule().await {
+            Capsule::RouteAdvertisement(routes) => routes,
+            other => panic!("expected RouteAdvertisement, got {other:?}"),
+        };
+        assert!(!routes.is_empty());
+
+        // Exercise ADDRESS_REQUEST (v4 available + v6 unavailable -> ::/128)
+        let req_capsule = Capsule::AddressRequest(vec![
+            AssignedAddress {
+                request_id: 5,
+                ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                prefix_len: 32,
+            },
+            AssignedAddress {
+                request_id: 6,
+                ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                prefix_len: 128,
+            },
+        ]);
+        send_stream
+            .send_data(encode_capsule(&req_capsule))
+            .await
+            .unwrap();
+        let reply_assign = match read_capsule().await {
+            Capsule::AddressAssign(addrs) => addrs,
+            other => panic!("expected AddressAssign reply, got {other:?}"),
+        };
+        assert_eq!(
+            reply_assign,
+            vec![
+                AssignedAddress {
+                    request_id: 5,
+                    ip: IpAddr::V4(client_ip),
+                    prefix_len: 32,
+                },
+                AssignedAddress {
+                    request_id: 6,
+                    ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                    prefix_len: 128,
+                },
+            ]
+        );
+
+        let target_ip = match udp_addr.ip() {
+            IpAddr::V4(v4) => v4,
+            _ => panic!("expected ipv4 echo addr"),
+        };
+        let pkt = make_ipv4_udp_packet(
+            client_ip,
+            41001,
+            target_ip,
+            udp_addr.port(),
+            64,
+            b"hello h3 connect-ip",
+        );
+        dgram_sender
+            .send_datagram(encode_context0_datagram(&pkt))
+            .unwrap();
+
+        let reply = dgram_reader.read_datagram().await.unwrap();
+        assert_eq!(reply.stream_id(), stream_id);
+        let reply_pkt = decode_context0_datagram(reply.into_payload()).unwrap().unwrap();
+        let meta = inspect_ip_packet(&reply_pkt).unwrap();
+        assert_eq!(meta.src, IpAddr::V4(target_ip));
+        assert_eq!(meta.dst, IpAddr::V4(client_ip));
+        assert_eq!(meta.proto, 17);
+        let ihl = usize::from(reply_pkt[0] & 0x0f) * 4;
+        assert_eq!(&reply_pkt[ihl + 8..], b"hello h3 connect-ip");
+
+        send_stream.finish().await.unwrap();
+        drop(send_req);
+        let _ = driver_task.await;
+        accept_task.abort();
+        udp_handle.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn h2_connect_ip_handshake_and_tcp_roundtrip() {
+    use std::net::{IpAddr, Ipv4Addr};
+    use super::wire::{
+        AssignedAddress, Capsule, CapsuleDecoder, decode_context0_datagram, encode_capsule,
+        encode_context0_datagram, inspect_ip_packet,
+    };
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (echo_addr, echo_handle) = spawn_tcp_echo().await;
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let selector = direct_selector(&resolver);
+        let server_cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+
+        let protocol_json = serde_json::json!({
+            "type": "tls",
+            "default_target": {
+                "cert": server_cert.cert.pem(),
+                "key": server_cert.signing_key.serialize_pem(),
+                "protocol": {
+                    "type": "masque",
+                    "users": [{"username": "alice", "password": "secret"}],
+                    "ip_enabled": true,
+                    "tunnel_addresses": ["10.41.0.1/30"],
+                    "stealth_404": false
+                }
+            }
+        });
+        let protocol = crate::config::test_support::from_json(protocol_json).unwrap();
+        let handler = crate::tcp::tcp_server_handler_factory::create_tcp_server_handler(
+            protocol,
+            &selector,
+            &resolver,
+            None,
+        )
+        .unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let server_task = tokio::spawn(async move {
+            let crate::tcp::tcp_handler::TcpServerSetupResult::Session(session) =
+                handler.setup_server_stream(Box::new(server_io)).await.unwrap()
+            else {
+                panic!("expected Session");
+            };
+            session.await;
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(server_cert.cert.der().clone()).unwrap();
+        let client_tls_cfg = crate::rustls_config_util::with_test_roots(roots, || {
+            crate::rustls_config_util::try_create_client_config(
+                true,
+                vec![],
+                vec!["h2".to_string()],
+                true,
+                None,
+                false,
+                &Default::default(),
+            )
+            .unwrap()
+        });
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls_cfg));
+        let tls_client = connector
+            .connect("localhost".try_into().unwrap(), client_io)
+            .await
+            .unwrap();
+        assert_eq!(tls_client.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+
+        let (mut send_req, conn) = h2::client::handshake(tls_client).await.unwrap();
+        let driver = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .uri("https://localhost/.well-known/masque/ip/*/*/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let (resp_fut, mut send_stream) = send_req.send_request(req, false).unwrap();
+        let resp = resp_fut.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("capsule-protocol").unwrap(), "?1");
+
+        let mut recv_stream = resp.into_body();
+        let mut decoder = CapsuleDecoder::new();
+
+        async fn next_h2_capsule(
+            recv: &mut h2::RecvStream,
+            decoder: &mut CapsuleDecoder,
+        ) -> Capsule {
+            loop {
+                if let Some(cap) = decoder.next_capsule().unwrap() {
+                    return cap;
+                }
+                let chunk = recv.data().await.unwrap().unwrap();
+                decoder.feed(&chunk);
+                recv.flow_control().release_capacity(chunk.len()).unwrap();
+            }
+        }
+
+        let assigned = match next_h2_capsule(&mut recv_stream, &mut decoder).await {
+            Capsule::AddressAssign(addrs) => addrs,
+            other => panic!("expected AddressAssign, got {other:?}"),
+        };
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].request_id, 0);
+        let client_ip = match assigned[0].ip {
+            IpAddr::V4(v4) => v4,
+            other => panic!("expected ipv4, got {other:?}"),
+        };
+        assert_eq!(client_ip, Ipv4Addr::new(10, 41, 0, 2));
+
+        let routes = match next_h2_capsule(&mut recv_stream, &mut decoder).await {
+            Capsule::RouteAdvertisement(routes) => routes,
+            other => panic!("expected RouteAdvertisement, got {other:?}"),
+        };
+        assert!(!routes.is_empty());
+
+        // Verify ADDRESS_REQUEST roundtrip.
+        send_stream
+            .send_data(
+                encode_capsule(&Capsule::AddressRequest(vec![AssignedAddress {
+                    request_id: 7,
+                    ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    prefix_len: 32,
+                }])),
+                false,
+            )
+            .unwrap();
+        let reply_assign = match next_h2_capsule(&mut recv_stream, &mut decoder).await {
+            Capsule::AddressAssign(addrs) => addrs,
+            other => panic!("expected AddressAssign reply, got {other:?}"),
+        };
+        assert_eq!(
+            reply_assign,
+            vec![AssignedAddress {
+                request_id: 7,
+                ip: IpAddr::V4(client_ip),
+                prefix_len: 32,
+            }]
+        );
+
+        // Run a real TCP 3-way handshake + payload echo over Capsule::Datagram.
+        let target_ip = match echo_addr.ip() {
+            IpAddr::V4(v4) => v4,
+            _ => panic!("expected ipv4 echo addr"),
+        };
+        let client_port = 42001u16;
+        let client_isn = 0x1000_0000u32;
+
+        let syn = make_ipv4_tcp_packet(
+            client_ip,
+            client_port,
+            target_ip,
+            echo_addr.port(),
+            client_isn,
+            0,
+            0x02, // SYN
+            &[],
+        );
+        send_stream
+            .send_data(
+                encode_capsule(&Capsule::Datagram(encode_context0_datagram(&syn))),
+                false,
+            )
+            .unwrap();
+
+        let syn_ack = loop {
+            if let Capsule::Datagram(payload) = next_h2_capsule(&mut recv_stream, &mut decoder).await
+            {
+                if let Some(pkt) = decode_context0_datagram(payload).unwrap() {
+                    let meta = inspect_ip_packet(&pkt).unwrap();
+                    if meta.proto == 6 && (pkt[33] & 0x12) == 0x12 {
+                        break pkt;
+                    }
+                }
+            }
+        };
+        let server_isn = u32::from_be_bytes(syn_ack[24..28].try_into().unwrap());
+        let server_ack = u32::from_be_bytes(syn_ack[28..32].try_into().unwrap());
+        assert_eq!(server_ack, client_isn + 1);
+
+        // Send ACK + data payload.
+        let msg = b"hello h2 connect-ip tcp";
+        let ack_data = make_ipv4_tcp_packet(
+            client_ip,
+            client_port,
+            target_ip,
+            echo_addr.port(),
+            client_isn + 1,
+            server_isn + 1,
+            0x18, // PSH | ACK
+            msg,
+        );
+        send_stream
+            .send_data(
+                encode_capsule(&Capsule::Datagram(encode_context0_datagram(&ack_data))),
+                false,
+            )
+            .unwrap();
+
+        let mut echoed = Vec::new();
+        while echoed.len() < msg.len() {
+            if let Capsule::Datagram(payload) = next_h2_capsule(&mut recv_stream, &mut decoder).await
+            {
+                if let Some(pkt) = decode_context0_datagram(payload).unwrap() {
+                    let meta = inspect_ip_packet(&pkt).unwrap();
+                    if meta.proto == 6 {
+                        let ihl = usize::from(pkt[0] & 0x0f) * 4;
+                        let tcp_hdr_len = usize::from(pkt[ihl + 12] >> 4) * 4;
+                        let total_len = usize::from(u16::from_be_bytes([pkt[2], pkt[3]]));
+                        let data = &pkt[ihl + tcp_hdr_len..total_len];
+                        echoed.extend_from_slice(data);
+                    }
+                }
+            }
+        }
+        assert_eq!(echoed, msg);
+
+        // Close first stream and verify IP lease is reclaimed back to the /30 pool.
+        send_stream.send_data(Bytes::new(), true).unwrap();
+        while let Some(chunk) = recv_stream.data().await {
+            if chunk.unwrap().is_empty() {
+                break;
+            }
+        }
+        drop(recv_stream);
+        drop(send_stream);
+
+        let req2 = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .uri("https://localhost/.well-known/masque/ip/*/*/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let (resp_fut2, mut send_stream2) = send_req.send_request(req2, false).unwrap();
+        let resp2 = resp_fut2.await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let mut recv_stream2 = resp2.into_body();
+        let mut decoder2 = CapsuleDecoder::new();
+        let assigned2 = match next_h2_capsule(&mut recv_stream2, &mut decoder2).await {
+            Capsule::AddressAssign(addrs) => addrs,
+            other => panic!("expected AddressAssign on 2nd session, got {other:?}"),
+        };
+        assert_eq!(assigned2[0].ip, IpAddr::V4(Ipv4Addr::new(10, 41, 0, 2)));
+
+        send_stream2.send_data(Bytes::new(), true).unwrap();
+        drop(recv_stream2);
+        drop(send_stream2);
+        drop(send_req);
+        let _ = driver.await;
+        server_task.abort();
+        echo_handle.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn connect_ip_rejects_disabled_exhausted_and_unroutable_targets() {
+    #[derive(Debug)]
+    struct TestDnsResolver;
+
+    impl Resolver for TestDnsResolver {
+        fn resolve_location(
+            &self,
+            location: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            let host = location.address().hostname().map(str::to_owned);
+            let port = location.port();
+            Box::pin(async move {
+                match host.as_deref() {
+                    Some("routable.test") => Ok(vec![SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 42)),
+                        port,
+                    )]),
+                    Some("unroutable.test") => Ok(vec![SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 42)),
+                        port,
+                    )]),
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "nxdomain",
+                    )),
+                }
+            })
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let resolver: Arc<dyn Resolver> = Arc::new(TestDnsResolver);
+        let selector = direct_selector(&resolver);
+        let peer: SocketAddr = "127.0.0.1:44451".parse().unwrap();
+
+        // 1. ip_enabled = false with stealth_404 = false -> 403 on H3
+        let (mut driver, mut send_req, accept_task) = spawn_h3_masque_pair(MasqueServerConfig {
+            users: NoneOrSome::One(MasqueUserConfig {
+                username: "alice".into(),
+                password: "secret".into(),
+            }),
+            ip_enabled: false,
+            stealth_404: false,
+            ..Default::default()
+        })
+        .await;
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let req = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h3::ext::Protocol::CONNECT_IP)
+            .uri("https://localhost/.well-known/masque/ip/*/*/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let mut stream = send_req.send_request(req).await.unwrap();
+        stream.finish().await.unwrap();
+        assert_eq!(
+            stream.recv_response().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        drop(send_req);
+        let _ = driver_task.await;
+        accept_task.abort();
+
+        // 2. ip_enabled = false with stealth_404 = true -> 404 on H2
+        let masque_disabled = Arc::new(
+            MasqueServer::new(
+                MasqueServerConfig {
+                    users: NoneOrSome::One(MasqueUserConfig {
+                        username: "alice".into(),
+                        password: "secret".into(),
+                    }),
+                    ip_enabled: false,
+                    stealth_404: true,
+                    ..Default::default()
+                },
+                selector.clone(),
+                resolver.clone(),
+            )
+            .unwrap(),
+        );
+        let (client_io, server_io) = tokio::io::duplex(16384);
+        let server_task = tokio::spawn(async move {
+            let _ = masque_disabled.serve_h2_stream(server_io, peer, false).await;
+        });
+        let (mut send_req, conn) = h2::client::handshake(client_io).await.unwrap();
+        let h2_driver = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .uri("https://localhost/.well-known/masque/ip/*/*/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let (resp_fut, _) = send_req.send_request(req, true).unwrap();
+        assert_eq!(resp_fut.await.unwrap().status(), StatusCode::NOT_FOUND);
+        drop(send_req);
+        let _ = h2_driver.await;
+        server_task.abort();
+
+        // 3. Enabled server with /30 pool (1 client IP) and restricted advertise_routes
+        let masque = Arc::new(
+            MasqueServer::new(
+                MasqueServerConfig {
+                    users: NoneOrSome::One(MasqueUserConfig {
+                        username: "alice".into(),
+                        password: "secret".into(),
+                    }),
+                    ip_enabled: true,
+                    tunnel_addresses: vec!["10.42.0.1/30".parse().unwrap()],
+                    advertise_routes: vec!["198.51.100.0/24".parse().unwrap()],
+                    stealth_404: false,
+                    ..Default::default()
+                },
+                selector,
+                resolver,
+            )
+            .unwrap(),
+        );
+        let (client_io, server_io) = tokio::io::duplex(32768);
+        let server_task = tokio::spawn(async move {
+            let _ = masque.serve_h2_stream(server_io, peer, false).await;
+        });
+        let (mut send_req, conn) = h2::client::handshake(client_io).await.unwrap();
+        let h2_driver = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        // 3a. Dual Authorization + Proxy-Authorization rejected -> 407
+        let dual_auth_req = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .uri("https://localhost/.well-known/masque/ip/*/*/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .header(header::PROXY_AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let (resp_fut, _) = send_req.send_request(dual_auth_req, true).unwrap();
+        assert_eq!(
+            resp_fut.await.unwrap().status(),
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        );
+
+        // 3b. Unroutable target CIDR and unroutable resolved hostname -> 403
+        let unroutable_req = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .uri("https://localhost/.well-known/masque/ip/192.0.2.0%2F24/*/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let (resp_fut, _) = send_req.send_request(unroutable_req, true).unwrap();
+        assert_eq!(resp_fut.await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        let unroutable_host_req = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .uri("https://localhost/.well-known/masque/ip/unroutable.test/17/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let (resp_fut, _) = send_req.send_request(unroutable_host_req, true).unwrap();
+        assert_eq!(resp_fut.await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        // 3c. Non-matching path -> 404; invalid ipproto -> 400
+        let wrong_path_req = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .uri("https://localhost/not-masque/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let (resp_fut, _) = send_req.send_request(wrong_path_req, true).unwrap();
+        assert_eq!(resp_fut.await.unwrap().status(), StatusCode::NOT_FOUND);
+
+        let bad_proto_req = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .uri("https://localhost/.well-known/masque/ip/*/999/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let (resp_fut, _) = send_req.send_request(bad_proto_req, true).unwrap();
+        assert_eq!(resp_fut.await.unwrap().status(), StatusCode::BAD_REQUEST);
+
+        // 3d. DNS resolution failure -> 502 with Proxy-Status: shoes; error=dns_error
+        let bad_dns_req = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .uri("https://localhost/.well-known/masque/ip/nonexistent.invalid/17/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let (resp_fut, _) = send_req.send_request(bad_dns_req, true).unwrap();
+        let bad_dns_resp = resp_fut.await.unwrap();
+        assert_eq!(bad_dns_resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            bad_dns_resp.headers().get("proxy-status").unwrap(),
+            "shoes; error=dns_error"
+        );
+        drop(bad_dns_resp);
+
+        // 3e. Hold 1 active session (resolved hostname) on /30 pool, then 2nd session -> 503 Service Unavailable
+        let req_ok = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .uri("https://localhost/.well-known/masque/ip/routable.test/17/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let (resp_ok_fut, mut hold_send) = send_req.send_request(req_ok, false).unwrap();
+        let resp_ok = resp_ok_fut.await.unwrap();
+        assert_eq!(resp_ok.status(), StatusCode::OK);
+
+        let req_exhausted = Request::builder()
+            .method(Method::CONNECT)
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .uri("https://localhost/.well-known/masque/ip/*/*/")
+            .header(header::AUTHORIZATION, basic_header("alice", "secret"))
+            .body(())
+            .unwrap();
+        let (resp_exhausted_fut, _) = send_req.send_request(req_exhausted, true).unwrap();
+        assert_eq!(
+            resp_exhausted_fut.await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        hold_send.send_data(Bytes::new(), true).unwrap();
+        let mut hold_recv = resp_ok.into_body();
+        while let Some(chunk) = hold_recv.data().await {
+            let bytes = chunk.unwrap();
+            hold_recv
+                .flow_control()
+                .release_capacity(bytes.len())
+                .unwrap();
+        }
+        drop(hold_recv);
+        drop(hold_send);
+        drop(send_req);
+        let _ = h2_driver.await;
+        server_task.abort();
+    })
+    .await
+    .unwrap();
+}

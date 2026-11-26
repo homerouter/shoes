@@ -136,6 +136,7 @@ impl CapsuleDecoder {
     }
 
     /// Number of unparsed bytes currently buffered.
+    #[cfg(test)]
     pub fn buffered(&self) -> usize {
         self.buf.len()
     }

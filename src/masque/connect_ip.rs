@@ -1,34 +1,46 @@
 use std::fmt;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use http::{Request, Response, StatusCode};
+use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
-use crate::address::NetLocation;
+use crate::address::{Address, NetLocation};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::MasqueServerConfig;
 use crate::config::tun::TunResourceLimits;
 use crate::ip_stack::driver::PacketStack;
 use crate::ip_stack::packet::PacketBuffer;
 use crate::ip_stack::wake::Wake;
-use crate::masque::ip_pool::{
-    AddressPool, IpSessionRegistry, networks_to_address_ranges, routes_contain,
-};
+use crate::masque::h3_server::H3DatagramHub;
+use crate::masque::ip_pool::{AddressPool, IpSessionRegistry, routes_contain};
+#[cfg(test)]
+use crate::masque::ip_pool::networks_to_address_ranges;
 use crate::masque::wire::{
-    AddressRange, IcmpErrorKind, build_icmp_error, decrement_hop_limit, inspect_ip_packet,
+    AddressRange, AssignedAddress, Capsule, CapsuleDecoder, IcmpErrorKind, build_icmp_error,
+    decode_context0_datagram, decrement_hop_limit, encode_capsule, encode_context0_datagram,
+    inspect_ip_packet,
+};
+use crate::masque::{
+    MasqueConnCtx, capsule_ok_response, feed_capsule_buf, feed_h2_capsule_chunk, send_h2_data,
+    send_h3_datagram_or_capsule, status_response,
 };
 use crate::resolver::Resolver;
 use crate::tun::udp_handler::UdpHandler;
 use crate::tun::udp_manager::TunUdpManager;
 
 const SESSION_OUTBOUND_QUEUE: usize = 256;
+const IP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn is_link_local_or_multicast(addr: IpAddr) -> bool {
     match addr {
@@ -53,6 +65,7 @@ pub struct MasqueIpSessionLease {
 }
 
 impl MasqueIpSessionLease {
+    #[cfg(test)]
     pub fn session_id(&self) -> u64 {
         self.id
     }
@@ -71,10 +84,12 @@ impl MasqueIpSessionLease {
         *guard = routes;
     }
 
+    #[cfg(test)]
     pub fn peer_routes(&self) -> Vec<AddressRange> {
         self.peer_routes.read().clone()
     }
 
+    #[cfg(test)]
     pub fn tx(&self) -> &mpsc::Sender<Bytes> {
         &self.tx
     }
@@ -83,15 +98,9 @@ impl MasqueIpSessionLease {
         self.rx.take()
     }
 
+    #[cfg(test)]
     pub async fn recv(&mut self) -> Option<Bytes> {
         self.rx.as_mut()?.recv().await
-    }
-
-    pub fn try_recv(&mut self) -> Result<Bytes, mpsc::error::TryRecvError> {
-        match self.rx.as_mut() {
-            Some(rx) => rx.try_recv(),
-            None => Err(mpsc::error::TryRecvError::Disconnected),
-        }
     }
 }
 
@@ -106,6 +115,7 @@ impl Drop for MasqueIpSessionLease {
 pub struct MasqueIpEngine {
     pool: Arc<AddressPool>,
     registry: Arc<IpSessionRegistry>,
+    #[cfg(test)]
     default_advertised_routes: Vec<AddressRange>,
     mtu: u16,
     next_session_id: AtomicU64,
@@ -139,6 +149,7 @@ impl MasqueIpEngine {
     ) -> io::Result<Arc<Self>> {
         let pool = Arc::new(AddressPool::new(&config.tunnel_addresses)?);
         let registry = Arc::new(IpSessionRegistry::new());
+        #[cfg(test)]
         let default_advertised_routes =
             networks_to_address_ranges(&config.effective_advertise_routes());
         let limits = TunResourceLimits::default();
@@ -246,6 +257,7 @@ impl MasqueIpEngine {
         Ok(Arc::new(Self {
             pool,
             registry,
+            #[cfg(test)]
             default_advertised_routes,
             mtu: config.mtu,
             next_session_id: AtomicU64::new(1),
@@ -260,14 +272,17 @@ impl MasqueIpEngine {
         &self.pool
     }
 
+    #[cfg(test)]
     pub fn registry(&self) -> &Arc<IpSessionRegistry> {
         &self.registry
     }
 
+    #[cfg(test)]
     pub fn default_advertised_routes(&self) -> &[AddressRange] {
         &self.default_advertised_routes
     }
 
+    #[cfg(test)]
     pub fn mtu(&self) -> u16 {
         self.mtu
     }
@@ -375,6 +390,486 @@ impl MasqueIpEngine {
                 self.wake.notify();
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+}
+
+enum ConnectIpPrep {
+    Ready {
+        engine: Arc<MasqueIpEngine>,
+        lease: MasqueIpSessionLease,
+    },
+    Reject(Response<()>),
+}
+
+fn dns_error_response() -> Response<()> {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header("proxy-status", "shoes; error=dns_error")
+        .body(())
+        .expect("valid dns error response")
+}
+
+fn v4_interval(net: Ipv4Network) -> (u32, u32) {
+    (u32::from(net.network()), u32::from(net.broadcast()))
+}
+
+fn v6_interval(net: Ipv6Network) -> (u128, u128) {
+    let start = u128::from(net.network());
+    let host_mask = if net.prefix() == 0 {
+        u128::MAX
+    } else {
+        u128::MAX >> net.prefix()
+    };
+    (start, start | host_mask)
+}
+
+fn coalesce_u32_intervals(mut intervals: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    if intervals.is_empty() {
+        return intervals;
+    }
+    intervals.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1.saturating_add(1)
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn coalesce_u128_intervals(mut intervals: Vec<(u128, u128)>) -> Vec<(u128, u128)> {
+    if intervals.is_empty() {
+        return intervals;
+    }
+    intervals.sort_unstable();
+    let mut merged: Vec<(u128, u128)> = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1.saturating_add(1)
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn compute_advertised_routes(
+    base: &[IpNetwork],
+    target: Option<&[IpNetwork]>,
+    ip_protocol: u8,
+) -> Vec<AddressRange> {
+    let mut base_v4 = Vec::new();
+    let mut base_v6 = Vec::new();
+    for &net in base {
+        match net {
+            IpNetwork::V4(v4) => base_v4.push(v4_interval(v4)),
+            IpNetwork::V6(v6) => base_v6.push(v6_interval(v6)),
+        }
+    }
+
+    let (v4_intervals, v6_intervals) = match target {
+        None => (
+            coalesce_u32_intervals(base_v4),
+            coalesce_u128_intervals(base_v6),
+        ),
+        Some(target_nets) => {
+            let mut iv4 = Vec::new();
+            let mut iv6 = Vec::new();
+            for &tnet in target_nets {
+                match tnet {
+                    IpNetwork::V4(tv4) => {
+                        let (ts, te) = v4_interval(tv4);
+                        for &(bs, be) in &base_v4 {
+                            let s = bs.max(ts);
+                            let e = be.min(te);
+                            if s <= e {
+                                iv4.push((s, e));
+                            }
+                        }
+                    }
+                    IpNetwork::V6(tv6) => {
+                        let (ts, te) = v6_interval(tv6);
+                        for &(bs, be) in &base_v6 {
+                            let s = bs.max(ts);
+                            let e = be.min(te);
+                            if s <= e {
+                                iv6.push((s, e));
+                            }
+                        }
+                    }
+                }
+            }
+            (coalesce_u32_intervals(iv4), coalesce_u128_intervals(iv6))
+        }
+    };
+
+    let mut out = Vec::with_capacity(v4_intervals.len() + v6_intervals.len());
+    for (start, end) in v4_intervals {
+        out.push(AddressRange {
+            start: IpAddr::V4(Ipv4Addr::from(start)),
+            end: IpAddr::V4(Ipv4Addr::from(end)),
+            ip_protocol,
+        });
+    }
+    for (start, end) in v6_intervals {
+        out.push(AddressRange {
+            start: IpAddr::V6(Ipv6Addr::from(start)),
+            end: IpAddr::V6(Ipv6Addr::from(end)),
+            ip_protocol,
+        });
+    }
+    out
+}
+
+async fn prepare_connect_ip(ctx: &MasqueConnCtx, request: &Request<()>) -> ConnectIpPrep {
+    let Some(engine) = ctx
+        .ip_engine
+        .as_ref()
+        .filter(|_| ctx.config.ip_enabled)
+        .cloned()
+    else {
+        let status = if ctx.config.stealth_404 {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        return ConnectIpPrep::Reject(status_response(status));
+    };
+
+    let raw_path = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path(), |pq| pq.as_str());
+    let parsed = match ctx.ip_template.match_path(raw_path) {
+        Ok(Some(target)) => target,
+        Ok(None) => return ConnectIpPrep::Reject(status_response(StatusCode::NOT_FOUND)),
+        Err(_) => return ConnectIpPrep::Reject(status_response(StatusCode::BAD_REQUEST)),
+    };
+
+    let has_v4 = engine.pool().server_v4().is_some();
+    let has_v6 = engine.pool().server_v6().is_some();
+    let base_networks: Vec<IpNetwork> = ctx
+        .config
+        .effective_advertise_routes()
+        .into_iter()
+        .filter(|net| match net {
+            IpNetwork::V4(_) => has_v4,
+            IpNetwork::V6(_) => has_v6,
+        })
+        .collect();
+
+    let target_networks = match parsed.target {
+        None => None,
+        Some(target_str) => {
+            if let Ok(ip) = target_str.parse::<IpAddr>() {
+                Some(vec![IpNetwork::from(ip.to_canonical())])
+            } else if let Ok(net) = target_str.parse::<IpNetwork>() {
+                Some(vec![net])
+            } else {
+                let loc = NetLocation::new(Address::Hostname(target_str), 0);
+                match crate::util::timeout_stream_setup(ctx.resolver.resolve_location(&loc)).await {
+                    Ok(addrs) if !addrs.is_empty() => Some(
+                        addrs
+                            .into_iter()
+                            .map(|sa| IpNetwork::from(sa.ip().to_canonical()))
+                            .collect(),
+                    ),
+                    _ => return ConnectIpPrep::Reject(dns_error_response()),
+                }
+            }
+        }
+    };
+
+    let ip_protocol = parsed.ipproto.unwrap_or(0);
+    let advertised_routes =
+        compute_advertised_routes(&base_networks, target_networks.as_deref(), ip_protocol);
+    if advertised_routes.is_empty() {
+        return ConnectIpPrep::Reject(status_response(StatusCode::FORBIDDEN));
+    }
+
+    match engine.open_session(advertised_routes) {
+        Ok(lease) => ConnectIpPrep::Ready { engine, lease },
+        Err(_) => ConnectIpPrep::Reject(status_response(StatusCode::SERVICE_UNAVAILABLE)),
+    }
+}
+
+fn initial_assigned_addresses(lease: &MasqueIpSessionLease) -> Vec<AssignedAddress> {
+    lease
+        .assigned_ips()
+        .iter()
+        .map(|&ip| AssignedAddress {
+            request_id: 0,
+            ip,
+            prefix_len: match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            },
+        })
+        .collect()
+}
+
+fn initial_capsules_bytes(lease: &MasqueIpSessionLease) -> Bytes {
+    let assign = encode_capsule(&Capsule::AddressAssign(initial_assigned_addresses(lease)));
+    let routes = encode_capsule(&Capsule::RouteAdvertisement(
+        lease.advertised_routes().to_vec(),
+    ));
+    let mut out = BytesMut::with_capacity(assign.len() + routes.len());
+    out.extend_from_slice(&assign);
+    out.extend_from_slice(&routes);
+    out.freeze()
+}
+
+fn answer_address_request(
+    lease: &MasqueIpSessionLease,
+    reqs: &[AssignedAddress],
+) -> Vec<AssignedAddress> {
+    let assigned_v4 = lease.assigned_ips().iter().find_map(|ip| match ip {
+        IpAddr::V4(v4) => Some(*v4),
+        IpAddr::V6(_) => None,
+    });
+    let assigned_v6 = lease.assigned_ips().iter().find_map(|ip| match ip {
+        IpAddr::V6(v6) => Some(*v6),
+        IpAddr::V4(_) => None,
+    });
+    let mut used_v4 = false;
+    let mut used_v6 = false;
+    let mut out = Vec::with_capacity(reqs.len() + 2);
+
+    for req in reqs {
+        match req.ip {
+            IpAddr::V4(_) => {
+                let ip = if !used_v4 && let Some(v4) = assigned_v4 {
+                    used_v4 = true;
+                    v4
+                } else {
+                    Ipv4Addr::UNSPECIFIED
+                };
+                out.push(AssignedAddress {
+                    request_id: req.request_id,
+                    ip: IpAddr::V4(ip),
+                    prefix_len: 32,
+                });
+            }
+            IpAddr::V6(_) => {
+                let ip = if !used_v6 && let Some(v6) = assigned_v6 {
+                    used_v6 = true;
+                    v6
+                } else {
+                    Ipv6Addr::UNSPECIFIED
+                };
+                out.push(AssignedAddress {
+                    request_id: req.request_id,
+                    ip: IpAddr::V6(ip),
+                    prefix_len: 128,
+                });
+            }
+        }
+    }
+
+    if !used_v4 && let Some(v4) = assigned_v4 {
+        out.push(AssignedAddress {
+            request_id: 0,
+            ip: IpAddr::V4(v4),
+            prefix_len: 32,
+        });
+    }
+    if !used_v6 && let Some(v6) = assigned_v6 {
+        out.push(AssignedAddress {
+            request_id: 0,
+            ip: IpAddr::V6(v6),
+            prefix_len: 128,
+        });
+    }
+    out
+}
+
+async fn drain_ip_capsules(
+    decoder: &mut CapsuleDecoder,
+    engine: &MasqueIpEngine,
+    lease: &MasqueIpSessionLease,
+) -> io::Result<Option<Bytes>> {
+    let mut replies = BytesMut::new();
+    while let Some(capsule) = decoder.next_capsule()? {
+        match capsule {
+            Capsule::Datagram(payload) => {
+                if let Some(pkt) = decode_context0_datagram(payload)? {
+                    engine.handle_inbound_packet(lease, &pkt).await;
+                }
+            }
+            Capsule::AddressRequest(reqs) => {
+                let assign = encode_capsule(&Capsule::AddressAssign(answer_address_request(
+                    lease, &reqs,
+                )));
+                replies.extend_from_slice(&assign);
+            }
+            Capsule::RouteAdvertisement(routes) => {
+                lease.set_peer_routes(routes);
+            }
+            Capsule::AddressAssign(_) | Capsule::Unknown { .. } => {}
+        }
+    }
+    Ok((!replies.is_empty()).then(|| replies.freeze()))
+}
+
+pub(crate) async fn handle_connect_ip_h3(
+    ctx: MasqueConnCtx,
+    request: Request<()>,
+    mut stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    hub: H3DatagramHub,
+) -> io::Result<()> {
+    let (engine, mut lease) = match prepare_connect_ip(&ctx, &request).await {
+        ConnectIpPrep::Ready { engine, lease } => (engine, lease),
+        ConnectIpPrep::Reject(resp) => {
+            stream
+                .send_response(resp)
+                .await
+                .map_err(io::Error::other)?;
+            return stream.finish().await.map_err(io::Error::other);
+        }
+    };
+
+    let stream_id = stream.id();
+    let (_rx_guard, mut dgram_rx) = hub.register(stream_id);
+    let mut dgram_sender = hub.acquire_sender(stream_id).await?;
+
+    stream
+        .send_response(capsule_ok_response())
+        .await
+        .map_err(io::Error::other)?;
+
+    let (mut send_stream, mut recv_stream) = stream.split();
+    send_stream
+        .send_data(initial_capsules_bytes(&lease))
+        .await
+        .map_err(io::Error::other)?;
+
+    let mut outbound_rx = lease
+        .take_receiver()
+        .expect("fresh CONNECT-IP lease must have outbound receiver");
+    let mut decoder = CapsuleDecoder::new();
+    let mut datagrams_unavailable = false;
+    let idle_sleep = tokio::time::sleep(IP_IDLE_TIMEOUT);
+    tokio::pin!(idle_sleep);
+
+    loop {
+        tokio::select! {
+            () = &mut idle_sleep => {
+                let _ = send_stream.finish().await;
+                return Ok(());
+            }
+            maybe_dgram = dgram_rx.recv() => {
+                let Some(pkt) = maybe_dgram else {
+                    let _ = send_stream.finish().await;
+                    return Ok(());
+                };
+                idle_sleep.as_mut().reset(Instant::now() + IP_IDLE_TIMEOUT);
+                engine.handle_inbound_packet(&lease, &pkt).await;
+            }
+            recv_res = recv_stream.recv_data() => {
+                match recv_res {
+                    Ok(Some(mut chunk)) => {
+                        idle_sleep.as_mut().reset(Instant::now() + IP_IDLE_TIMEOUT);
+                        feed_capsule_buf(&mut decoder, &mut chunk);
+                        if let Some(reply_bytes) = drain_ip_capsules(&mut decoder, &engine, &lease).await? {
+                            send_stream
+                                .send_data(reply_bytes)
+                                .await
+                                .map_err(io::Error::other)?;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = send_stream.finish().await;
+                        return Ok(());
+                    }
+                    Err(err) => return Err(io::Error::other(err)),
+                }
+            }
+            maybe_outbound = outbound_rx.recv() => {
+                let Some(pkt) = maybe_outbound else {
+                    let _ = send_stream.finish().await;
+                    return Ok(());
+                };
+                idle_sleep.as_mut().reset(Instant::now() + IP_IDLE_TIMEOUT);
+                let encoded = encode_context0_datagram(&pkt);
+                send_h3_datagram_or_capsule(
+                    &mut dgram_sender,
+                    &mut send_stream,
+                    &mut datagrams_unavailable,
+                    encoded,
+                    true,
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+pub(crate) async fn handle_connect_ip_h2(
+    ctx: MasqueConnCtx,
+    request: Request<()>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    mut recv: h2::RecvStream,
+) -> io::Result<()> {
+    let (engine, mut lease) = match prepare_connect_ip(&ctx, &request).await {
+        ConnectIpPrep::Ready { engine, lease } => (engine, lease),
+        ConnectIpPrep::Reject(resp) => {
+            return respond
+                .send_response(resp, true)
+                .map(|_| ())
+                .map_err(io::Error::other);
+        }
+    };
+
+    let mut send = respond
+        .send_response(capsule_ok_response(), false)
+        .map_err(io::Error::other)?;
+    send_h2_data(&mut send, initial_capsules_bytes(&lease)).await?;
+
+    let mut outbound_rx = lease
+        .take_receiver()
+        .expect("fresh CONNECT-IP lease must have outbound receiver");
+    let mut decoder = CapsuleDecoder::new();
+    let idle_sleep = tokio::time::sleep(IP_IDLE_TIMEOUT);
+    tokio::pin!(idle_sleep);
+
+    loop {
+        tokio::select! {
+            () = &mut idle_sleep => {
+                let _ = send.send_data(Bytes::new(), true);
+                return Ok(());
+            }
+            chunk_opt = recv.data() => {
+                match chunk_opt {
+                    Some(Ok(chunk)) => {
+                        idle_sleep.as_mut().reset(Instant::now() + IP_IDLE_TIMEOUT);
+                        feed_h2_capsule_chunk(&mut recv, &mut decoder, &chunk)?;
+                        if let Some(reply_bytes) = drain_ip_capsules(&mut decoder, &engine, &lease).await? {
+                            send_h2_data(&mut send, reply_bytes).await?;
+                        }
+                    }
+                    Some(Err(err)) => return Err(io::Error::other(err)),
+                    None => {
+                        let _ = send.send_data(Bytes::new(), true);
+                        return Ok(());
+                    }
+                }
+            }
+            maybe_outbound = outbound_rx.recv() => {
+                let Some(pkt) = maybe_outbound else {
+                    let _ = send.send_data(Bytes::new(), true);
+                    return Ok(());
+                };
+                idle_sleep.as_mut().reset(Instant::now() + IP_IDLE_TIMEOUT);
+                let frame = encode_capsule(&Capsule::Datagram(encode_context0_datagram(&pkt)));
+                send_h2_data(&mut send, frame).await?;
+            }
         }
     }
 }

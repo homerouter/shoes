@@ -7,7 +7,7 @@ use http::{Method, Request, Response, StatusCode};
 use crate::async_stream::AsyncStream;
 use crate::resources;
 
-use super::{MasqueConnCtx, MasqueServer, connect, connect_udp};
+use super::{MasqueConnCtx, MasqueServer, connect, connect_ip, connect_udp};
 
 pub(crate) async fn serve_h2_stream<IO: AsyncStream + 'static>(
     server: &MasqueServer,
@@ -109,12 +109,7 @@ async fn dispatch_h2_request(
             {
                 return send_empty_response(&mut respond, rejection.into_response());
             }
-            let status = if ctx.config.stealth_404 {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::NOT_IMPLEMENTED
-            };
-            send_empty_response(&mut respond, Response::builder().status(status).body(()).unwrap())
+            connect_ip::handle_connect_ip_h2(ctx, request, respond, recv).await
         }
         Some(_) => send_empty_response(
             &mut respond,

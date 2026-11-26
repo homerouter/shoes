@@ -247,6 +247,7 @@ impl AddressPool {
         })
     }
 
+    #[cfg(test)]
     pub fn prefixes(&self) -> &[IpNetwork] {
         &self.prefixes
     }
@@ -331,9 +332,11 @@ impl AddressPool {
 }
 
 /// Ordered set of RFC 9484 `AddressRange` route entries.
+#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IpRangeSet(Vec<AddressRange>);
 
+#[cfg(test)]
 impl IpRangeSet {
     pub fn new(ranges: Vec<AddressRange>) -> Self {
         Self(ranges)
@@ -369,6 +372,7 @@ pub fn routes_contain(routes: &[AddressRange], addr: IpAddr, proto: u8) -> bool 
     })
 }
 
+#[cfg(test)]
 pub fn networks_to_address_ranges(networks: &[IpNetwork]) -> Vec<AddressRange> {
     networks
         .iter()

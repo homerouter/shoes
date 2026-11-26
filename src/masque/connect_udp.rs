@@ -1,21 +1,22 @@
 use std::io;
 use std::time::Duration;
 
-use bytes::{Buf, Bytes};
-use h3_datagram::datagram_handler::SendDatagramError;
-use http::{Request, Response, StatusCode};
+use bytes::Bytes;
+use http::{Request, StatusCode};
 use tokio::time::Instant;
 
 use crate::address::{Address, NetLocation};
 use crate::routing::udp_relay::UdpRelay;
 
-use super::MasqueConnCtx;
 use super::h3_server::H3DatagramHub;
 use super::wire::{
     Capsule, CapsuleDecoder, decode_context0_datagram, encode_capsule, encode_context0_datagram,
 };
+use super::{
+    MasqueConnCtx, capsule_ok_response, feed_capsule_buf, feed_h2_capsule_chunk, send_h2_data,
+    send_h3_datagram_or_capsule, status_response,
+};
 
-const CAPSULE_PROTOCOL_HEADER: &str = "capsule-protocol";
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 enum ConnectUdpPrep {
@@ -57,21 +58,6 @@ fn prepare_connect_udp(ctx: &MasqueConnCtx, request: &Request<()>) -> ConnectUdp
     }
 }
 
-fn ok_response() -> Response<()> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CAPSULE_PROTOCOL_HEADER, "?1")
-        .body(())
-        .expect("valid CONNECT-UDP response")
-}
-
-fn status_response(status: StatusCode) -> Response<()> {
-    Response::builder()
-        .status(status)
-        .body(())
-        .expect("valid status response")
-}
-
 fn forward_udp_payload(relay: &UdpRelay, payload: Bytes, target: &NetLocation) -> bool {
     match relay.send_to(payload, target.clone()) {
         Ok(()) => true,
@@ -101,27 +87,6 @@ fn drain_capsules(
     Ok(true)
 }
 
-async fn send_h2_data(send: &mut h2::SendStream<Bytes>, mut data: Bytes) -> io::Result<()> {
-    while !data.is_empty() {
-        send.reserve_capacity(data.len());
-        let cap = loop {
-            let current = send.capacity();
-            if current > 0 {
-                break current;
-            }
-            match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
-                Some(Ok(_)) => continue,
-                Some(Err(err)) => return Err(io::Error::other(err)),
-                None => return Err(io::ErrorKind::BrokenPipe.into()),
-            }
-        };
-        let n = cap.min(data.len());
-        send.send_data(data.split_to(n), false)
-            .map_err(io::Error::other)?;
-    }
-    Ok(())
-}
-
 pub(crate) async fn handle_connect_udp_h3(
     ctx: MasqueConnCtx,
     request: Request<()>,
@@ -144,7 +109,7 @@ pub(crate) async fn handle_connect_udp_h3(
     let mut dgram_sender = hub.acquire_sender(stream_id).await?;
 
     stream
-        .send_response(ok_response())
+        .send_response(capsule_ok_response())
         .await
         .map_err(io::Error::other)?;
 
@@ -175,12 +140,7 @@ pub(crate) async fn handle_connect_udp_h3(
                 match recv_res {
                     Ok(Some(mut chunk)) => {
                         idle_sleep.as_mut().reset(Instant::now() + UDP_IDLE_TIMEOUT);
-                        while chunk.has_remaining() {
-                            let bytes = chunk.chunk();
-                            decoder.feed(bytes);
-                            let len = bytes.len();
-                            chunk.advance(len);
-                        }
+                        feed_capsule_buf(&mut decoder, &mut chunk);
                         if !drain_capsules(&mut decoder, &relay, &target)? {
                             let _ = send_stream.finish().await;
                             return Ok(());
@@ -200,32 +160,14 @@ pub(crate) async fn handle_connect_udp_h3(
                 };
                 idle_sleep.as_mut().reset(Instant::now() + UDP_IDLE_TIMEOUT);
                 let encoded = encode_context0_datagram(&data);
-                if !datagrams_unavailable {
-                    match dgram_sender.send_datagram(encoded.clone()) {
-                        Ok(()) => continue,
-                        Err(SendDatagramError::NotAvailable { .. }) => {
-                            datagrams_unavailable = true;
-                        }
-                        Err(SendDatagramError::TooLarge { .. }) => {
-                            log::debug!(
-                                "MASQUE H3 datagram too large ({} bytes); dropping",
-                                encoded.len()
-                            );
-                            continue;
-                        }
-                        Err(err @ SendDatagramError::ConnectionError { .. }) => {
-                            return Err(io::Error::other(err));
-                        }
-                        Err(_) => {
-                            datagrams_unavailable = true;
-                        }
-                    }
-                }
-                let capsule = encode_capsule(&Capsule::Datagram(encoded));
-                send_stream
-                    .send_data(capsule)
-                    .await
-                    .map_err(io::Error::other)?;
+                send_h3_datagram_or_capsule(
+                    &mut dgram_sender,
+                    &mut send_stream,
+                    &mut datagrams_unavailable,
+                    encoded,
+                    false,
+                )
+                .await?;
             }
         }
     }
@@ -248,7 +190,7 @@ pub(crate) async fn handle_connect_udp_h2(
     };
 
     let mut send = respond
-        .send_response(ok_response(), false)
+        .send_response(capsule_ok_response(), false)
         .map_err(io::Error::other)?;
     let mut decoder = CapsuleDecoder::new();
     let idle_sleep = tokio::time::sleep(UDP_IDLE_TIMEOUT);
@@ -264,13 +206,7 @@ pub(crate) async fn handle_connect_udp_h2(
                 match chunk_opt {
                     Some(Ok(chunk)) => {
                         idle_sleep.as_mut().reset(Instant::now() + UDP_IDLE_TIMEOUT);
-                        let len = chunk.len();
-                        decoder.feed(&chunk);
-                        if len > 0 {
-                            recv.flow_control()
-                                .release_capacity(len)
-                                .map_err(io::Error::other)?;
-                        }
+                        feed_h2_capsule_chunk(&mut recv, &mut decoder, &chunk)?;
                         if !drain_capsules(&mut decoder, &relay, &target)? {
                             let _ = send.send_data(Bytes::new(), true);
                             return Ok(());

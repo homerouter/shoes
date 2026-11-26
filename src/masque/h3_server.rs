@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::resources;
 
-use super::{MasqueConnCtx, MasqueServer, connect, connect_udp};
+use super::{MasqueConnCtx, MasqueServer, connect, connect_ip, connect_udp};
 
 const DATAGRAM_CHANNEL_CAPACITY: usize = 256;
 
@@ -198,16 +198,7 @@ async fn dispatch_h3_request(
             {
                 return send_empty_response(&mut stream, rejection.into_response()).await;
             }
-            let status = if ctx.config.stealth_404 {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::NOT_IMPLEMENTED
-            };
-            send_empty_response(
-                &mut stream,
-                Response::builder().status(status).body(()).unwrap(),
-            )
-            .await
+            connect_ip::handle_connect_ip_h3(ctx, request, stream, hub).await
         }
         Some(_) => {
             send_empty_response(
